@@ -5773,7 +5773,14 @@ pub const LinuxServer = struct {
     /// would advance the issuer epoch). Cleared only at the adopt commit edge.
     mesh_presence_hot_pending: bool = false,
     /// Next runtime guest counter. The on-wire epoch stays 1 for this process.
+    /// A Helix successor raises it past every adopted guest incarnation so a
+    /// new registration never reuses a carried guest id.
     guest_serial: u64 = 0,
+    /// Why the most recent `adoptInheritedClientWithHost` returned false
+    /// (`.none` after a success). Allocation-free; read by the resume log.
+    adopt_reject: AdoptReject = .none,
+    /// The error behind `adopt_reject`, when the failing step returned one.
+    adopt_reject_error: ?anyerror = null,
     /// Immutable sorted event-time membership used by RVL2: this node plus the
     /// exact configured direct-neighbor identity pins. For this release
     /// `[mesh].trust_roots` is deliberately the direct-neighbor set, not a broad
@@ -27207,8 +27214,19 @@ pub const LinuxServer = struct {
     /// registration and after USR2 adoption; a no-op when no class registry is set
     /// (the generous default cap stands).
     fn assignConnClass(self: *LinuxServer, conn: *ConnState) void {
+        self.assignConnClassCtx(conn, matchCtx(conn));
+    }
+
+    /// The class policy a Helix successor derives for this live connection
+    /// (same registry, same facets), or null with no class registry.
+    fn successorClassPolicy(self: *const LinuxServer, conn: *const ConnState) ?conn_class.Policy {
+        const reg = if (self.config.class_registry) |*r| r else return null;
+        return reg.classFor(matchCtx(conn)).policy;
+    }
+
+    fn assignConnClassCtx(self: *LinuxServer, conn: *ConnState, ctx: conn_class.MatchContext) void {
         const reg = if (self.config.class_registry) |*r| r else return;
-        const class = reg.classFor(matchCtx(conn));
+        const class = reg.classFor(ctx);
         conn.class_policy = class.policy;
         conn.sendq_cap = if (conn.s2s != null or conn.s2s_secured != null)
             s2sSendqCap(class.policy.sendq)
@@ -41000,6 +41018,14 @@ pub const LinuxServer = struct {
                 skip = "closing";
                 continue;
             }
+            // Defense in depth: apply the successor's adoption invariants to
+            // this client BEFORE exec. A client the successor would reject
+            // keeps the cut incomplete, so UPGRADE is refused with every
+            // connection intact instead of exec'ing into a fatal resume.
+            if (self.sealAdoptionRefusal(e.value, flood_carry)) |why| {
+                skip = why;
+                continue;
+            }
             // wss browser client: carry it whenever its
             // WebSocket adapter is past the HTTP Upgrade (phase=open) — the
             // adapter's partial framing state (a mid-frame deframer + a partial
@@ -41064,6 +41090,17 @@ pub const LinuxServer = struct {
                         continue;
                     };
                     counts.tls_rollback_downgraded += 1;
+                }
+                // The successor charges this row against the SendQ cap of the
+                // class it derives (adoptTlsState); refuse here what it would.
+                const successor_cap: u64 = if (self.successorClassPolicy(e.value)) |policy| policy.sendq else default_sendq_cap;
+                const carried_charge = tlsCarriedCharge(tls_row) orelse {
+                    skip = "carried TLS SendQ charge overflows (successor would refuse adoption)";
+                    continue;
+                };
+                if (carried_charge > successor_cap) {
+                    skip = "carried TLS SendQ charge exceeds the successor class sendq (successor would refuse adoption)";
+                    continue;
                 }
                 tls_blob_version = tls_snapshot.minimalVersion(tls_row);
                 tls_blob = tls_snapshot.encodeVersion(self.allocator, tls_row, tls_blob_version) catch continue;
@@ -45715,11 +45752,12 @@ pub const LinuxServer = struct {
                 if (tls_state != null) adopted_tls += 1;
                 if (ws_state != null) adopted_ws += 1;
             } else {
-                srvLog("onyx-server: UPGRADE resume could not adopt client fd={d} nick_len={d} oper={} tls={} ws={} guest={} account={}\n", .{
-                    snap.fd,               snap.nick.len,
-                    snap.is_oper,          snap.was_secured,
-                    snap.was_websocket,    !std.mem.allEqual(u8, &snap.guest_incarnation, 0),
-                    snap.account.len != 0,
+                srvLog("onyx-server: UPGRADE resume could not adopt client fd={d} nick_len={d} oper={} tls={} ws={} guest={} account={} reason={s} error={s}\n", .{
+                    snap.fd,                                                    snap.nick.len,
+                    snap.is_oper,                                               snap.was_secured,
+                    snap.was_websocket,                                         !std.mem.allEqual(u8, &snap.guest_incarnation, 0),
+                    snap.account.len != 0,                                      @tagName(self.adopt_reject),
+                    if (self.adopt_reject_error) |e| @errorName(e) else "none",
                 });
             }
         }
@@ -47284,28 +47322,100 @@ pub const LinuxServer = struct {
         if (close_fd) closeFd(fd);
     }
 
+    /// Typed reason an exact inherited client was not adopted. Every `false`
+    /// return of `adoptInheritedClientWithHost`/`adoptTlsState` records one,
+    /// so the fatal resume log names the failing invariant.
+    pub const AdoptReject = enum(u8) {
+        none,
+        reserved_nick,
+        guest_relation,
+        shard_capacity,
+        slot_alloc,
+        token_alloc,
+        windows_admission,
+        clone_peer_missing,
+        clone_register,
+        host_presentation,
+        flood_guard_missing,
+        flood_guard_import,
+        flood_guard_unexpected,
+        tls_snapshot_invalid,
+        tls_fd_mismatch,
+        tls_charge_overflow,
+        tls_sendq_cap,
+        tls_engine_alloc,
+        tls_resume,
+        tls_offload_restore,
+        tls_exporter,
+        tls_deferred_alloc,
+        tls_wire_alloc,
+        ws_state,
+        pending_in_alloc,
+        pending_out_append,
+        session_group_revoked,
+        session_attach,
+        session_attach_evicted,
+        nick_in_use_guest,
+        nick_in_use_other_account,
+        nick_register,
+        channel_restore,
+        cloexec,
+    };
+
+    fn rejectAdopt(self: *LinuxServer, reason: AdoptReject, err: ?anyerror) bool {
+        self.adopt_reject = reason;
+        self.adopt_reject_error = err;
+        return false;
+    }
+
+    /// The carried guest fields of one client, as the successor classifies
+    /// them. Shared by the predecessor's pre-exec seal check and the
+    /// successor's adoption so the two can never disagree.
+    pub const InheritedGuestRelation = enum {
+        /// No guest incarnation (account session, or a guest never assigned one).
+        none,
+        /// A guest whose presence record was admitted: all metadata set.
+        published,
+        /// A guest incarnation whose presence record was never admitted
+        /// (0.11.0 `publishOrdinaryGuest` committed the id before admission):
+        /// all metadata zero. It carries no mesh authority.
+        unpublished,
+        /// Anything else: partial metadata, an account, or no real nick.
+        invalid,
+    };
+
+    pub fn inheritedGuestRelation(guest_id: [16]u8, revision: u64, claim_revision: u64, claim_hlc: u64, account: []const u8, nick: []const u8) InheritedGuestRelation {
+        if (std.mem.allEqual(u8, &guest_id, 0)) return .none;
+        if (account.len != 0 or nick.len == 0 or std.mem.eql(u8, nick, "*")) return .invalid;
+        if (revision != 0 and claim_revision != 0 and claim_hlc != 0) return .published;
+        if (revision == 0 and claim_revision == 0 and claim_hlc == 0) return .unpublished;
+        return .invalid;
+    }
+
     fn adoptInheritedClient(self: *LinuxServer, snap: session_snapshot.Snapshot, tls_state: ?tls_snapshot.Snapshot, ws_state: ?ws_snapshot.Snapshot, close_fd_on_failure: bool) bool {
         if (comptime !builtin.is_test) return false;
         return self.adoptInheritedClientWithHost(snap, tls_state, ws_state, close_fd_on_failure, null);
     }
 
     fn adoptInheritedClientWithHost(self: *LinuxServer, snap: session_snapshot.Snapshot, tls_state: ?tls_snapshot.Snapshot, ws_state: ?ws_snapshot.Snapshot, close_fd_on_failure: bool, host_row: ?host_presentation_snapshot.Row) bool {
+        self.adopt_reject = .none;
+        self.adopt_reject_error = null;
         if (std.mem.startsWith(u8, snap.nick, "=")) {
             if (close_fd_on_failure) closeFd(snap.fd);
-            return false;
+            return self.rejectAdopt(.reserved_nick, null);
         }
-        const guest_id_present = !std.mem.allEqual(u8, &snap.guest_incarnation, 0);
-        const guest_metadata_present = snap.guest_revision != 0 and
-            snap.guest_claim_revision != 0 and snap.guest_claim_hlc != 0;
         // Without a guest incarnation the revision fields describe nothing:
         // predecessors before 0.10.2 left them set when a guest bound an
         // account. They are dropped below rather than refused, so those
         // sessions stay adoptable; they cannot confer any guest authority.
-        if (guest_id_present and (!guest_metadata_present or snap.account.len != 0 or
-            snap.nick.len == 0 or std.mem.eql(u8, snap.nick, "*")))
-        {
+        // An unpublished incarnation (id, no admitted presence) is a state a
+        // live 0.11.0 predecessor seals for a registered guest; it carries no
+        // mesh authority and is restored verbatim (metadata stays zero).
+        const guest_relation = inheritedGuestRelation(snap.guest_incarnation, snap.guest_revision, snap.guest_claim_revision, snap.guest_claim_hlc, snap.account, snap.nick);
+        const guest_id_present = guest_relation != .none;
+        if (guest_relation == .invalid) {
             if (close_fd_on_failure) closeFd(snap.fd);
-            return false;
+            return self.rejectAdopt(.guest_relation, null);
         }
         // Per-SHARD cap (rx() is the adoption-order target shard): matches the
         // accept path, whose cap is also per-shard — each reactor's table is
@@ -47314,11 +47424,11 @@ pub const LinuxServer = struct {
         // fd locally, then the caller rejects the whole successor startup.
         if (self.rx().clients.len() >= self.config.max_clients) {
             if (close_fd_on_failure) closeFd(snap.fd);
-            return false;
+            return self.rejectAdopt(.shard_capacity, null);
         }
-        const id = self.rx().clients.alloc(ConnState.init(snap.fd)) catch {
+        const id = self.rx().clients.alloc(ConnState.init(snap.fd)) catch |adopt_err| {
             if (close_fd_on_failure) closeFd(snap.fd);
-            return false;
+            return self.rejectAdopt(.slot_alloc, adopt_err);
         };
         const conn = self.rx().clients.get(id).?;
         conn.diagnostics_owner = &self.diagnostics;
@@ -47334,10 +47444,10 @@ pub const LinuxServer = struct {
         conn.last_search_ms = snap.last_search_ms;
         conn.keytrans_require = snap.keytrans_require;
         conn.nick_claimed_at_ms = snap.nick_claimed_at_ms;
-        conn.token = tokenFromId(id) catch {
+        conn.token = tokenFromId(id) catch |adopt_err| {
             _ = self.rx().clients.free(id);
             if (close_fd_on_failure) closeFd(snap.fd);
-            return false;
+            return self.rejectAdopt(.token_alloc, adopt_err);
         };
         conn.peer_addr = snap.peer_addr;
         conn.throttle_counted = snap.throttle_counted;
@@ -47347,24 +47457,24 @@ pub const LinuxServer = struct {
             const expected_mesh_hash = self.meshCloneHash(conn);
             if (self.config.native_adopt_barrier != null and conn.peer_addr == null) {
                 self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                return false;
+                return self.rejectAdopt(.windows_admission, null);
             }
             if (self.config.native_adopt_barrier != null and
                 ((conn.throttle_counted and (self.conn_throttle == null or self.ipCloneExempt(conn))) or
                     (conn.mesh_clone_counted and (expected_mesh_hash == null or expected_mesh_hash.? != conn.mesh_clone_hash))))
             {
                 self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                return false;
+                return self.rejectAdopt(.windows_admission, null);
             }
         }
         if (snap.clone_counted) {
             const addr = conn.peer_addr orelse {
                 self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                return false;
+                return self.rejectAdopt(.clone_peer_missing, null);
             };
-            self.clone_limit.register(addr) catch {
+            self.clone_limit.register(addr) catch |adopt_err| {
                 self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                return false;
+                return self.rejectAdopt(.clone_register, adopt_err);
             };
             conn.clone_counted = true;
         }
@@ -47378,9 +47488,9 @@ pub const LinuxServer = struct {
         conn.last_activity_ms = now;
         conn.session.restore(snap);
         conn.host_presentation = .{};
-        if (host_row) |row| self.restoreHostPresentation(conn, row) catch {
+        if (host_row) |row| self.restoreHostPresentation(conn, row) catch |adopt_err| {
             self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-            return false;
+            return self.rejectAdopt(.host_presentation, adopt_err);
         };
         // The carried oper block is profile history only: restore() deliberately
         // clears it. Re-derive successor authority from the restored authenticated
@@ -47400,20 +47510,26 @@ pub const LinuxServer = struct {
         self.injectSessionState(conn);
         // Determine the destination physical cap before validating any carried
         // wire/tail/control charge. A smaller new policy refuses the whole adopt.
-        self.assignConnClass(conn);
+        // The TLS engine is rebuilt below, so match the class with the carried
+        // transport facet now: a TLS-matched class (its SendQ cap and flood
+        // policy) is the one the predecessor applied and the final re-match
+        // selects; matching it as plaintext refused legitimate TLS state.
+        var class_ctx = matchCtx(conn);
+        class_ctx.is_tls = tls_state != null;
+        self.assignConnClassCtx(conn, class_ctx);
         if (snap.flood_guard) |carry| {
             const derived = conn.flood_guard orelse {
                 self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                return false;
+                return self.rejectAdopt(.flood_guard_missing, null);
             };
-            conn.flood_guard = flood_guard.FloodGuard.importCarry(derived.config, now, carry) catch {
+            conn.flood_guard = flood_guard.FloodGuard.importCarry(derived.config, now, carry) catch |adopt_err| {
                 self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                return false;
+                return self.rejectAdopt(.flood_guard_import, adopt_err);
             };
         } else if (comptime builtin.os.tag == .windows) {
             if (self.config.native_adopt_barrier != null and conn.flood_guard != null) {
                 self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                return false;
+                return self.rejectAdopt(.flood_guard_unexpected, null);
             }
         }
         // TLS client: rebuild the live engine BEFORE anything else can touch the
@@ -47462,7 +47578,7 @@ pub const LinuxServer = struct {
                 };
                 if (!ws_ok) {
                     self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                    return false;
+                    return self.rejectAdopt(.ws_state, null);
                 }
             }
         }
@@ -47476,9 +47592,9 @@ pub const LinuxServer = struct {
                 @memcpy(conn.line_buf[0..snap.pending_in.len], snap.pending_in);
                 conn.line_len = snap.pending_in.len;
             } else {
-                conn.recv_overflow.appendSlice(conn.overflow_allocator, snap.pending_in) catch {
+                conn.recv_overflow.appendSlice(conn.overflow_allocator, snap.pending_in) catch |adopt_err| {
                     self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                    return false;
+                    return self.rejectAdopt(.pending_in_alloc, adopt_err);
                 };
             }
         }
@@ -47488,9 +47604,9 @@ pub const LinuxServer = struct {
         // above; the seal path guarantees this field is empty for those.
         if (snap.pending_out.len != 0 and tls_state == null) {
             conn.sendq_cap = @max(conn.sendq_cap, snap.pending_out.len);
-            rawAppendToConn(conn, snap.pending_out) catch {
+            rawAppendToConn(conn, snap.pending_out) catch |adopt_err| {
                 self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                return false;
+                return self.rejectAdopt(.pending_out_append, adopt_err);
             };
         }
         // Re-track before the socket becomes live in io_uring. A carried
@@ -47508,23 +47624,23 @@ pub const LinuxServer = struct {
             }
             if (self.session_group_restart_required or self.session_replica_store.groupRevokeForToken(token) != null) {
                 self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                return false;
+                return self.rejectAdopt(.session_group_revoked, null);
             }
             const outcome = self.sessions.attachReportingEviction(
                 acct,
                 monitorIdFromClient(id),
                 token,
                 conn.connected_at_ms,
-            ) catch {
+            ) catch |adopt_err| {
                 self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                return false;
+                return self.rejectAdopt(.session_attach, adopt_err);
             };
             // Exact inherited state may not repair capacity by evicting another
             // carried attachment. Such an eviction would also publish replica /
             // delivery side effects outside the candidate stores.
             if (outcome.evicted != null) {
                 self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                return false;
+                return self.rejectAdopt(.session_attach_evicted, null);
             }
         }
         // Re-populate the world nick registry so the carried client stays
@@ -47536,25 +47652,25 @@ pub const LinuxServer = struct {
                 error.NickInUse => {
                     const account = conn.session.account() orelse {
                         self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                        return false;
+                        return self.rejectAdopt(.nick_in_use_guest, null);
                     };
                     if (!self.nickHeldBySameAccount(snap.nick, account, worldIdFromClient(id))) {
                         self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                        return false;
+                        return self.rejectAdopt(.nick_in_use_other_account, null);
                     }
                 },
                 else => {
                     self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                    return false;
+                    return self.rejectAdopt(.nick_register, err);
                 },
             };
         }
         // Re-join the carried channel memberships with their exact member modes.
         var cit = session_snapshot.channelIter(snap.channels_blob);
         while (cit.next()) |ch| {
-            self.world.restoreMember(ch.name, worldIdFromClient(id), .{ .bits = ch.modes }) catch {
+            self.world.restoreMember(ch.name, worldIdFromClient(id), .{ .bits = ch.modes }) catch |adopt_err| {
                 self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                return false;
+                return self.rejectAdopt(.channel_restore, adopt_err);
             };
         }
         // Restore exec hygiene before the final causal stamp. A bad inherited
@@ -47562,12 +47678,19 @@ pub const LinuxServer = struct {
         // close authority for transactional callers.
         if (!setCloexec(snap.fd, true)) {
             self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-            return false;
+            return self.rejectAdopt(.cloexec, null);
         }
         // Nothing below this point can reject the adoption. Stamp the fresh
         // mesh claim only after every allocation/world/session mutation, so a
         // rolled-back client cannot leave a phantom causal advance behind.
         conn.mesh_nick_hlc = self.nextMeshHlc();
+        // guest_serial is process-local and not in the capsule: raise it past
+        // the carried incarnation so no later registration reuses this id.
+        if (guest_id_present) {
+            if (mesh_presence_v2.subject(conn.guest_id)) |parts| {
+                if (parts.epoch == 1 and parts.counter > self.guest_serial) self.guest_serial = parts.counter;
+            } else |_| {}
+        }
         // Carried outbound bytes remain inert too. runOnce fairly arms RECV and
         // any required SEND after control SQEs, retaining this slot on SQ-full.
         conn.io_activation_pending = true;
@@ -47596,22 +47719,52 @@ pub const LinuxServer = struct {
         };
     }
 
+    /// Predecessor-side mirror of the successor's per-client adoption checks
+    /// that depend only on live predecessor state (guest relation, class
+    /// flood policy). Returns the operator-facing refusal reason, or null.
+    /// TLS SendQ admissibility is checked against the captured row.
+    fn sealAdoptionRefusal(self: *const LinuxServer, conn: *const ConnState, flood_carry: ?flood_guard.CarryState) ?[]const u8 {
+        // Exactly the nick/account fields the `.clients` capsule will carry.
+        const carried = conn.session.snapshot();
+        if (inheritedGuestRelation(conn.guest_id, conn.guest_revision, conn.guest_claim_revision, conn.guest_claim_hlc, carried.account, carried.nick) == .invalid)
+            return "guest incarnation metadata is inconsistent (successor would refuse adoption)";
+        if (flood_carry) |carry| {
+            const policy = self.successorClassPolicy(conn) orelse
+                return "flood-guard state but no connection class in the successor (successor would refuse adoption)";
+            const derived = policy.floodGuardConfig();
+            if (!derived.enabled)
+                return "flood-guard state but the successor class has no flood guard (successor would refuse adoption)";
+            _ = flood_guard.FloodGuard.importCarry(derived, self.nowMs(), carry) catch
+                return "flood-guard state does not match the successor class policy (successor would refuse adoption)";
+        }
+        return null;
+    }
+
+    /// The physical SendQ bytes a carried TLS row charges on adoption: queued
+    /// wire FIFO + deferred ciphertext envelope + control credit. Null when it
+    /// does not fit usize. Shared by the seal pre-check and adoptTlsState.
+    fn tlsCarriedCharge(ts: tls_snapshot.Snapshot) ?usize {
+        const tail_charge = std.math.cast(usize, ts.deferred_ciphertext_charge) orelse return null;
+        const with_tail = std.math.add(usize, ts.pending_out.len, tail_charge) catch return null;
+        return std.math.add(usize, with_tail, ts.control_charge) catch null;
+    }
+
     /// Rebuild a carried client's live TLS engine from its snapshot. On success
     /// the conn owns a resumed TlsConn and any unflushed predecessor ciphertext
     /// is re-queued verbatim. Returns false on ANY failure; the caller cleans the
     /// client and rejects successor startup (TLS never falls back to plaintext).
     fn adoptTlsState(self: *LinuxServer, conn: *ConnState, ts: tls_snapshot.Snapshot) bool {
-        tls_snapshot.validate(ts) catch return false;
-        if (ts.fd != conn.fd) return false;
-        const tail_charge = std.math.cast(usize, ts.deferred_ciphertext_charge) orelse return false;
-        const charged = std.math.add(usize, std.math.add(usize, ts.pending_out.len, tail_charge) catch return false, ts.control_charge) catch return false;
-        if (charged > conn.sendq_cap) return false;
-        const t = self.allocator.create(tls_conn.TlsConn) catch return false;
+        tls_snapshot.validate(ts) catch |e| return self.rejectAdopt(.tls_snapshot_invalid, e);
+        if (ts.fd != conn.fd) return self.rejectAdopt(.tls_fd_mismatch, null);
+        const charged = tlsCarriedCharge(ts) orelse return self.rejectAdopt(.tls_charge_overflow, null);
+        if (charged > conn.sendq_cap) return self.rejectAdopt(.tls_sendq_cap, null);
+        const tail_charge: usize = @intCast(ts.deferred_ciphertext_charge);
+        const t = self.allocator.create(tls_conn.TlsConn) catch |e| return self.rejectAdopt(.tls_engine_alloc, e);
         const cfg12: ?tls12_server.Config = if (self.config.tls12_cert_chain.len != 0 and
             (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null)) self.tls12Config() else null;
-        t.* = tls_conn.TlsConn.resumeFrom(self.allocator, self.tls13Config(self.config.tls_request_client_cert), cfg12, ts.state) catch {
+        t.* = tls_conn.TlsConn.resumeFrom(self.allocator, self.tls13Config(self.config.tls_request_client_cert), cfg12, ts.state) catch |e| {
             self.allocator.destroy(t);
-            return false;
+            return self.rejectAdopt(.tls_resume, e);
         };
         // This candidate still owns no live transport. Every allocation/getter
         // and mandatory exporter derivation completes before publication.
@@ -47620,12 +47773,12 @@ pub const LinuxServer = struct {
             t.deinit();
             self.allocator.destroy(t);
         };
-        t.restoreInheritedOffload(conn.fd, ts.tx_offloaded, ts.rx_offloaded) catch return false;
+        t.restoreInheritedOffload(conn.fd, ts.tx_offloaded, ts.rx_offloaded) catch |e| return self.rejectAdopt(.tls_offload_restore, e);
         var exporter: [32]u8 = @splat(0);
         defer std.crypto.secureZero(u8, &exporter);
-        if (ts.state.engine == .tls13) t.channelBindingTlsExporter(&exporter) catch return false;
-        conn.tls_deferred_plain.ensureTotalCapacityPrecise(conn.overflow_allocator, ts.deferred_plain.len) catch return false;
-        var wire = sendq.prepareAppend(conn, ts.pending_out.len) catch return false;
+        if (ts.state.engine == .tls13) t.channelBindingTlsExporter(&exporter) catch |e| return self.rejectAdopt(.tls_exporter, e);
+        conn.tls_deferred_plain.ensureTotalCapacityPrecise(conn.overflow_allocator, ts.deferred_plain.len) catch |e| return self.rejectAdopt(.tls_deferred_alloc, e);
+        var wire = sendq.prepareAppend(conn, ts.pending_out.len) catch |e| return self.rejectAdopt(.tls_wire_alloc, e);
         defer wire.abort();
         // Allocation-free local publication; outer whole-adopt rollback retains
         // predecessor FD custody and tears down every speculative candidate.
@@ -72370,15 +72523,43 @@ pub const LinuxServer = struct {
         return route;
     }
 
+    /// Next process-local guest incarnation with no retained record under this
+    /// origin. Counters never repeat (aborted reservations included); ids that
+    /// already name a retained record are skipped. Null when exhausted.
+    fn reserveFreshGuestId(self: *LinuxServer, auth: *const guest_presence_route.Authority, origin: [32]u8) ?mesh_presence_v2.GuestId {
+        var attempts: usize = 0;
+        while (attempts < 1024) : (attempts += 1) {
+            const counter = std.math.add(u64, self.guest_serial, 1) catch return null;
+            self.guest_serial = counter;
+            const id = mesh_presence_v2.guestId(.{ .epoch = 1, .counter = counter }) catch return null;
+            if (auth.retainedByGuest(origin, id) == null) return id;
+        }
+        return null;
+    }
+
     fn publishOrdinaryGuest(self: *LinuxServer, conn: *ConnState, drive: bool) void {
         if (!self.ordinaryGuestEligible(conn)) return;
         const ident = self.config.node_identity orelse return;
         const auth = self.ensureGuestAuthority() catch return;
-        if (std.mem.allEqual(u8, &conn.guest_id, 0)) {
-            const counter = std.math.add(u64, self.guest_serial, 1) catch return;
-            conn.guest_id = mesh_presence_v2.guestId(.{ .epoch = 1, .counter = counter }) catch return;
-            self.guest_serial = counter;
+        // An incarnation whose presence this connection never got admitted
+        // (guest_revision == 0) owns nothing. A retained record under it is
+        // another guest's (an id reused across a Helix by 0.11.0), so it is
+        // replaced by a fresh id instead of renewing someone else's record.
+        if (std.mem.allEqual(u8, &conn.guest_id, 0) or
+            (conn.guest_revision == 0 and auth.retainedByGuest(ident.sign_kp.public_key, conn.guest_id) != null))
+        {
+            conn.guest_id = self.reserveFreshGuestId(auth, ident.sign_kp.public_key) orelse {
+                conn.guest_id = @splat(0);
+                return;
+            };
         }
+        // The id is committed only together with an admitted presence record:
+        // any early return below leaves an unpublished connection with no
+        // incarnation, never an id without metadata (which a Helix successor
+        // before this fix refused to adopt).
+        defer if (conn.guest_revision == 0) {
+            conn.guest_id = @splat(0);
+        };
         const prior = auth.retainedByGuest(ident.sign_kp.public_key, conn.guest_id);
         if (prior) |kept| if (kept.operation == .quit) return;
         const nick = conn.session.displayName();
@@ -72448,6 +72629,9 @@ pub const LinuxServer = struct {
 
     fn retireOrdinaryGuest(self: *LinuxServer, conn: *const ConnState) bool {
         if (std.mem.allEqual(u8, &conn.guest_id, 0)) return true;
+        // An unpublished incarnation owns no record; one retained under the
+        // same id belongs to another guest and must not be retired by us.
+        if (conn.guest_revision == 0) return true;
         const ident = self.config.node_identity orelse return false;
         const auth = self.guest_presence orelse return false;
         const prior = auth.retainedByGuest(ident.sign_kp.public_key, conn.guest_id) orelse return false;
@@ -72489,6 +72673,8 @@ pub const LinuxServer = struct {
     /// callers can retry without leaving an unrevokable route behind.
     fn retireOrdinaryGuestForAccountBind(self: *LinuxServer, conn: *ConnState) bool {
         if (std.mem.allEqual(u8, &conn.guest_id, 0)) return true;
+        // An unpublished incarnation (e.g. carried from a 0.11.0 predecessor)
+        // has no record of ours to retire; retireOrdinaryGuest returns true.
         if (!self.retireOrdinaryGuest(conn)) return false;
         conn.guest_id = @splat(0);
         // The revision fields only describe the retired incarnation. Leaving
@@ -186724,4 +186910,348 @@ test "armor3: TLS metrics expose kTLS 1.2, delegated credential expiry and QUIC 
     try std.testing.expect(std.mem.indexOf(u8, out.items, "onyx_quic_early_data_rejected_total ") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "onyx_quic_stateless_resets_sent_total ") != null);
     _ = server.tls_ktls12_active.fetchSub(2, .monotonic);
+}
+
+/// Helix adoption fixture: one registered TLS client (1.3 or 1.2) on a real
+/// loopback TCP socket, so kTLS can be attached when the kernel supports it.
+const HelixAdoptTlsFixture = struct {
+    server: *Server,
+    pair: *DaemonOutputTestPair,
+    id: client_model.ClientId,
+    peer_fd: i32,
+
+    fn create(version: tls_conn.Version) !HelixAdoptTlsFixture {
+        if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const pair = try DaemonOutputTestPair.create(version);
+        errdefer pair.destroy();
+        const server = switch (version) {
+            .tls13 => try createTestServer(a, .{
+                .host = "127.0.0.1",
+                .port = 0,
+                .crypto_io = std.testing.io,
+                .tls_cert_chain = &pair.chain13,
+                .tls_signing_key = pair.tls.cfg13.signing_key,
+            }),
+            .tls12 => try createTestServer(a, .{
+                .host = "127.0.0.1",
+                .port = 0,
+                .crypto_io = std.testing.io,
+                .tls_cert_chain = &pair.chain13,
+                .tls_signing_key = pair.tls.cfg13.signing_key,
+                .tls12_cert_chain = &pair.chain12,
+                .tls12_signing_key = pair.tls.cfg12.?.ecdsa_p256_signing_key,
+            }),
+        };
+        errdefer {
+            server.deinit();
+            a.destroy(server);
+        }
+        server.helix_target_state_caps = .current;
+        current_reactor = &server.reactors[0];
+        const peer = try connectLoopback(try server.boundPort());
+        errdefer closeFd(peer);
+        var ready = [_]posix.pollfd{.{ .fd = server.reactors[0].listener_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 2000) == 0) return error.TestTimeout;
+        const accepted = linux.accept4(server.reactors[0].listener_fd, null, null, linux.SOCK.CLOEXEC);
+        if (posix.errno(accepted) != .SUCCESS) return error.TestUnexpectedResult;
+        const fd: i32 = @intCast(accepted);
+        errdefer closeFd(fd);
+        try os_runtime.setNonblocking(fd);
+        const id = try addTestLocalClient(server, "Ariadne", null);
+        const conn = server.rx().clients.get(id).?;
+        conn.session.restore(.{ .nick = "Ariadne", .username = "ariadne", .realname = "Helix guest" });
+        conn.session.registration.registered = true;
+        conn.test_sendq_capture = true;
+        const owned = try a.create(tls_conn.TlsConn);
+        owned.* = pair.tls;
+        pair.tls = switch (version) {
+            .tls13 => try tls_conn.TlsConn.init(a, pair.tls.cfg13),
+            .tls12 => tls_conn.TlsConn.initDual(a, pair.tls.cfg13, pair.tls.cfg12.?),
+        };
+        conn.fd = fd;
+        conn.tls = owned;
+        conn.is_tls = true;
+        try server.driveTls(id, conn, &.{});
+        return .{ .server = server, .pair = pair, .id = id, .peer_fd = peer };
+    }
+
+    fn connection(self: *HelixAdoptTlsFixture) *ConnState {
+        return self.server.reactors[0].clients.get(self.id).?;
+    }
+
+    /// Attach kTLS TX+RX like `[tls] ktls = "txrx"`; false when unsupported.
+    fn offload(self: *HelixAdoptTlsFixture) bool {
+        if (!ktls.probeUlpSupport()) return false;
+        const conn = self.connection();
+        conn.tls.?.enableKtlsTx(conn.fd) catch return false;
+        conn.tls_tx_offloaded = true;
+        conn.tls.?.enableKtlsRx(conn.fd) catch return false;
+        conn.tls_rx_offloaded = true;
+        return true;
+    }
+
+    fn deinit(self: *HelixAdoptTlsFixture) void {
+        self.server.deinit();
+        std.testing.allocator.destroy(self.server);
+        closeFd(self.peer_fd);
+        self.pair.destroy();
+    }
+};
+
+const HelixAdoptOutcome = struct {
+    sealed: usize,
+    expected: usize,
+    adopted: bool,
+    reason: Server.AdoptReject,
+    guest_serial: u64 = 0,
+};
+
+/// Real predecessor seal -> exact successor adoption of the fixture client.
+/// On success the successor owns the descriptor (the predecessor's is cleared).
+fn helixSealThenAdoptForTest(fixture: *HelixAdoptTlsFixture) !HelixAdoptOutcome {
+    const a = std.testing.allocator;
+    const conn = fixture.connection();
+    var seal: HelixRollbackSeal = .{};
+    defer seal.deinit();
+    seal.run(fixture.server);
+    var outcome: HelixAdoptOutcome = .{ .sealed = seal.counts.clients, .expected = seal.counts.clients_expected, .adopted = false, .reason = .none };
+    // A refused seal keeps the live connection exactly as it was.
+    try std.testing.expect(setCloexec(conn.fd, true));
+    if (seal.counts.clients != 1) return outcome;
+    var client_piece: ?helix_live.StatePiece = null;
+    for (seal.pieces.items) |piece| if (piece.kind == .clients) {
+        client_piece = piece;
+    };
+    const tls_piece = seal.tlsPiece() orelse return error.TestUnexpectedResult;
+    const snap = try session_snapshot.decodeCurrent((client_piece orelse return error.TestUnexpectedResult).bytes);
+    const row = try tls_snapshot.decode(tls_piece.bytes, helix_live.pieceHeader(tls_piece).version);
+    const successor = try createTestServer(a, fixture.server.config);
+    defer {
+        successor.deinit();
+        a.destroy(successor);
+    }
+    current_reactor = &successor.reactors[0];
+    defer current_reactor = &fixture.server.reactors[0];
+    outcome.adopted = successor.adoptInheritedClient(snap, row, null, false);
+    outcome.reason = successor.adopt_reject;
+    outcome.guest_serial = successor.guest_serial;
+    if (outcome.adopted) {
+        conn.fd = -1; // the successor owns (and closes) the descriptor now
+        var it = successor.reactors[0].clients.iterator();
+        const adopted = it.next().?.value;
+        try std.testing.expect(adopted.tls != null);
+        try std.testing.expectEqualSlices(u8, &snap.guest_incarnation, &adopted.guest_id);
+    }
+    return outcome;
+}
+
+fn helixUnpublishedGuestAdoptCase(version: tls_conn.Version, offload: bool) !void {
+    defer current_reactor = null;
+    var fixture = try HelixAdoptTlsFixture.create(version);
+    defer fixture.deinit();
+    if (offload and !fixture.offload()) return error.SkipZigTest;
+    // 0.11.0 publishOrdinaryGuest committed the incarnation before admission
+    // and returned early (colliding retained quit record, or an unencodable
+    // presence field): guest id set, every presence metadata field zero.
+    const conn = fixture.connection();
+    conn.guest_id = try mesh_presence_v2.guestId(.{ .epoch = 1, .counter = 4 });
+    conn.guest_revision = 0;
+    conn.guest_claim_revision = 0;
+    conn.guest_claim_hlc = 0;
+    const outcome = try helixSealThenAdoptForTest(&fixture);
+    try std.testing.expectEqual(@as(usize, 1), outcome.expected);
+    try std.testing.expectEqual(@as(usize, 1), outcome.sealed);
+    try std.testing.expectEqual(Server.AdoptReject.none, outcome.reason);
+    try std.testing.expect(outcome.adopted);
+    // The successor never re-issues the carried incarnation to a new guest.
+    try std.testing.expect(outcome.guest_serial >= 4);
+}
+
+test "Helix adopt: TLS 1.3 guest with an unpublished incarnation is adopted" {
+    try helixUnpublishedGuestAdoptCase(.tls13, false);
+}
+
+test "Helix adopt: TLS 1.3 kTLS txrx guest with an unpublished incarnation is adopted" {
+    try helixUnpublishedGuestAdoptCase(.tls13, true);
+}
+
+test "Helix adopt: TLS 1.2 kTLS txrx guest with an unpublished incarnation is adopted" {
+    try helixUnpublishedGuestAdoptCase(.tls12, true);
+}
+
+test "Helix adopt: predecessor refuses the seal for a guest the successor would reject, connection intact" {
+    defer current_reactor = null;
+    var fixture = try HelixAdoptTlsFixture.create(.tls13);
+    defer fixture.deinit();
+    const conn = fixture.connection();
+    // Partial guest metadata: inadmissible on the successor (guest_relation).
+    conn.guest_id = try mesh_presence_v2.guestId(.{ .epoch = 1, .counter = 9 });
+    conn.guest_revision = 5;
+    conn.guest_claim_revision = 0;
+    conn.guest_claim_hlc = 0;
+    const outcome = try helixSealThenAdoptForTest(&fixture);
+    try std.testing.expectEqual(@as(usize, 1), outcome.expected);
+    try std.testing.expectEqual(@as(usize, 0), outcome.sealed);
+    try std.testing.expect(!outcome.adopted);
+    // Refusal is lossless: the live client keeps its socket and TLS engine.
+    try std.testing.expect(conn.fd >= 0 and conn.tls != null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.server.reactors[0].clients.len());
+    // And the successor's own check names the same invariant.
+    var snap = conn.session.snapshot();
+    snap.fd = conn.fd;
+    snap.guest_incarnation = conn.guest_id;
+    snap.guest_revision = conn.guest_revision;
+    try std.testing.expectEqual(Server.InheritedGuestRelation.invalid, Server.inheritedGuestRelation(snap.guest_incarnation, snap.guest_revision, snap.guest_claim_revision, snap.guest_claim_hlc, snap.account, snap.nick));
+    const successor = try createTestServer(std.testing.allocator, fixture.server.config);
+    defer {
+        successor.deinit();
+        std.testing.allocator.destroy(successor);
+    }
+    current_reactor = &successor.reactors[0];
+    try std.testing.expect(!successor.adoptInheritedClient(snap, null, null, false));
+    try std.testing.expectEqual(Server.AdoptReject.guest_relation, successor.adopt_reject);
+}
+
+test "Helix adopt: a TLS-matched connection class keeps its flood guard and SendQ cap across adoption" {
+    defer current_reactor = null;
+    var builder = conn_class.Builder.init(std.testing.allocator);
+    try builder.add(.{
+        .name = "tlsonly",
+        .policy = .{ .sendq = 4 << 20, .flood_lines = 50, .flood_window_ms = 10_000 },
+        .tls_only = true,
+    });
+    var registry = try builder.finish();
+    defer registry.deinit();
+    var fixture = try HelixAdoptTlsFixture.create(.tls13);
+    defer fixture.deinit();
+    fixture.server.config.class_registry = registry;
+    defer fixture.server.config.class_registry = null;
+    const conn = fixture.connection();
+    fixture.server.assignConnClass(conn);
+    try std.testing.expectEqual(@as(usize, 4 << 20), conn.sendq_cap);
+    try std.testing.expect(conn.flood_guard != null);
+    _ = conn.flood_guard.?.classifyRaw(fixture.server.nowMs(), "PRIVMSG #room :hello\r\n");
+    const outcome = try helixSealThenAdoptForTest(&fixture);
+    try std.testing.expectEqual(@as(usize, 1), outcome.sealed);
+    try std.testing.expectEqual(Server.AdoptReject.none, outcome.reason);
+    try std.testing.expect(outcome.adopted);
+}
+
+const GuestPublishFixtureForTest = struct {
+    server: *Server,
+    identity: *node_identity.NodeIdentity,
+
+    fn create() !@This() {
+        const a = std.testing.allocator;
+        const identity = try a.create(node_identity.NodeIdentity);
+        errdefer a.destroy(identity);
+        identity.* = try node_identity.fromSeed(@splat(0xA7), "guest-publish-test");
+        errdefer identity.deinit();
+        const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .node_identity = identity, .node_id = identity.shortId(), .crypto_io = std.testing.io });
+        current_reactor = &server.reactors[0];
+        return .{ .server = server, .identity = identity };
+    }
+
+    fn guest(self: *@This(), nick: []const u8, realname: []const u8) !*ConnState {
+        const id = try addTestLocalClient(self.server, nick, null);
+        const conn = self.server.connFor(id).?;
+        conn.session.restore(.{ .nick = nick, .username = "guest", .realname = realname });
+        conn.session.registration.registered = true;
+        return conn;
+    }
+
+    /// Admit a record under this node's origin, as an earlier incarnation of
+    /// the process (or a peer replay) would have left it retained.
+    fn retain(self: *@This(), counter: u64, operation: mesh_presence_v2.Operation, nick: []const u8) !void {
+        const now = self.server.guestNowMs();
+        var buffer: [mesh_presence_v2.max_wire_len]u8 = undefined;
+        const encoded = try mesh_presence_v2.encode(.{
+            .operation = operation,
+            .origin = self.identity.sign_kp.public_key,
+            .guest = try mesh_presence_v2.guestId(.{ .epoch = 1, .counter = counter }),
+            .revision = 2,
+            .routing_class = .true_guest,
+            .class_revision = 1,
+            .claim_hlc = 1,
+            .claim_revision = 1,
+            .issued_ms = now,
+            .expires_ms = now + 60_000,
+            .nick = nick,
+            .username = "old",
+            .host = "old.host",
+            .realname = "Old",
+            .server = "here.example",
+            .description = "",
+        }, &self.identity.sign_kp, &buffer);
+        const auth = try self.server.ensureGuestAuthority();
+        const roots = try self.server.presenceApprovalRoots(null);
+        defer std.testing.allocator.free(roots);
+        _ = try auth.admit(encoded, roots, now, 0, true);
+    }
+
+    fn deinit(self: *@This()) void {
+        self.server.deinit();
+        std.testing.allocator.destroy(self.server);
+        self.identity.deinit();
+        std.testing.allocator.destroy(self.identity);
+    }
+};
+
+test "Helix adopt: a guest id colliding with a retained quit record is never committed without presence metadata" {
+    defer current_reactor = null;
+    var fixture = try GuestPublishFixtureForTest.create();
+    defer fixture.deinit();
+    // A Helix successor restarts guest_serial at 0 while the ids its adopted
+    // guests carried (and retired here) stay retained: counter 1 is taken.
+    try fixture.retain(1, .quit, "Gone");
+    const conn = try fixture.guest("Ariadne", "Helix guest");
+    fixture.server.publishOrdinaryGuest(conn, false);
+    // 0.11.0 left guest_id = (1,1) with zero metadata here: exactly the
+    // capsule its successor refused ("could not adopt client ... guest=true").
+    const relation = Server.inheritedGuestRelation(conn.guest_id, conn.guest_revision, conn.guest_claim_revision, conn.guest_claim_hlc, "", "Ariadne");
+    try std.testing.expectEqual(Server.InheritedGuestRelation.published, relation);
+    try std.testing.expectEqualSlices(u8, &(try mesh_presence_v2.guestId(.{ .epoch = 1, .counter = 2 })), &conn.guest_id);
+    // The retired record is untouched.
+    const auth = fixture.server.guest_presence.?;
+    const kept = auth.retainedByGuest(fixture.identity.sign_kp.public_key, try mesh_presence_v2.guestId(.{ .epoch = 1, .counter = 1 })).?;
+    try std.testing.expectEqual(mesh_presence_v2.Operation.quit, kept.operation);
+}
+
+test "Helix adopt: a guest whose presence cannot be encoded keeps no incarnation" {
+    defer current_reactor = null;
+    var fixture = try GuestPublishFixtureForTest.create();
+    defer fixture.deinit();
+    // A displayed host outside the presence host grammar fails the encode
+    // after the id was reserved (any early return takes the same path).
+    const conn = try fixture.guest("Oddhost", "Odd host guest");
+    conn.session.restore(.{ .nick = "Oddhost", .username = "guest", .realname = "Odd host guest", .host = "odd*host.example" });
+    conn.session.registration.registered = true;
+    try std.testing.expectEqualStrings("odd*host.example", hostOf(conn));
+    fixture.server.publishOrdinaryGuest(conn, false);
+    try std.testing.expect(std.mem.allEqual(u8, &conn.guest_id, 0));
+    try std.testing.expectEqual(Server.InheritedGuestRelation.none, Server.inheritedGuestRelation(conn.guest_id, conn.guest_revision, conn.guest_claim_revision, conn.guest_claim_hlc, "", "Oddhost"));
+}
+
+test "Helix adopt: an unpublished carried incarnation neither renews nor retires another guest's record" {
+    defer current_reactor = null;
+    var fixture = try GuestPublishFixtureForTest.create();
+    defer fixture.deinit();
+    const owner = try fixture.guest("Owner", "Owner guest");
+    fixture.server.publishOrdinaryGuest(owner, false);
+    try std.testing.expect(owner.guest_revision != 0);
+    const shared = owner.guest_id;
+    // A carried 0.11.0 client that was handed the same id but never admitted.
+    const carried = try fixture.guest("Carried", "Carried guest");
+    carried.guest_id = shared;
+    try std.testing.expect(fixture.server.retireOrdinaryGuestForAccountBind(carried));
+    try std.testing.expect(std.mem.allEqual(u8, &carried.guest_id, 0));
+    carried.guest_id = shared;
+    fixture.server.publishOrdinaryGuest(carried, false);
+    try std.testing.expect(!std.mem.eql(u8, &shared, &carried.guest_id));
+    try std.testing.expect(carried.guest_revision != 0);
+    const auth = fixture.server.guest_presence.?;
+    const kept = auth.retainedByGuest(fixture.identity.sign_kp.public_key, shared).?;
+    try std.testing.expectEqual(mesh_presence_v2.Operation.present, kept.operation);
+    try std.testing.expectEqualStrings("Owner", kept.nick);
 }
