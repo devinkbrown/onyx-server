@@ -22,6 +22,8 @@ const geo_fetch = @import("../proto/geo_fetch.zig");
 const weather_units = @import("../proto/weather_units.zig");
 const news_sources = @import("../proto/news_sources.zig");
 const platform = @import("../substrate/platform.zig");
+const ca_bundle = @import("ca_bundle.zig");
+const dlog = @import("dlog.zig");
 
 comptime {
     if (news_sources.max_shown != max_headlines) @compileError("news show count must match the geo headline slots");
@@ -47,9 +49,18 @@ pub const Options = struct {
     news_ttl_ms: i64 = 5 * 60 * 1000, // news cache TTL 300s
     weather_enabled: bool = true,
     news_enabled: bool = true,
-    /// Skip TLS cert verification for news feeds (public read-only data). Lets
-    /// the best-effort clean-room TLS reach more hosts; off by default.
+    /// Skip TLS cert verification for news feeds (public read-only data).
+    /// Operator escape hatch only; off by default and warned at boot. When off,
+    /// the live fetch verifies against `news_ca_bundle`.
     news_insecure_tls: bool = false,
+    /// PEM CA bundle (RFC 7468 CERTIFICATE blocks) used as the trust anchors
+    /// for the live news fetch. Loaded once by the fetcher thread; a missing,
+    /// oversize, or anchor-free bundle disables the live fetch (fail closed)
+    /// instead of falling back to `news_insecure_tls`. Not part of
+    /// `optionsDigest`: the anchor source never shapes cached state.
+    news_ca_bundle: []const u8 = ca_bundle.default_path,
+    /// Read bound for `news_ca_bundle`.
+    news_ca_bundle_max_bytes: usize = ca_bundle.default_max_bytes,
     /// Directory of headline files written by a key-free updater (tools/
     /// news_update.sh: one headline per line, file `<key>.txt` where key is the
     /// cache key with ':' -> '_', e.g. `src_bbc.txt` / `cc_us.txt`). When set,
@@ -185,6 +196,15 @@ pub const Service = struct {
     /// only wake a reactor; it must not touch the cache or the world.
     fetch_done: ?*const fn (*anyopaque) void = null,
     fetch_done_ctx: ?*anyopaque = null,
+    /// News trust anchors. Owned by the fetcher thread while it runs; `stop`
+    /// and `deinit` release it only after the thread is joined.
+    news_trust: NewsTrust = .{},
+
+    pub const NewsTrustState = enum(u8) { unloaded, ready, failed };
+    pub const NewsTrust = struct {
+        state: NewsTrustState = .unloaded,
+        store: ca_bundle.TrustStore = .{},
+    };
 
     pub fn init(allocator: std.mem.Allocator, opts: Options) Service {
         return .{ .allocator = allocator, .opts = opts };
@@ -196,6 +216,29 @@ pub const Service = struct {
         if (self.thread != null or self.runtime.view != null) return error.AlreadyStarted;
         _ = try optionsDigest(self.opts);
         try self.runtime.pause.bindIo(io);
+        self.logNewsTlsPosture();
+    }
+
+    /// Boot notice for the live news TLS posture. Never fails boot: the fetch
+    /// itself fails closed if the bundle is unusable.
+    pub fn logNewsTlsPosture(self: *const Service) void {
+        if (!self.opts.news_enabled or self.opts.news_cache_dir.len != 0) return;
+        if (self.opts.news_insecure_tls) {
+            dlog.log("onyx-server: WARNING [geo] news_insecure_tls = true: live news feeds are fetched WITHOUT certificate verification; set news_insecure_tls = false to verify against [geo].news_ca_bundle ({s})\n", .{self.opts.news_ca_bundle});
+        } else {
+            dlog.log("onyx-server: [geo] live news fetch verifies TLS against {s}\n", .{self.opts.news_ca_bundle});
+        }
+    }
+
+    /// Release the news trust anchors. Call after the fetcher is stopped (or
+    /// was never started). `stop` already does this.
+    pub fn deinit(self: *Service) void {
+        self.releaseNewsTrust();
+    }
+
+    fn releaseNewsTrust(self: *Service) void {
+        if (self.news_trust.state == .ready) self.news_trust.store.deinit(self.allocator);
+        self.news_trust = .{};
     }
     pub fn validateDormantRegistration(self: *Service, control: *runtime_pause.start_gate.Control, view: *const runtime_pause.start_gate.View, slot: runtime_pause.start_gate.Slot) !void {
         try self.runtime.validateRegistration(control, view, slot, .geo, 0, self, dormant_spawn_options);
@@ -477,6 +520,7 @@ pub const Service = struct {
             t.join();
             self.thread = null;
         }
+        self.releaseNewsTrust();
     }
 
     // ---- reactor-side API (mutex-guarded, never blocks on network) ----------
@@ -799,13 +843,7 @@ pub const Service = struct {
 
     fn tryFetchNews(self: *Service, k: []const u8) bool {
         const url = newsUrlForKey(k) orelse return false;
-        const u = http_fetch.parseUrl(url) catch return false;
-        var req_buf: [1024]u8 = undefined;
-        const req = geo_fetch.buildNewsRequest(&req_buf, u.host, u.path) catch return false;
-        const resp = http_fetch.get(self.allocator, u.host, u.port, u.tls, req, .{
-            .insecure_skip_verify = self.opts.news_insecure_tls,
-            .max_response_bytes = 1024 * 1024,
-        }) catch return false;
+        const resp = self.fetchNewsUrl(url) catch return false;
         defer self.allocator.free(resp);
         const body = geo_fetch.httpPayload(resp) orelse return false;
 
@@ -818,6 +856,45 @@ pub const Service = struct {
             lines[i] = geo_fetch.packHeadline(&packed_rows[i], item.published_unix, item.title, item.deck);
         }
         return self.storeNews(k, lines[0..got.len]);
+    }
+
+    /// One live feed GET. Verifies the server certificate against the loaded
+    /// `news_ca_bundle` (RFC 8446 §4.4.2.2 via `http_fetch`), unless the
+    /// operator set `news_insecure_tls`. An unusable bundle refuses the fetch;
+    /// it never degrades to an unverified connection.
+    fn fetchNewsUrl(self: *Service, url: []const u8) ![]u8 {
+        const u = try http_fetch.parseUrl(url);
+        var req_buf: [1024]u8 = undefined;
+        const req = try geo_fetch.buildNewsRequest(&req_buf, u.host, u.path);
+        var fetch_opts: http_fetch.Options = .{ .max_response_bytes = 1024 * 1024 };
+        if (u.tls) {
+            if (self.opts.news_insecure_tls) {
+                fetch_opts.insecure_skip_verify = true;
+            } else {
+                fetch_opts.trust_anchors = self.newsTrustAnchors() orelse return error.NoTrustAnchors;
+            }
+        }
+        return http_fetch.get(self.allocator, u.host, u.port, u.tls, req, fetch_opts);
+    }
+
+    /// Load `news_ca_bundle` once per fetcher lifetime. Fetcher thread only.
+    /// Failure is sticky (one clear log line, then every live fetch refuses)
+    /// until `stop` resets it.
+    fn newsTrustAnchors(self: *Service) ?[]const []const u8 {
+        switch (self.news_trust.state) {
+            .ready => return self.news_trust.store.slice(),
+            .failed => return null,
+            .unloaded => {},
+        }
+        if (loadBundle(self.allocator, self.opts.news_ca_bundle, self.opts.news_ca_bundle_max_bytes)) |store| {
+            self.news_trust = .{ .state = .ready, .store = store };
+            dlog.log("onyx-server: [geo] loaded {d} news trust anchors from {s}\n", .{ store.slice().len, self.opts.news_ca_bundle });
+            return self.news_trust.store.slice();
+        } else |err| {
+            self.news_trust = .{ .state = .failed };
+            dlog.log("onyx-server: ERROR [geo] news CA bundle {s} unusable ({s}); live news fetch DISABLED (fix [geo].news_ca_bundle; there is no automatic fallback to news_insecure_tls)\n", .{ self.opts.news_ca_bundle, @errorName(err) });
+            return null;
+        }
     }
 
     /// Read `<news_cache_dir>/<key with ':'->'_'>.txt` (one headline per line,
@@ -946,6 +1023,20 @@ fn fileKey(k: []const u8, buf: []u8) []const u8 {
     const n = @min(buf.len, k.len);
     for (k[0..n], 0..) |c, i| buf[i] = if (c == ':') '_' else c;
     return buf[0..n];
+}
+
+/// Read and decode a PEM CA bundle with the fetcher's raw-syscall reader (no
+/// reactor io). A file larger than `max_bytes` is refused, not truncated: a
+/// silently cut bundle would drop roots without notice.
+fn loadBundle(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) !ca_bundle.TrustStore {
+    if (path.len == 0 or max_bytes == 0 or max_bytes == std.math.maxInt(usize)) return error.InvalidPath;
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
+    defer allocator.free(path_z);
+    const buf = try allocator.alloc(u8, max_bytes + 1);
+    defer allocator.free(buf);
+    const text = readFileZ(path_z, buf) orelse return error.Unreadable;
+    if (text.len > max_bytes) return error.FileTooBig;
+    return ca_bundle.TrustStore.fromPem(allocator, text);
 }
 
 /// Finite regular-cache acquisition. NONBLOCK prevents a configured FIFO from
@@ -1676,3 +1767,257 @@ test "companion runtime producer fence GEO carries accepted lazy FIFO and preven
     try std.testing.expectError(error.InvalidProducerFence, service.inspectFrozen(fence, null));
     try std.testing.expectEqual(@as(usize, 2), (try service.inspectFrozen(next, null)).queued);
 }
+
+/// Loopback TLS 1.3 feed server for the news trust tests (Linux sockets).
+const NewsTlsFixture = struct {
+    const tls_server = @import("../crypto/tls_server.zig");
+    const native_io = @import("http_fetch/native_io.zig");
+    const max_tls_record = @import("http_fetch/tls_exchange.zig").max_tls_record;
+
+    listen_fd: linux.fd_t,
+    port: u16,
+
+    fn open() !NewsTlsFixture {
+        const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
+        const fd: linux.fd_t = @intCast(rc);
+        errdefer _ = linux.close(fd);
+        var addr: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+        if (posix.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+        if (posix.errno(linux.listen(fd, 4)) != .SUCCESS) return error.SkipZigTest;
+        var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+        if (posix.errno(linux.getsockname(fd, @ptrCast(&addr), &len)) != .SUCCESS) return error.TestUnexpectedResult;
+        return .{ .listen_fd = fd, .port = std.mem.bigToNative(u16, addr.port) };
+    }
+
+    fn close(self: *NewsTlsFixture) void {
+        _ = linux.close(self.listen_fd);
+    }
+
+    fn pendingConnection(self: *const NewsTlsFixture) bool {
+        var pfd = [_]linux.pollfd{.{ .fd = self.listen_fd, .events = linux.POLL.IN, .revents = 0 }};
+        return linux.poll(&pfd, 1, 0) != 0;
+    }
+
+    const Worker = struct {
+        listen_fd: linux.fd_t,
+        chain: []const []const u8,
+        key_pair: std.crypto.sign.Ed25519.KeyPair,
+        expect_http: bool,
+        request_seen: bool = false,
+        alert_seen: bool = false,
+        failure: ?anyerror = null,
+
+        fn run(self: *Worker) void {
+            self.exchange() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn readExact(fd: linux.fd_t, bytes: []u8) !void {
+            var off: usize = 0;
+            while (off < bytes.len) off += try native_io.readSome(fd, bytes[off..]);
+        }
+
+        fn record(fd: linux.fd_t, buffer: []u8) ![]u8 {
+            try readExact(fd, buffer[0..5]);
+            const len = 5 + @as(usize, std.mem.readInt(u16, buffer[3..5], .big));
+            if (len > buffer.len) return error.TestUnexpectedResult;
+            try readExact(fd, buffer[5..len]);
+            return buffer[0..len];
+        }
+
+        fn exchange(self: *Worker) !void {
+            var pfd = [_]linux.pollfd{.{ .fd = self.listen_fd, .events = linux.POLL.IN, .revents = 0 }};
+            if (linux.poll(&pfd, 1, 3000) != 1) return error.TestUnexpectedResult;
+            const arc = linux.accept4(self.listen_fd, null, null, linux.SOCK.CLOEXEC);
+            if (posix.errno(arc) != .SUCCESS) return error.TestUnexpectedResult;
+            const fd: linux.fd_t = @intCast(arc);
+            defer _ = linux.close(fd);
+            try native_io.setRecvTimeout(fd, 3000);
+            var engine = try tls_server.Server.init(std.heap.page_allocator, .{
+                .cert_chain = self.chain,
+                .signing_key = self.key_pair,
+            });
+            defer engine.deinit();
+            var buffer: [max_tls_record]u8 = undefined;
+            while (!engine.handshakeDone()) {
+                switch (try engine.feed(try record(fd, &buffer))) {
+                    .bytes_to_send => |bytes| {
+                        defer std.heap.page_allocator.free(bytes);
+                        try native_io.writeAll(fd, bytes);
+                    },
+                    .need_more => {},
+                }
+                if (!self.expect_http) {
+                    // RFC 8446 §4.4.2.4 / §6.2: an untrusted chain makes the
+                    // client abort with a fatal alert before application data.
+                    try std.testing.expectError(error.TlsAlert, engine.feed(try record(fd, &buffer)));
+                    self.alert_seen = true;
+                    return;
+                }
+            }
+            const request = try engine.decrypt(try record(fd, &buffer));
+            defer std.heap.page_allocator.free(request);
+            self.request_seen = std.mem.startsWith(u8, request, "GET /feed HTTP/1.1\r\n");
+            const response = try engine.encrypt("HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nConnection: close\r\n\r\n" ++
+                "<rss><channel><item><title>Loopback headline</title></item></channel></rss>");
+            defer std.heap.page_allocator.free(response);
+            try native_io.writeAll(fd, response);
+        }
+    };
+};
+
+fn newsTestCert(buf: []u8, seed: u8, kp: std.crypto.sign.Ed25519.KeyPair) ![]const u8 {
+    const selfsign = @import("../proto/x509_selfsign.zig");
+    return selfsign.buildSelfSigned(buf, .{
+        .common_name = "127.0.0.1",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ seed, 1 },
+        .key_pair = kp,
+        .ip_addresses = &.{&.{ 127, 0, 0, 1 }},
+        .is_ca = true,
+    });
+}
+
+fn writeTestBundle(dir: std.Io.Dir, name: []const u8, der: []const u8) !void {
+    const pem = @import("../proto/pem.zig");
+    var pem_buf: [4096]u8 = undefined;
+    const text = try pem.encode(&pem_buf, "CERTIFICATE", der);
+    var file_buf: [4200]u8 = undefined;
+    const body = try std.fmt.bufPrint(&file_buf, "# test bundle\n{s}\n", .{text});
+    try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = body });
+}
+
+fn runNewsFetch(service: *Service, fixture: *const NewsTlsFixture, url: []const u8, chain: []const []const u8, kp: std.crypto.sign.Ed25519.KeyPair, expect_http: bool, worker: *NewsTlsFixture.Worker) anyerror![]u8 {
+    worker.* = .{ .listen_fd = fixture.listen_fd, .chain = chain, .key_pair = kp, .expect_http = expect_http };
+    const thread = try std.Thread.spawn(.{}, NewsTlsFixture.Worker.run, .{worker});
+    const resp = service.fetchNewsUrl(url);
+    thread.join();
+    if (worker.failure) |err| {
+        if (resp) |r| service.allocator.free(r) else |_| {}
+        return err;
+    }
+    return resp;
+}
+
+test "news live fetch verifies against news_ca_bundle and fails closed on a wrong bundle" {
+    if (comptime builtin_os != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const server_kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x47));
+    const other_kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x48));
+    var cert_buf: [2048]u8 = undefined;
+    const cert = try newsTestCert(&cert_buf, 0x47, server_kp);
+    var other_buf: [2048]u8 = undefined;
+    const other = try newsTestCert(&other_buf, 0x48, other_kp);
+    try writeTestBundle(tmp.dir, "good.pem", cert);
+    try writeTestBundle(tmp.dir, "wrong.pem", other);
+    var good_path_buf: [256]u8 = undefined;
+    const good_path = try std.fmt.bufPrint(&good_path_buf, ".zig-cache/tmp/{s}/good.pem", .{tmp.sub_path});
+    var wrong_path_buf: [256]u8 = undefined;
+    const wrong_path = try std.fmt.bufPrint(&wrong_path_buf, ".zig-cache/tmp/{s}/wrong.pem", .{tmp.sub_path});
+
+    var fixture = try NewsTlsFixture.open();
+    defer fixture.close();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/feed", .{fixture.port});
+    const chain = [_][]const u8{cert};
+    var worker: NewsTlsFixture.Worker = undefined;
+
+    // Trusted bundle: verification succeeds with news_insecure_tls off.
+    {
+        var service = Service.init(a, .{ .news_ca_bundle = good_path });
+        defer service.deinit();
+        const resp = try runNewsFetch(&service, &fixture, url, &chain, server_kp, true, &worker);
+        defer a.free(resp);
+        try std.testing.expect(worker.request_seen);
+        const body = geo_fetch.httpPayload(resp) orelse return error.TestUnexpectedResult;
+        var items: [max_headlines]geo_fetch.RssItem = undefined;
+        const got = geo_fetch.parseRssItems(body, &items);
+        try std.testing.expectEqual(@as(usize, 1), got.len);
+        try std.testing.expectEqualStrings("Loopback headline", got[0].title);
+        try std.testing.expectEqual(Service.NewsTrustState.ready, service.news_trust.state);
+    }
+
+    // Wrong bundle: the handshake aborts before any HTTP request.
+    {
+        var service = Service.init(a, .{ .news_ca_bundle = wrong_path });
+        defer service.deinit();
+        const resp = runNewsFetch(&service, &fixture, url, &chain, server_kp, false, &worker);
+        defer if (resp) |r| a.free(r) else |_| {};
+        try std.testing.expectError(error.UnknownCa, resp);
+        try std.testing.expect(worker.alert_seen and !worker.request_seen);
+        try std.testing.expect(!fixture.pendingConnection()); // no TLS 1.2 or plaintext retry
+    }
+
+    // Escape hatch: news_insecure_tls never consults the bundle.
+    {
+        var service = Service.init(a, .{ .news_insecure_tls = true, .news_ca_bundle = "/nonexistent/onyx-geo.pem" });
+        defer service.deinit();
+        const resp = try runNewsFetch(&service, &fixture, url, &chain, server_kp, true, &worker);
+        defer a.free(resp);
+        try std.testing.expect(worker.request_seen);
+        try std.testing.expectEqual(Service.NewsTrustState.unloaded, service.news_trust.state);
+    }
+}
+
+test "news live fetch refuses to connect when the CA bundle is unusable" {
+    if (comptime builtin_os != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "empty.pem", .data = "no certificates here\n" });
+    var empty_path_buf: [256]u8 = undefined;
+    const empty_path = try std.fmt.bufPrint(&empty_path_buf, ".zig-cache/tmp/{s}/empty.pem", .{tmp.sub_path});
+    var missing_path_buf: [256]u8 = undefined;
+    const missing_path = try std.fmt.bufPrint(&missing_path_buf, ".zig-cache/tmp/{s}/missing.pem", .{tmp.sub_path});
+
+    var fixture = try NewsTlsFixture.open();
+    defer fixture.close();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/feed", .{fixture.port});
+
+    const cases = [_]Options{
+        .{ .news_ca_bundle = missing_path },
+        .{ .news_ca_bundle = empty_path },
+        .{ .news_ca_bundle = empty_path, .news_ca_bundle_max_bytes = 4 }, // over the bound
+        .{ .news_ca_bundle = "" },
+    };
+    for (cases) |opts| {
+        var service = Service.init(a, opts);
+        defer service.deinit();
+        try std.testing.expectError(error.NoTrustAnchors, service.fetchNewsUrl(url));
+        try std.testing.expectEqual(Service.NewsTrustState.failed, service.news_trust.state);
+        // Sticky: a second fetch still refuses, never reverting to insecure.
+        try std.testing.expectError(error.NoTrustAnchors, service.fetchNewsUrl(url));
+    }
+    try std.testing.expect(!fixture.pendingConnection());
+}
+
+test "news CA bundle load is bounded and frees on failure" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x49));
+    var cert_buf: [2048]u8 = undefined;
+    try writeTestBundle(tmp.dir, "one.pem", try newsTestCert(&cert_buf, 0x49, kp));
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/one.pem", .{tmp.sub_path});
+    var store = try loadBundle(a, path, ca_bundle.default_max_bytes);
+    defer store.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), store.slice().len);
+    try std.testing.expectError(error.FileTooBig, loadBundle(a, path, 16));
+    try std.testing.expectError(error.Unreadable, loadBundle(a, ".zig-cache/tmp", ca_bundle.default_max_bytes));
+    try std.testing.checkAllAllocationFailures(a, struct {
+        fn run(alloc: std.mem.Allocator, p: []const u8) !void {
+            var s = try loadBundle(alloc, p, 64 * 1024);
+            s.deinit(alloc);
+        }
+    }.run, .{path});
+}
+
+const builtin_os = @import("builtin").os.tag;

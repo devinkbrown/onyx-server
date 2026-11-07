@@ -197,8 +197,15 @@ pub const Config = struct {
     /// wttr.in + the bundled RSS feeds in a background thread.
     pub const Geo = struct {
         enabled: bool = false,
-        /// Skip TLS verification for public read-only news feeds.
-        news_insecure_tls: bool = true,
+        /// Skip TLS verification for public read-only news feeds. Explicit
+        /// operator escape hatch; off by default and warned at boot.
+        news_insecure_tls: bool = false,
+        /// PEM CA bundle whose certificates are the trust anchors for the live
+        /// news fetch. Null = `ca_bundle.default_path`. An unusable bundle
+        /// disables the live fetch; it never falls back to insecure.
+        news_ca_bundle: ?[]const u8 = null,
+        /// Read bound for `news_ca_bundle` (64 KiB..64 MiB).
+        news_ca_bundle_max_bytes: u64 = 4 << 20,
         /// Min ms between bot replies per channel (anti-flood). 0 = disabled.
         cmd_cooldown_ms: u32 = 3000,
         /// Fallback `!weather` location when a user has no GeoIP/`location` meta.
@@ -996,6 +1003,7 @@ pub const Config = struct {
         if (self.news.source) |v| allocator.free(v);
         if (self.geo.default_location) |v| allocator.free(v);
         if (self.geo.news_cache_dir) |v| allocator.free(v);
+        if (self.geo.news_ca_bundle) |v| allocator.free(v);
         if (self.oper.grants_path) |v| allocator.free(v);
         if (self.oper.event_history_path) |v| allocator.free(v);
         if (self.trace.file) |v| allocator.free(v);

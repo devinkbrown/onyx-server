@@ -162,9 +162,17 @@ count = 3
 # `default_location` below), localized to their country (°F/mph for US/LR/MM,
 # else °C/km-h). Users can override per call: `!weather Tokyo`.
 enabled = false
-# Skip TLS verification for the public read-only news feeds so the best-effort
-# clean-room TLS reaches more hosts. Weather is plain HTTP and unaffected.
-news_insecure_tls = true
+# Operator escape hatch: skip TLS certificate verification for the live news
+# fetch. Logged as a warning at boot when true. Weather is plain HTTP.
+news_insecure_tls = false
+# PEM CA bundle whose certificates are the trust anchors for the live news
+# fetch. Loaded once; a missing, oversize, or empty bundle disables the live
+# fetch with an error log (never a silent fallback to news_insecure_tls).
+# NOT YET EFFECTIVE: parsed but not yet passed to the geo service; the live
+# fetch always uses /etc/ssl/certs/ca-certificates.crt and the 4194304 bound.
+news_ca_bundle = "/etc/ssl/certs/ca-certificates.crt"
+# Read bound for news_ca_bundle, in bytes. Range 65536..67108864.
+news_ca_bundle_max_bytes = 4194304
 # Minimum interval between bot replies in a single channel, in ms (anti-flood,
 # so a user can't spam !weather to flood the channel). 0 disables. Range 0..600000.
 cmd_cooldown_ms = 3000
