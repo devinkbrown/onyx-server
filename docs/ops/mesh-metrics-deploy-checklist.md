@@ -59,6 +59,35 @@ link:
 | `onyx_session_replica_{entries,tombstones,...}` | Replica table and tombstone occupancy against their caps. |
 | `onyx_resource_*` | `[resources]` memory budget and refusals. |
 
+## Helix refused for "remote visible identity"
+
+`UPGRADE refused — remote visible identity and physical notification frontiers
+has no exact Helix checkpoint` covers four separate conditions. Builds after
+0.11.0 log one more line that names them, followed by up to four
+`UPGRADE continuity non-IRC output client=… encoding=… owner=…` samples:
+
+```text
+onyx-server: UPGRADE continuity detail: local_quit_captures=N (recipients=N) pending_remote_host_records=N (unattached=N) departures=N (records=N) spool_barriers=N (clients=N: attached=N closing=N detached=N) spool_non_irc=N (plaintext=N preframed_secure=N; attached=N closing=N detached=N)
+```
+
+`UPGRADE PLAN` prints the same detail. These `/metrics` gauges carry the
+counts without World-dependent attached/closing/detached classification:
+
+| Gauge | Blocks Helix when non-zero |
+|---|---|
+| `onyx_helix_continuity_local_quit_captures` (`…_local_quit_recipients`) | A local QUIT still owed to physical recipients |
+| `onyx_helix_continuity_pending_remote_host_records` | CHGHOST or split records not yet in a SendQ |
+| `onyx_helix_continuity_departure_images` (`…_departure_records`) | Peer netsplit images not yet received by every recipient |
+| `onyx_helix_continuity_spool_barriers` | Output barriers held for those images |
+| `onyx_helix_continuity_spool_plaintext`, `…_spool_preframed_secure` | Diverted output not yet in a SendQ |
+| `onyx_helix_continuity_remote_visible_blocked` | 1 when any of the above holds |
+
+These should return to 0 within a few sweep intervals (`[limits] sweep_interval`,
+2s on both nodes). If they stay up, `owner=closing` means that a connection
+which is already closing still holds diverted output. The maintenance timer now
+finishes that close. `owner=attached` that persists for longer than the
+kernel's 60s TCP user timeout is a bug to report, along with the detail line.
+
 For a supplementary CA/hostname-verified cross-node chat smoke:
 
 ```sh
