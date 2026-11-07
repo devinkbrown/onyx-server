@@ -70,6 +70,11 @@ pub fn randomSource(seed: u64) Source {
 }
 
 /// Per-country default headline feeds, verbatim URLs.
+///
+/// Every feed here (and in `sources`) must serve UTF-8. `geo_fetch` does no
+/// charset transcoding, so a Latin-1 body would put invalid UTF-8 on the wire
+/// of a UTF8ONLY server. Check `encoding=` and validate the body
+/// (`iconv -f UTF-8 -t UTF-8`) before adding a feed.
 pub const country_feeds = [_]CountryFeed{
     .{ .cc = "US", .name = "NPR News", .url = "https://feeds.npr.org/1001/rss.xml" },
     .{ .cc = "GB", .name = "BBC News", .url = "https://feeds.bbci.co.uk/news/rss.xml" },
@@ -106,7 +111,7 @@ pub const country_feeds = [_]CountryFeed{
     .{ .cc = "ES", .name = "The Local Spain", .url = "https://www.thelocal.es/feeds/rss.php" },
     .{ .cc = "PT", .name = "The Portugal News", .url = "https://www.theportugalnews.com/rss" },
     .{ .cc = "MY", .name = "Malay Mail", .url = "https://www.malaymail.com/feed" },
-    .{ .cc = "ID", .name = "ANTARA News", .url = "https://en.antaranews.com/rss/news.xml" },
+    .{ .cc = "ID", .name = "ANTARA News", .url = "https://www.antaranews.com/rss/terkini.xml" },
     .{ .cc = "TH", .name = "Bangkok Post", .url = "https://www.bangkokpost.com/rss/data/topstories.xml" },
     .{ .cc = "VN", .name = "VnExpress International", .url = "https://e.vnexpress.net/rss/news.rss" },
     .{ .cc = "HK", .name = "SCMP", .url = "https://www.scmp.com/rss/91/feed/" },
@@ -319,7 +324,8 @@ test "every source and country feed has an https url" {
 test "retired feed URLs stay out of the catalogue" {
     // Each of these failed a live probe on 2026-11-07 (TLS failure, NXDOMAIN,
     // 3xx the fetcher does not follow, 404/410, a body over the 1 MiB fetch
-    // cap, or a 200 with no <item>/<entry>). None may come back.
+    // cap, a 200 with no <item>/<entry>, or a non-UTF-8 body). None may come
+    // back.
     const retired = [_][]const u8{
         "https://rss.cnn.com/rss/edition.rss",
         "https://feeds.24.com/articles/news24/TopStories/rss",
@@ -336,6 +342,8 @@ test "retired feed URLs stay out of the catalogue" {
         "https://www.chinadaily.com.cn/rss/cndy_rss.xml",
         "https://www.koreaherald.com/rss/01.xml",
         "https://vietnamnews.vn/rss/20.rss",
+        // Served as ISO-8859-1 with raw 0xA0 bytes in <title>; not UTF-8.
+        "https://en.antaranews.com/rss/news.xml",
     };
     for (retired) |dead| {
         for (sources) |s| try std.testing.expect(!std.mem.eql(u8, s.url, dead));
