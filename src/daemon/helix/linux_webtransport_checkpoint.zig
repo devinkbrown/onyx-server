@@ -119,6 +119,24 @@ pub fn encode(allocator: std.mem.Allocator, body: *const Body, tls: wt.TlsConfig
     return codec.encodeFramed(Body, allocator, body.*, magic, keyed_version, keyed_domain);
 }
 
+pub const LegacyTargetError = error{WideKeyUpdateUnsupported};
+
+/// Shape `body` for a successor lacking `quic-wide-key-update-v1` (0.10.4,
+/// which decodes only the v2 frame and requires `key_update.ready == false`
+/// for TLS_AES_256_GCM_SHA384). The QUIC session-ticket keys are dropped so
+/// `encode` writes the exact v2 frame: tickets issued before the swap then
+/// fall back to a full handshake, which is what the older successor does for
+/// every connection anyway. A live SHA-384 connection captured ready for key
+/// update has no v2-equivalent state and returns an error; the caller refuses
+/// the UPGRADE before exec with every connection intact.
+pub fn prepareForLegacyTarget(body: *Body) LegacyTargetError!void {
+    for (body.snapshot.connections) |*row| {
+        if (row.quic.requiresWideKeyUpdateAdopter()) return error.WideKeyUpdateUnsupported;
+    }
+    body.quic_ticket_keys.wipe();
+    body.quic_ticket_keys = .{};
+}
+
 /// Strict on the current (v3) frame; a v2 frame (older predecessor, or no
 /// key to carry) decodes with the keys absent.
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8, tls: wt.TlsConfig) Error!Body {
@@ -377,6 +395,17 @@ test "Helix Linux WebTransport carries QUIC ticket keys in v3 and accepts their 
     const cross = try codec.encodeFramed(Body, allocator, body, magic, keyed_version, domain);
     defer freeEncoded(allocator, cross);
     try std.testing.expectError(error.InvalidSnapshot, validateWire(cross));
+
+    // Rollback target lacking quic-wide-key-update-v1 (0.10.4): the keys are
+    // dropped so the frame is the exact v2 a v2-only reader decodes.
+    var rollback = body;
+    try prepareForLegacyTarget(&rollback);
+    try std.testing.expect(rollback.quic_ticket_keys.current == null and rollback.quic_ticket_keys.previous == null);
+    const legacy_wire = try encode(allocator, &rollback, tls);
+    defer freeEncoded(allocator, legacy_wire);
+    try std.testing.expectEqual(version, try frameVersion(legacy_wire));
+    try std.testing.expectEqualSlices(u8, plain, legacy_wire);
+    _ = try codec.scanFramed(BodyV2, legacy_wire, magic, version, domain);
     body.quic_ticket_keys = .{};
 }
 

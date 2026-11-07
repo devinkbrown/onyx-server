@@ -1837,6 +1837,9 @@ pub fn main(init: std.process.Init) !void {
             // Advertise only the current exact contract. A pre-S2S-v5 writer
             // cannot preserve authenticated partial frames, so its probe must
             // refuse this target while the predecessor still serves clients.
+            // The advertisement is multi-line: the base token plus rolling
+            // state capabilities (tls-session-v4, quic-wide-key-update-v1)
+            // whose absence tells a predecessor to seal older row forms.
             std.debug.print("{s}\n", .{onyx_server.daemon.helix.live.upgrade_capability_advertisement});
             if (comptime builtin.os.tag == .linux)
                 std.debug.print("{s}\n", .{onyx_server.daemon.helix.live.boot_policy_capability_token});

@@ -5586,6 +5586,11 @@ pub const LinuxServer = struct {
     /// counted until its handoff attempt has finished.
     windows_upgrade_priority_lock: std.atomic.Mutex = .unlocked,
     windows_manual_upgrade_pending: usize = 0,
+    /// Rolling state capabilities of the Helix target pinned by the most recent
+    /// `openCompatibleUpgradeTarget` probe (Linux). The seal writes each row in
+    /// a form this target adopts, or refuses UPGRADE before exec. Native
+    /// same-image handoffs never probe and keep `.current`.
+    helix_target_state_caps: helix_live.TargetStateCaps = .current,
     /// Reactor-0 monotonic retry guard for automatic Windows descriptor-ID
     /// rollover. The successor starts fresh after Helix imports only live IDs.
     windows_descriptor_rollover_retry_after_ms: i64 = 0,
@@ -39423,8 +39428,11 @@ pub const LinuxServer = struct {
         errdefer closeFd(executable_fd);
 
         const io = self.config.crypto_io orelse return error.UpgradeProbeUnavailable;
-        if (!try helix_live.probeUpgradeExecutableFdWithBootPolicy(self.allocator, io, executable_fd, self.config.helix_boot_policy))
+        const caps = (try helix_live.probeUpgradeExecutableFdStateCaps(self.allocator, io, executable_fd, self.config.helix_boot_policy)) orelse
             return error.UpgradeTargetIncompatible;
+        self.helix_target_state_caps = caps;
+        if (!caps.tls_session_v4 or !caps.quic_wide_key_update)
+            srvLog("onyx-server: UPGRADE target is a rollback image (tls-session-v4={}, quic-wide-key-update-v1={}); rows are sealed in its older exact forms or UPGRADE is refused before exec\n", .{ caps.tls_session_v4, caps.quic_wide_key_update });
         return executable_fd;
     }
 
@@ -40801,6 +40809,12 @@ pub const LinuxServer = struct {
         s2s_preserved: usize = 0,
         s2s_preserve_failed: bool = false,
         s2s_hint_failed: bool = false,
+        /// Rollback target lacking `tls-session-v4` (0.10.4): TLS 1.2 rows
+        /// written in exact v3 form after dropping only the RFC 9266 binding,
+        /// and rows with no v3 form (kTLS-offloaded TLS 1.2 / TLS 1.2 control
+        /// state) that keep the cut incomplete so UPGRADE refuses before exec.
+        tls_rollback_downgraded: usize = 0,
+        tls_rollback_refused: usize = 0,
     };
 
     /// Seal ONE reactor shard's connections for a Helix UPGRADE: every carried
@@ -40986,10 +41000,25 @@ pub const LinuxServer = struct {
                     .kernel_tx_prefix_remaining = e.value.tls_kernel_prefix_remaining,
                 }) catch continue;
                 defer capture.deinit();
-                // Helix rollback: write the lowest exact schema (v3 unless the
-                // row carries a TLS 1.2 binding/offload) so a v3-only
-                // successor (0.10.4) still adopts the common case.
-                const tls_row = tlsCaptureSnapshot(e.value, &capture);
+                // Every TLS 1.3 row and every TLS 1.2 row without v4-only data
+                // is written as exact v3; anything else is v4. On its own this
+                // does NOT make a rollback safe: every completed EMS TLS 1.2
+                // session carries `session.tls_exporter` (and is kTLS-offloaded
+                // under `ktls="txrx"`), so it is v4, and a [3,3]-only successor
+                // (0.10.4) aborts the whole adopt on it. When the probed target
+                // lacks `tls-session-v4`, drop only the TLS 1.2 binding (0.10.4
+                // never offers SCRAM -PLUS on TLS 1.2, so it loses nothing it
+                // could use) and refuse UPGRADE before exec for any row that
+                // still has no exact v3 form.
+                var tls_row = tlsCaptureSnapshot(e.value, &capture);
+                if (!self.helix_target_state_caps.tls_session_v4 and !tls_snapshot.representableAsV3(tls_row)) {
+                    tls_row = tls_snapshot.forV3Target(tls_row) orelse {
+                        counts.tls_rollback_refused += 1;
+                        skip = "TLS 1.2 kTLS/control state has no tls_session v3 form (target lacks tls-session-v4)";
+                        continue;
+                    };
+                    counts.tls_rollback_downgraded += 1;
+                }
                 tls_blob_version = tls_snapshot.minimalVersion(tls_row);
                 tls_blob = tls_snapshot.encodeVersion(self.allocator, tls_row, tls_blob_version) catch continue;
             }
@@ -42520,6 +42549,15 @@ pub const LinuxServer = struct {
                     self.deferredUpgradeNotice(request, "UPGRADE refused: WebTransport has not reached an exact checkpoint boundary");
                     return err;
                 };
+                if (!self.helix_target_state_caps.quic_wide_key_update) {
+                    linux_wt_checkpoint.prepareForLegacyTarget(&linux_webtransport_body.?) catch {
+                        const msg = "UPGRADE refused: target binary cannot adopt live WebTransport TLS_AES_256_GCM_SHA384 connections (quic-wide-key-update-v1); wait for them to close or cold restart";
+                        srvLog("onyx-server: {s}\n", .{msg});
+                        self.deferredUpgradeNotice(request, msg);
+                        self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: rollback target lacks quic-wide-key-update-v1") catch {};
+                        return error.UpgradeTargetIncompatible;
+                    };
+                }
                 const tls_wire = try encodeWebTransportTls(self.allocator, self.linuxWebTransportOwner().?.tls);
                 windows_tls_material_wire = tls_wire;
                 try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = tls_wire, .min_supported = 2 });
@@ -42637,6 +42675,18 @@ pub const LinuxServer = struct {
             self.deferredUpgradeNotice(request, "UPGRADE refused: exact secured-link or unmanaged-dial continuity could not be sealed");
             self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: incomplete mesh continuity seal") catch {};
             return error.SessionReplicaConverging;
+        }
+        if (seal_counts.tls_rollback_downgraded != 0)
+            srvLog("onyx-server: UPGRADE — {d} TLS 1.2 session(s) sealed as tls_session v3 for a rollback target (RFC 9266 binding dropped; SCRAM -PLUS unavailable on them after the swap)\n", .{seal_counts.tls_rollback_downgraded});
+        if (seal_counts.tls_rollback_refused != 0) {
+            restoreCloexec(carried_fds[0..carried_fd_count]);
+            var rb: [320]u8 = undefined;
+            const msg = std.fmt.bufPrint(&rb, "UPGRADE refused: target binary cannot adopt {d} kTLS TLS 1.2 session(s) (tls-session-v4); set [tls] ktls = \"off\" and UPGRADE to the current image first, then wait for or disconnect kTLS TLS 1.2 clients (onyx_tls_ktls12_active 0), or cold restart", .{seal_counts.tls_rollback_refused}) catch
+                "UPGRADE refused: target binary cannot adopt kTLS TLS 1.2 sessions (tls-session-v4)";
+            srvLog("onyx-server: {s}\n", .{msg});
+            self.deferredUpgradeNotice(request, msg);
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: rollback target lacks tls-session-v4 for live kTLS TLS 1.2 sessions") catch {};
+            return error.UpgradeTargetIncompatible;
         }
         if (seal_counts.fd_prepare_failed or seal_counts.clients != seal_counts.clients_expected) {
             restoreCloexec(carried_fds[0..carried_fd_count]);
@@ -186175,6 +186225,294 @@ test "armor3: TLS 1.2 RFC 9266 channel binding rides the tls_session row and is 
     // The resumed 1.2 engine itself cannot re-derive it.
     var scratch: [32]u8 = undefined;
     try std.testing.expectError(error.BadState, adopted.tls.?.channelBindingTlsExporter(&scratch));
+}
+
+/// Helix rollback fixture: one registered TLS 1.2 (EMS) client whose live
+/// path has derived the RFC 9266 binding, on a real TCP socket so kTLS can be
+/// attached. `exe_path` lets a test pin a fake probe target.
+const HelixRollbackTls12Fixture = struct {
+    server: *Server,
+    pair: *DaemonOutputTestPair,
+    id: client_model.ClientId,
+    peer_fd: i32,
+    binding: [32]u8,
+
+    fn create(exe_path: ?[]const u8) !HelixRollbackTls12Fixture {
+        if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+        const a = std.testing.allocator;
+        const pair = try DaemonOutputTestPair.createSuite(.tls12, null);
+        errdefer pair.destroy();
+        const server = try createTestServer(a, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .crypto_io = std.testing.io,
+            .exe_path = exe_path,
+            .tls_cert_chain = &pair.chain13,
+            .tls_signing_key = pair.tls.cfg13.signing_key,
+            .tls12_cert_chain = &pair.chain12,
+            .tls12_signing_key = pair.tls.cfg12.?.ecdsa_p256_signing_key,
+        });
+        errdefer {
+            server.deinit();
+            a.destroy(server);
+        }
+        current_reactor = &server.reactors[0];
+        const peer = try connectLoopback(try server.boundPort());
+        errdefer closeFd(peer);
+        var ready = [_]posix.pollfd{.{ .fd = server.reactors[0].listener_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 2000) == 0) return error.TestTimeout;
+        const accepted = linux.accept4(server.reactors[0].listener_fd, null, null, linux.SOCK.CLOEXEC);
+        if (posix.errno(accepted) != .SUCCESS) return error.TestUnexpectedResult;
+        const fd: i32 = @intCast(accepted);
+        errdefer closeFd(fd);
+        try os_runtime.setNonblocking(fd);
+        const id = try addTestLocalClient(server, "Tls12Rollback", null);
+        const conn = server.rx().clients.get(id).?;
+        conn.session.restore(.{ .nick = "Tls12Rollback", .username = "owner", .realname = "TLS12 rollback" });
+        conn.session.registration.registered = true;
+        conn.test_sendq_capture = true;
+        const owned = try a.create(tls_conn.TlsConn);
+        owned.* = pair.tls;
+        pair.tls = tls_conn.TlsConn.initDual(a, pair.tls.cfg13, pair.tls.cfg12.?);
+        conn.fd = fd;
+        conn.tls = owned;
+        conn.is_tls = true;
+        // The live path derives the binding once the handshake is done.
+        try server.driveTls(id, conn, &.{});
+        const binding = conn.session.tls_exporter orelse return error.TestUnexpectedResult;
+        return .{ .server = server, .pair = pair, .id = id, .peer_fd = peer, .binding = binding };
+    }
+
+    fn connection(self: *HelixRollbackTls12Fixture) *ConnState {
+        return self.server.reactors[0].clients.get(self.id).?;
+    }
+
+    fn deinit(self: *HelixRollbackTls12Fixture) void {
+        self.server.deinit();
+        std.testing.allocator.destroy(self.server);
+        closeFd(self.peer_fd);
+        self.pair.destroy();
+    }
+};
+
+const HelixRollbackSeal = struct {
+    pieces: std.ArrayList(helix_live.StatePiece) = .empty,
+    blobs: std.ArrayList([]u8) = .empty,
+    fds: [1]linux.fd_t = undefined,
+    fd_count: usize = 0,
+    counts: Server.SealCounts = .{},
+
+    fn run(self: *HelixRollbackSeal, server: *Server) void {
+        server.sealShardClients(&server.reactors[0], &self.pieces, &self.blobs, &self.fds, &self.fd_count, &self.counts);
+    }
+
+    fn tlsPiece(self: *const HelixRollbackSeal) ?helix_live.StatePiece {
+        for (self.pieces.items) |piece| if (piece.kind == .tls_session) return piece;
+        return null;
+    }
+
+    fn deinit(self: *HelixRollbackSeal) void {
+        const a = std.testing.allocator;
+        self.pieces.deinit(a);
+        for (self.blobs.items) |blob| a.free(blob);
+        self.blobs.deinit(a);
+    }
+};
+
+/// 0.10.4 (e202c6cf) adopts `.tls_session` only when
+/// `negotiate({3,3,3}, header) == header.version` and then decodes that exact
+/// version (server.zig ~45034-45047 at that commit).
+fn release_0_10_4_adoptsTlsSession(piece: helix_live.StatePiece) bool {
+    var deployed = helix_capsule.descriptor(.tls_session);
+    deployed.current_version = 3;
+    deployed.min_supported = 3;
+    deployed.max_supported = 3;
+    const header = helix_live.pieceHeader(piece);
+    const negotiated = helix_capsule.negotiate(deployed, header) catch return false;
+    if (negotiated != header.version) return false;
+    // Its handoff-relations pass additionally requires the canonical header.
+    var canonical = helix_capsule.Header.init(.tls_session);
+    canonical.version = 3;
+    canonical.min_supported = 3;
+    canonical.max_supported = 3;
+    if (!std.meta.eql(canonical, header)) return false;
+    const row = tls_snapshot.decode(piece.bytes, 3) catch return false;
+    return tls_snapshot.representableAsV3(row);
+}
+
+test "Helix rollback: a target without tls-session-v4 gets exact v3 TLS 1.2 rows; a current target keeps v4" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try HelixRollbackTls12Fixture.create(null);
+    defer fixture.deinit();
+    const conn = fixture.connection();
+
+    // (c) Target advertises tls-session-v4: the binding rides a v4 row, which
+    // 0.10.4 would reject (the confirmed rollback hazard).
+    fixture.server.helix_target_state_caps = .current;
+    {
+        var seal: HelixRollbackSeal = .{};
+        defer seal.deinit();
+        seal.run(fixture.server);
+        try std.testing.expectEqual(@as(usize, 1), seal.counts.clients_expected);
+        try std.testing.expectEqual(@as(usize, 1), seal.counts.clients);
+        try std.testing.expectEqual(@as(usize, 0), seal.counts.tls_rollback_downgraded);
+        const piece = seal.tlsPiece() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u16, 4), helix_live.pieceHeader(piece).version);
+        const row = try tls_snapshot.decode(piece.bytes, 4);
+        try std.testing.expectEqualSlices(u8, &fixture.binding, &row.tls12_channel_binding.?);
+        try std.testing.expect(!release_0_10_4_adoptsTlsSession(piece));
+    }
+    try std.testing.expect(setCloexec(conn.fd, true));
+
+    // (a) 0.10.4-class target: only the binding is v4 data, so the row is the
+    // exact v3 form, adopted by a [3,3] reader and by this binary.
+    fixture.server.helix_target_state_caps = .legacy;
+    var seal: HelixRollbackSeal = .{};
+    defer seal.deinit();
+    seal.run(fixture.server);
+    try std.testing.expectEqual(@as(usize, 1), seal.counts.clients);
+    try std.testing.expectEqual(@as(usize, 1), seal.counts.tls_rollback_downgraded);
+    try std.testing.expectEqual(@as(usize, 0), seal.counts.tls_rollback_refused);
+    const piece = seal.tlsPiece() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(release_0_10_4_adoptsTlsSession(piece));
+    const header = helix_live.pieceHeader(piece);
+    try std.testing.expectEqual(@as(u16, 3), try helix_capsule.negotiate(helix_capsule.descriptor(.tls_session), header));
+    const row = try tls_snapshot.decode(piece.bytes, header.version);
+    try std.testing.expect(row.tls12_channel_binding == null);
+    // The predecessor's own live binding is untouched (refusal stays lossless).
+    try std.testing.expectEqualSlices(u8, &fixture.binding, &conn.session.tls_exporter.?);
+
+    // (d) The v3 row a 0.10.4 predecessor writes is adopted by this binary.
+    const successor = try createTestServer(a, fixture.server.config);
+    defer {
+        successor.deinit();
+        a.destroy(successor);
+    }
+    current_reactor = &successor.reactors[0];
+    var client = conn.session.snapshot();
+    client.fd = conn.fd;
+    client.was_secured = true;
+    try std.testing.expect(successor.adoptInheritedClient(client, row, null, false));
+    conn.fd = -1; // the successor now owns the descriptor
+    var it = successor.reactors[0].clients.iterator();
+    const adopted = it.next().?.value;
+    try std.testing.expect(adopted.tls != null);
+    // No binding was carried, so -PLUS is simply not offered on it.
+    try std.testing.expect(adopted.session.tls_exporter == null);
+    current_reactor = &fixture.server.reactors[0];
+}
+
+/// A tiny static x86-64 ELF whose only behaviour is write(stdout, reply) and
+/// exit(0): a stand-in Helix probe target that stays executable through the
+/// probe's pinned `/proc/self/fd` path.
+fn writeProbeReplyElfForTest(dir: std.Io.Dir, name: []const u8, comptime reply: []const u8) !void {
+    var image: [161 + reply.len]u8 = @splat(0);
+    @memcpy(image[0..7], "\x7fELF\x02\x01\x01");
+    std.mem.writeInt(u16, image[16..18], 2, .little); // ET_EXEC
+    std.mem.writeInt(u16, image[18..20], 62, .little); // EM_X86_64
+    std.mem.writeInt(u32, image[20..24], 1, .little);
+    std.mem.writeInt(u64, image[24..32], 0x400080, .little);
+    std.mem.writeInt(u64, image[32..40], 64, .little);
+    std.mem.writeInt(u16, image[52..54], 64, .little);
+    std.mem.writeInt(u16, image[54..56], 56, .little);
+    std.mem.writeInt(u16, image[56..58], 1, .little);
+    std.mem.writeInt(u32, image[64..68], 1, .little); // PT_LOAD
+    std.mem.writeInt(u32, image[68..72], 5, .little); // read + execute
+    std.mem.writeInt(u64, image[80..88], 0x400000, .little);
+    std.mem.writeInt(u64, image[88..96], 0x400000, .little);
+    std.mem.writeInt(u64, image[96..104], image.len, .little);
+    std.mem.writeInt(u64, image[104..112], image.len, .little);
+    std.mem.writeInt(u64, image[112..120], 4096, .little);
+    @memcpy(image[128..161], &[_]u8{
+        0xb8, 1, 0, 0, 0, // mov eax, SYS_write
+        0xbf, 1, 0, 0, 0, // mov edi, stdout
+        0x48, 0x8d, 0x35, 16, 0, 0, 0, // lea rsi, [rip + reply]
+        0xba, 0, 0, 0, 0, // mov edx, reply length
+        0x0f, 0x05, // syscall
+        0xb8, 60, 0, 0, 0, // mov eax, SYS_exit
+        0x31, 0xff, // xor edi, edi
+        0x0f, 0x05, // syscall
+    });
+    std.mem.writeInt(u32, image[146..150], reply.len, .little);
+    @memcpy(image[161..], reply);
+    try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = &image, .flags = .{ .permissions = .executable_file } });
+}
+
+/// Frozen 0.10.4 probe answer (base line only; boot-policy line on Linux).
+const release_0_10_4_probe_reply = helix_live.upgrade_capability_token ++ "\n" ++ helix_live.boot_policy_capability_token ++ "\n";
+
+test "Helix rollback: UPGRADE to a 0.10.4 target refuses before exec on a kTLS TLS 1.2 session, connection intact" {
+    if (comptime builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    if (!ktls.probeUlpSupport()) return error.SkipZigTest;
+    defer current_reactor = null;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeProbeReplyElfForTest(tmp.dir, "onyx-0.10.4", release_0_10_4_probe_reply);
+    var path_buf: [256]u8 = undefined;
+    const old_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/onyx-0.10.4", .{tmp.sub_path});
+    const probe = try std.process.run(alloc, std.testing.io, .{ .argv = &.{ old_path, helix_live.upgrade_capability_arg } });
+    defer alloc.free(probe.stdout);
+    defer alloc.free(probe.stderr);
+    try std.testing.expectEqualStrings(release_0_10_4_probe_reply, probe.stdout);
+    // The 0.10.4 base line still satisfies the exact probe ...
+    try std.testing.expect(helix_live.hasUpgradeCapabilityLine(probe.stdout));
+    // ... but it advertises no rolling state capability.
+    try std.testing.expectEqual(helix_live.TargetStateCaps.legacy, helix_live.TargetStateCaps.fromOutput(probe.stdout));
+
+    var fixture = try HelixRollbackTls12Fixture.create(old_path);
+    defer fixture.deinit();
+    const conn = fixture.connection();
+    conn.tls.?.enableKtlsTx(conn.fd) catch return error.SkipZigTest;
+    conn.tls_tx_offloaded = true;
+
+    // The real probe pins the target and records it as a rollback image.
+    const pinned = try fixture.server.openCompatibleUpgradeTarget(old_path);
+    closeFd(pinned);
+    try std.testing.expectEqual(helix_live.TargetStateCaps.legacy, fixture.server.helix_target_state_caps);
+
+    // Seal level: the offloaded row has no v3 form, so the cut is incomplete.
+    {
+        var seal: HelixRollbackSeal = .{};
+        defer seal.deinit();
+        seal.run(fixture.server);
+        try std.testing.expectEqual(@as(usize, 1), seal.counts.clients_expected);
+        try std.testing.expectEqual(@as(usize, 0), seal.counts.clients);
+        try std.testing.expectEqual(@as(usize, 1), seal.counts.tls_rollback_refused);
+        try std.testing.expectEqual(@as(usize, 0), seal.fd_count);
+        try std.testing.expect(seal.tlsPiece() == null);
+    }
+    // The same row against a current target still seals as v4.
+    fixture.server.helix_target_state_caps = .current;
+    {
+        var seal: HelixRollbackSeal = .{};
+        defer seal.deinit();
+        seal.run(fixture.server);
+        try std.testing.expectEqual(@as(usize, 1), seal.counts.clients);
+        const piece = seal.tlsPiece() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u16, 4), helix_live.pieceHeader(piece).version);
+        try std.testing.expect((try tls_snapshot.decode(piece.bytes, 4)).tx_offloaded);
+    }
+    try std.testing.expect(setCloexec(conn.fd, true));
+
+    // Full production path: probe -> quiesce -> seal -> refusal, never exec.
+    const listener_fd = fixture.server.reactors[0].listener_fd;
+    try std.testing.expect(setCloexec(listener_fd, true));
+    // Reset so the post-condition proves performUpgrade's own probe passed
+    // and re-learned the legacy target: the refusal then comes from the seal
+    // (no WebTransport listener here), never from the probe.
+    fixture.server.helix_target_state_caps = .current;
+    try std.testing.expectError(error.UpgradeTargetIncompatible, fixture.server.performUpgrade(.signal));
+    try std.testing.expectEqual(helix_live.TargetStateCaps.legacy, fixture.server.helix_target_state_caps);
+    const client_flags = linux.fcntl(conn.fd, posix.F.GETFD, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(client_flags));
+    try std.testing.expect((client_flags & posix.FD_CLOEXEC) != 0);
+    try std.testing.expect((linux.fcntl(listener_fd, posix.F.GETFD, 0) & posix.FD_CLOEXEC) != 0);
+    try std.testing.expectEqual(@as(usize, 1), fixture.server.reactors[0].clients.len());
+    try std.testing.expect(fixture.connection() == conn and !conn.closing and conn.tls_tx_offloaded);
+    try std.testing.expectEqualSlices(u8, &fixture.binding, &conn.session.tls_exporter.?);
 }
 
 test "armor3: TLS ticket keys are per node, so a foreign node's ticket never resumes or replays 0-RTT" {
