@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Ordered TOML projection transaction. Keep validation and ownership order stable.
+//!
+//! NOT the live parser: no compiled root imports this file (or `model.zig`),
+//! and it lacks keys added since the split (e.g. Armor wave 2a/2b [tls].groups,
+//! [tls].delegated_credentials, [webtransport] QUIC policy, [geo].news_ca_bundle*).
+//! The authority is `src/daemon/config_format.zig`; the guard test there fails
+//! if anything outside this directory starts importing these candidates.
 
 const std = @import("std");
 const toml = @import("../../proto/toml.zig");

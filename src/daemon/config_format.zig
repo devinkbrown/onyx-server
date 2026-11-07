@@ -6041,3 +6041,35 @@ test "cloak parserValue resolver failures retain field or allocation error" {
         }
     }
 }
+
+test "config_format split model and projection candidates stay unreachable drift candidates" {
+    // The live configuration authority is this file's `Config` and
+    // `parseToml`. The adjacent `config_format/` model/projection/tests files
+    // are an earlier split that no compiled root imports (so they are never
+    // even built) and that already lacks the Armor wave 2a/2b keys
+    // ([tls].groups, [tls].delegated_credentials, [webtransport] 0-RTT /
+    // resumption / stateless reset, [geo].news_ca_bundle*). Fail if anything
+    // outside that directory starts importing them, so they can never become
+    // a live, divergent second parser without being reconciled first.
+    const allocator = std.testing.allocator;
+    const needles = [_][]const u8{ "config_format/" ++ "model.zig", "config_format/" ++ "projection.zig" };
+    var src = std.Io.Dir.cwd().openDir(std.testing.io, "src", .{ .iterate = true }) catch return error.SkipZigTest;
+    defer src.close(std.testing.io);
+    var walker = try src.walk(allocator);
+    defer walker.deinit();
+    var scanned: usize = 0;
+    while (try walker.next(std.testing.io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        if (std.mem.startsWith(u8, entry.path, "daemon/config_format/")) continue;
+        const text = try entry.dir.readFileAlloc(std.testing.io, entry.basename, allocator, .limited(64 << 20));
+        defer allocator.free(text);
+        scanned += 1;
+        for (needles) |needle| {
+            if (std.mem.indexOf(u8, text, needle) != null) {
+                std.debug.print("{s} imports dead config candidate {s}\n", .{ entry.path, needle });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+    try std.testing.expect(scanned > 100);
+}
