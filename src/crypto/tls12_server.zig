@@ -41,6 +41,11 @@ const ext_extended_master_secret: u16 = 0x0017;
 
 /// RFC 7507 TLS_FALLBACK_SCSV pseudo cipher-suite value.
 const suite_fallback_scsv: u16 = 0x5600;
+/// Upper bound on a client Finished body buffered across records. TLS 1.2
+/// verify_data is 12 bytes for every suite here (RFC 5246 §7.4.9); the slack
+/// lets a wrong-length body reach the constant-time comparison (decrypt_error)
+/// while a hostile multi-KiB declaration is refused up front.
+const max_finished_body_len: usize = 64;
 
 /// Domain tag stamped into the first 4 bytes of the AEAD-sealed ticket_nonce of
 /// every TLS 1.2 ticket this server issues. Tickets are only ever minted for
@@ -76,6 +81,19 @@ pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
     UnsupportedCipherSuite,
     UnsupportedGroup,
     EntropyUnavailable,
+    /// RFC 5246 §7.4: a handshake message not valid in the current state, or
+    /// handshake bytes after a message that ends a flight. `unexpected_message`.
+    UnexpectedMessage,
+    /// A well-formed field with a forbidden value (RFC 5246 §7.4.1.2
+    /// compression list without null, RFC 8422 §5.1.2 point formats without
+    /// uncompressed). `illegal_parameter`.
+    IllegalParameter,
+    /// RFC 5246 §7.4.1.4.1: no client signature_algorithms entry this key can
+    /// produce for the ServerKeyExchange. `handshake_failure`.
+    NoCommonSignatureAlgorithms,
+    /// RFC 7301 §3.2: ALPN offered with no protocol in common.
+    /// `no_application_protocol`.
+    NoApplicationProtocol,
 };
 
 pub const Config = struct {
@@ -91,6 +109,12 @@ pub const Config = struct {
     rsa_signing_key: ?rsa_sign.PrivateKey = null,
     /// ALPN protocols in server preference order.
     alpn_protocols: []const []const u8 = &.{},
+    /// RFC 7301 §3.2: refuse (fatal `no_application_protocol`) a client that
+    /// offers ALPN sharing no protocol with a non-empty `alpn_protocols`.
+    /// A client offering no ALPN always proceeds. See the TLS 1.3
+    /// `tls_server.Config.alpn_mismatch_fatal`; defaults to `false` (lenient)
+    /// to preserve the daemon's never-refuse ALPN listener policy.
+    alpn_mismatch_fatal: bool = false,
     /// Mutual TLS: when true the server sends a CertificateRequest and, if the
     /// client presents a cert, verifies its CertificateVerify possession proof
     /// and exposes the leaf via `clientCertDer()` (for certfp / SASL EXTERNAL).
@@ -203,6 +227,19 @@ pub const Server = struct {
     server_random: [32]u8,
     session_id: [32]u8 = @splat(0),
     session_id_len: usize = 0,
+    /// RFC 5246 §7.4.1.4.1: the ServerKeyExchange SignatureAndHashAlgorithm
+    /// chosen from the client's signature_algorithms for the configured key, or
+    /// 0 when none is usable (a full handshake then fails handshake_failure; an
+    /// abbreviated handshake signs nothing and is unaffected).
+    ske_scheme: u16 = 0,
+    /// The last alert received from the peer (RFC 5246 §7.2), recorded before
+    /// the engine fails with `TlsAlert` (close_notify vs error alert).
+    peer_alert: ?tls_alert.Alert = null,
+    /// Set once `closeNotify` emitted our close_notify (RFC 5246 §7.2.1).
+    close_notify_sent: bool = false,
+    /// See `tls_server.Server.tx_offloaded`: set by `markTxOffloaded` once TX
+    /// is in the kernel; userspace seals then fail closed.
+    tx_offloaded: bool = false,
     /// The client offered status_request (wants an OCSP staple).
     client_requested_ocsp: bool = false,
     /// The client offered the RFC 7627 extended_master_secret extension.
@@ -414,7 +451,12 @@ pub const Server = struct {
         if (self.state == .connected) return error.BadState;
         try self.recv_buf.appendSlice(self.allocator, received);
         while (true) {
-            const rec = (try tls12.completeRecord(self.recv_buf.items)) orelse return .need_more;
+            // RFC 5246 Appendix E.1: "TLS servers ... MUST accept any value
+            // {03,XX} as the record layer version number for ClientHello."
+            const rec = (if (self.state == .wait_client_hello)
+                try tls12.completeInitialRecord(self.recv_buf.items)
+            else
+                try tls12.completeRecord(self.recv_buf.items)) orelse return .need_more;
             const encrypted = switch (self.state) {
                 .wait_client_finished, .wait_resumed_client_finished => true,
                 else => false,
@@ -425,20 +467,24 @@ pub const Server = struct {
                     const opened = try tls12.openRecordAlloc(self.allocator, self.selected_suite orelse return error.BadState, &self.keys.client_write, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]);
                     defer self.allocator.free(opened.plaintext);
                     if (opened.plaintext.len > tls_record.max_plaintext_len or (self.client_offered_record_size_limit and opened.plaintext.len > self.receive_record_size_limit)) return error.RecordOverflow;
-                    _ = tls_alert.parse(opened.plaintext) catch return error.BadRecord;
-                } else _ = tls_alert.parse(rec.fragment) catch return error.BadRecord;
+                    self.peer_alert = tls_alert.parse(opened.plaintext) catch return error.BadRecord;
+                } else self.peer_alert = tls_alert.parse(rec.fragment) catch return error.BadRecord;
                 return error.TlsAlert;
             }
             switch (self.state) {
                 .wait_client_hello => {
-                    if (rec.content_type != .handshake) return error.BadHandshake;
+                    if (rec.content_type != .handshake) return error.UnexpectedMessage;
                     try self.client_hello_reassembly.append(self.allocator, rec.fragment);
                     consumePrefix(&self.recv_buf, rec.wire_len);
                     const message_len = self.client_hello_reassembly.completeLen() orelse continue;
-                    if (message_len != self.client_hello_reassembly.bytes.items.len) return error.BadHandshake;
+                    // RFC 5246 §7.4: the client must wait for the server flight;
+                    // handshake bytes riding behind the ClientHello are
+                    // unexpected_message (BoGo PartialClientKeyExchangeWithClientHello).
+                    if (message_len != self.client_hello_reassembly.bytes.items.len) return error.UnexpectedMessage;
                     var off: usize = 0;
                     const msg = try parseHandshake(self.client_hello_reassembly.bytes.items, &off);
-                    if (off != self.client_hello_reassembly.bytes.items.len or msg.typ != .client_hello) return error.BadHandshake;
+                    if (off != self.client_hello_reassembly.bytes.items.len) return error.BadHandshake;
+                    if (msg.typ != .client_hello) return error.UnexpectedMessage;
                     try self.parseClientHello(msg.body);
                     try self.transcript.appendSlice(self.allocator, msg.raw);
                     // A presented ticket that opens, validates, and is not
@@ -459,30 +505,27 @@ pub const Server = struct {
                     return .{ .bytes_to_send = reply };
                 },
                 .wait_client_certificate, .wait_client_key_exchange, .wait_client_certificate_verify => {
-                    if (rec.content_type != .handshake) return error.BadHandshake;
+                    if (rec.content_type != .handshake) return error.UnexpectedMessage;
                     try self.feedClientHandshakeRecord(rec);
                 },
                 .wait_client_ccs => {
-                    if (self.client_handshake_reassembly.bytes.items.len != 0) return error.BadHandshake;
-                    if (rec.content_type != .change_cipher_spec or rec.fragment.len != 1 or rec.fragment[0] != 1) return error.BadHandshake;
+                    // RFC 5246 §7.1: ChangeCipherSpec must start on a fresh
+                    // record boundary after a complete message (no partial
+                    // handshake data may straddle it — BoGo
+                    // FragmentAcrossChangeCipherSpec).
+                    if (self.client_handshake_reassembly.bytes.items.len != 0) return error.UnexpectedMessage;
+                    if (rec.content_type != .change_cipher_spec) return error.UnexpectedMessage;
+                    if (rec.fragment.len != 1 or rec.fragment[0] != 1) return error.BadHandshake;
                     consumePrefix(&self.recv_buf, rec.wire_len);
                     self.state = .wait_client_finished;
                 },
                 .wait_client_finished => {
+                    const finished = (try self.readClientFinished(rec)) orelse continue;
+                    defer self.allocator.free(finished);
                     const suite = self.selected_suite orelse return error.BadState;
-                    if (rec.content_type != .handshake) return error.BadHandshake;
-                    const opened = try tls12.openRecordAlloc(self.allocator, suite, &self.keys.client_write, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]);
-                    self.hs_read_seq += 1;
-                    defer self.allocator.free(opened.plaintext);
-                    if (opened.plaintext.len > tls_record.max_plaintext_len or (self.client_offered_record_size_limit and opened.plaintext.len > self.receive_record_size_limit)) return error.RecordOverflow;
-                    if (opened.content_type != .handshake) return error.BadHandshake;
-                    var off: usize = 0;
-                    const msg = try parseHandshake(opened.plaintext, &off);
-                    if (off != opened.plaintext.len or msg.typ != .finished) return error.BadHandshake;
                     const expected = try tls12.finishedVerifyData(suite, &self.master_secret, "client finished", self.transcript.items);
-                    if (!tls12.constantTimeEq(&expected, msg.body)) return error.FinishedMismatch;
-                    try self.transcript.appendSlice(self.allocator, msg.raw);
-                    consumePrefix(&self.recv_buf, rec.wire_len);
+                    if (!tls12.constantTimeEq(&expected, finished[4..])) return error.FinishedMismatch;
+                    try self.transcript.appendSlice(self.allocator, finished);
                     const reply = try self.buildServerFinishedFlight();
                     // TLS 1.2 keeps ONE record sequence per direction per epoch:
                     // the encrypted Finished is seq 0 and application data continues
@@ -497,7 +540,8 @@ pub const Server = struct {
                     return .{ .bytes_to_send = reply };
                 },
                 .wait_resumed_client_ccs => {
-                    if (rec.content_type != .change_cipher_spec or rec.fragment.len != 1 or rec.fragment[0] != 1) return error.BadHandshake;
+                    if (rec.content_type != .change_cipher_spec) return error.UnexpectedMessage;
+                    if (rec.fragment.len != 1 or rec.fragment[0] != 1) return error.BadHandshake;
                     consumePrefix(&self.recv_buf, rec.wire_len);
                     self.state = .wait_resumed_client_finished;
                 },
@@ -507,19 +551,11 @@ pub const Server = struct {
                     // Finished. Verify it over the abbreviated transcript
                     // (ClientHello, ServerHello[, NewSessionTicket], server
                     // Finished) and then the connection is established.
+                    const finished = (try self.readClientFinished(rec)) orelse continue;
+                    defer self.allocator.free(finished);
                     const suite = self.selected_suite orelse return error.BadState;
-                    if (rec.content_type != .handshake) return error.BadHandshake;
-                    const opened = try tls12.openRecordAlloc(self.allocator, suite, &self.keys.client_write, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]);
-                    self.hs_read_seq += 1;
-                    defer self.allocator.free(opened.plaintext);
-                    if (opened.plaintext.len > tls_record.max_plaintext_len or (self.client_offered_record_size_limit and opened.plaintext.len > self.receive_record_size_limit)) return error.RecordOverflow;
-                    if (opened.content_type != .handshake) return error.BadHandshake;
-                    var off: usize = 0;
-                    const msg = try parseHandshake(opened.plaintext, &off);
-                    if (off != opened.plaintext.len or msg.typ != .finished) return error.BadHandshake;
                     const expected = try tls12.finishedVerifyData(suite, &self.master_secret, "client finished", self.transcript.items);
-                    if (!tls12.constantTimeEq(&expected, msg.body)) return error.FinishedMismatch;
-                    consumePrefix(&self.recv_buf, rec.wire_len);
+                    if (!tls12.constantTimeEq(&expected, finished[4..])) return error.FinishedMismatch;
                     // Same single-sequence-per-epoch carry as the full path.
                     self.app_read_seq = self.hs_read_seq;
                     self.app_write_seq = self.hs_write_seq;
@@ -529,6 +565,40 @@ pub const Server = struct {
                 .connected => return error.BadState,
             }
         }
+    }
+
+    /// Open one encrypted client handshake record of the Finished epoch and
+    /// reassemble the Finished message across records (RFC 5246 §6.2.1:
+    /// "multiple client messages of the same ContentType MAY be coalesced into
+    /// a single TLSPlaintext record, or a single message MAY be fragmented
+    /// across several records"). Returns the complete raw Finished message
+    /// (header included, caller owns) or null when more records are needed.
+    /// Finished is the client's last handshake message, so any other message
+    /// type, or bytes after it, is `unexpected_message` (BoGo
+    /// TrailingDataWithFinished-*). A Finished declaring more than
+    /// `max_finished_body_len` bytes is refused before it is buffered; a body of
+    /// the wrong (but bounded) length is left to the verify_data comparison and
+    /// fails as `FinishedMismatch` / decrypt_error (RFC 5246 §7.4.9).
+    fn readClientFinished(self: *Server, rec: tls12.Record) Error!?[]u8 {
+        const suite = self.selected_suite orelse return error.BadState;
+        if (rec.content_type != .handshake) return error.UnexpectedMessage;
+        const opened = try tls12.openRecordAlloc(self.allocator, suite, &self.keys.client_write, self.hs_read_seq, self.recv_buf.items[0..rec.wire_len]);
+        self.hs_read_seq += 1;
+        defer self.allocator.free(opened.plaintext);
+        if (opened.plaintext.len > tls_record.max_plaintext_len or (self.client_offered_record_size_limit and opened.plaintext.len > self.receive_record_size_limit)) return error.RecordOverflow;
+        if (opened.content_type != .handshake) return error.UnexpectedMessage;
+        // RFC 5246 §6.2.1: zero-length handshake fragments MUST NOT be sent.
+        if (opened.plaintext.len == 0) return error.BadHandshake;
+        consumePrefix(&self.recv_buf, rec.wire_len);
+        try self.client_handshake_reassembly.append(self.allocator, opened.plaintext);
+        const pending = self.client_handshake_reassembly.bytes.items;
+        if (pending[0] != @backingInt(tls12.HandshakeType.finished)) return error.UnexpectedMessage;
+        if (pending.len >= 4 and std.mem.readInt(u24, pending[1..4], .big) > max_finished_body_len) return error.BadHandshake;
+        const message_len = self.client_handshake_reassembly.completeLen() orelse return null;
+        if (pending.len != message_len) return error.UnexpectedMessage;
+        const owned = try self.allocator.dupe(u8, pending[0..message_len]);
+        self.client_handshake_reassembly.consume(message_len);
+        return owned;
     }
 
     /// Accumulate a plaintext client handshake record, then process every
@@ -546,13 +616,13 @@ pub const Server = struct {
 
             switch (self.state) {
                 .wait_client_certificate => {
-                    if (msg.typ != .certificate) return error.BadHandshake;
+                    if (msg.typ != .certificate) return error.UnexpectedMessage;
                     try self.parseClientCertificate(msg.body);
                     try self.transcript.appendSlice(self.allocator, msg.raw);
                     self.state = .wait_client_key_exchange;
                 },
                 .wait_client_key_exchange => {
-                    if (msg.typ != .client_key_exchange) return error.BadHandshake;
+                    if (msg.typ != .client_key_exchange) return error.UnexpectedMessage;
                     // RFC 7627: EMS includes ClientKeyExchange in the session
                     // hash before the master secret is derived.
                     try self.transcript.appendSlice(self.allocator, msg.raw);
@@ -560,12 +630,14 @@ pub const Server = struct {
                     self.state = if (self.client_leaf_key != null) .wait_client_certificate_verify else .wait_client_ccs;
                 },
                 .wait_client_certificate_verify => {
-                    if (msg.typ != .certificate_verify) return error.BadHandshake;
+                    if (msg.typ != .certificate_verify) return error.UnexpectedMessage;
                     try self.verifyClientCertificateVerify(msg.body);
                     try self.transcript.appendSlice(self.allocator, msg.raw);
                     self.state = .wait_client_ccs;
                 },
-                else => return error.BadHandshake,
+                // A complete message after the flight's last one: the client
+                // must now send ChangeCipherSpec (RFC 5246 §7.4).
+                else => return error.UnexpectedMessage,
             }
             self.client_handshake_reassembly.consume(message_len);
         }
@@ -630,6 +702,8 @@ pub const Server = struct {
     /// Allocation/sequence exhaustion leaves the live TX epoch unchanged.
     pub fn prepareAppWrite(self: *Server, chunks: []const []const u8) Error!PreparedAppWrite {
         if (self.read_failed) return error.BadState;
+        // RFC 8446 §6.1: nothing may be written after our close_notify.
+        if (self.close_notify_sent or self.tx_offloaded) return error.BadState;
         if (self.state != .connected or self.app_write_active != null) return error.BadState;
         if (self.app_write_generation == std.math.maxInt(u64)) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
@@ -678,6 +752,29 @@ pub const Server = struct {
         };
     }
 
+    /// Encode an orderly-shutdown `close_notify` alert (RFC 5246 §7.2.1: "The
+    /// client and the server must share knowledge that the connection is
+    /// ending ... Either party may initiate a close by sending a close_notify
+    /// alert"; RFC 8446 §6.1 makes it a MUST before closing the write side).
+    /// Valid only once connected; sealed under the server write key at the next
+    /// application sequence number. No application data may follow it. Caller
+    /// owns the bytes.
+    ///
+    /// Userspace-TX connections only: after kTLS TX install the kernel owns
+    /// the write sequence and this would reuse a (key, nonce) pair. Send the
+    /// alert as a kernel control record (cmsg, record type 21) instead, and
+    /// call `markTxOffloaded` at install so this returns BadState.
+    pub fn closeNotify(self: *Server) Error![]u8 {
+        if (self.state != .connected or self.app_write_active != null or self.close_notify_sent or self.tx_offloaded) return error.BadState;
+        const suite = self.selected_suite orelse return error.BadState;
+        const seq = try tls12.reserveAppSeq(self.app_write_seq);
+        const body = [_]u8{ @backingInt(tls_server.AlertLevel.warning), @backingInt(tls_server.AlertDescription.close_notify) };
+        const record = try tls12.sealRecordAlloc(self.allocator, suite, &self.keys.server_write, seq, .alert, &body);
+        self.app_write_seq = seq + 1;
+        self.close_notify_sent = true;
+        return record;
+    }
+
     pub fn encrypt(self: *Server, appdata: []const u8) Error![]u8 {
         var prepared = try self.prepareAppWrite(&.{appdata});
         defer prepared.deinit();
@@ -701,7 +798,7 @@ pub const Server = struct {
         if (opened.plaintext.len > tls_record.max_plaintext_len or (self.client_offered_record_size_limit and opened.plaintext.len > self.receive_record_size_limit)) return error.RecordOverflow;
         self.app_read_seq += 1;
         if (opened.content_type == .alert) {
-            _ = tls_alert.parse(opened.plaintext) catch return error.BadRecord;
+            self.peer_alert = tls_alert.parse(opened.plaintext) catch return error.BadRecord;
             return error.TlsAlert;
         }
         if (opened.content_type != .application_data) return error.BadHandshake;
@@ -713,6 +810,13 @@ pub const Server = struct {
     /// engines to kernel `TLS_CIPHER_*` code points with one switch; crypto never
     /// depends on the daemon's `ktls` module.
     pub const KtlsCipher = tls_server.Server.KtlsCipher;
+
+    /// Record that TX has been installed into the kernel (kTLS `TLS_TX`).
+    /// Afterwards `closeNotify`, `prepareAppWrite` and `encrypt` return
+    /// BadState rather than sealing under a stale userspace sequence.
+    pub fn markTxOffloaded(self: *Server) void {
+        self.tx_offloaded = true;
+    }
 
     /// One direction's TLS 1.2 AEAD material for `setsockopt(TLS_TX|TLS_RX)`
     /// with `version = TLS_1_2_VERSION`:
@@ -846,15 +950,38 @@ pub const Server = struct {
 
     fn parseClientHello(self: *Server, body: []const u8) Error!void {
         var c = Cursor.init(body);
-        if (try c.readU16() != tls12.tls_version) return error.ProtocolVersion;
+        const legacy_version = try c.readU16();
+        // Not an SSL/TLS {03,XX} version at all: refuse before parsing further
+        // (supported_versions can only rescue a TLS 1.x legacy_version).
+        if (legacy_version < 0x0300) return error.ProtocolVersion;
         @memcpy(&self.client_random, try c.take(32));
         self.session_id_len = try c.readU8();
         if (self.session_id_len > self.session_id.len) return error.BadHandshake;
         @memcpy(self.session_id[0..self.session_id_len], try c.take(self.session_id_len));
         const suites_bytes = try c.take(try c.readU16());
         self.offered_suites = suites_bytes;
+        // RFC 5246 §7.4.1.2: compression_methods<1..2^8-1> "MUST contain, and
+        // all implementations MUST support, CompressionMethod.null". Other
+        // offered methods are simply not selected; a list without null is
+        // illegal_parameter (BoGo NoNullCompression-TLS12).
         const comp = try c.take(try c.readU8());
-        if (comp.len != 1 or comp[0] != 0) return error.BadHandshake;
+        if (comp.len == 0) return error.BadHandshake;
+        if (std.mem.indexOfScalar(u8, comp, 0) == null) return error.IllegalParameter;
+        const exts: ?[]const u8 = if (c.remaining() != 0) try c.take(try c.readU16()) else null;
+        try c.expectEmpty();
+
+        // Version negotiation comes first, so an old client learns
+        // protocol_version rather than a suite or group failure (BoGo
+        // NoSSL3-Server). RFC 8446 §4.2.1: when supported_versions is present it
+        // alone decides (TLS 1.2 iff it lists 0x0303 — enforced in
+        // `parseClientExtensions`), whatever legacy_version says (BoGo
+        // ConflictingVersionNegotiation-2). Without it, RFC 5246 Appendix E.1:
+        // a client_version above TLS 1.2 is answered with TLS 1.2 (BoGo
+        // MinorVersionTolerance / MajorVersionTolerance /
+        // ClientHelloVersionTooHigh); below TLS 1.2 this modern-only engine
+        // refuses with protocol_version.
+        const has_supported_versions = if (exts) |block| try extensionPresent(block, 0x002b) else false;
+        if (!has_supported_versions and legacy_version < tls12.tls_version) return error.ProtocolVersion;
 
         const auth = activeCertificateAuth(self.config) orelse return error.NoSigningKey;
         var selected: ?tls12.CipherSuite = null;
@@ -872,12 +999,7 @@ pub const Server = struct {
         }
         self.selected_suite = selected orelse return error.UnsupportedCipherSuite;
 
-        if (c.remaining() != 0) {
-            const ext_len = try c.readU16();
-            const exts = try c.take(ext_len);
-            try self.parseClientExtensions(exts);
-        }
-        try c.expectEmpty();
+        if (exts) |block| _ = try self.parseClientExtensions(block);
 
         // RFC 7627: the hardened profile requires the extended master secret;
         // this fires whether the extension was absent from the list or the
@@ -889,13 +1011,43 @@ pub const Server = struct {
         self.ems_negotiated = self.client_offered_ems;
     }
 
-    fn parseClientExtensions(self: *Server, bytes: []const u8) Error!void {
+    /// Parse the ClientHello extensions block. Returns non-null (true) when a
+    /// supported_versions extension offering TLS 1.2 was present, null when the
+    /// extension was absent (legacy_version then negotiates).
+    fn parseClientExtensions(self: *Server, bytes: []const u8) Error!?bool {
         var saw_p256 = false;
+        var saw_versions: ?bool = null;
+        var offered_alpn = false;
+        var sig_algs: ?[]const u8 = null;
+        // RFC 5246 §7.4.1.4: "There MUST NOT be more than one extension of the
+        // same type." One bit per wire value (8 KiB on the stack) is exact.
+        var seen = std.bit_set.StaticBitSet(std.math.maxInt(u16) + 1).empty;
         var c = Cursor.init(bytes);
         while (c.remaining() != 0) {
             const typ = try c.readU16();
             const body = try c.take(try c.readU16());
+            if (seen.isSet(typ)) return error.BadHandshake;
+            seen.set(typ);
             switch (typ) {
+                0x0000 => tls_server.validateServerNameExtension(body) catch return error.BadHandshake,
+                0x000b => {
+                    // RFC 8422 §5.1.2: ec_point_formats<1..2^8-1>; a list
+                    // without uncompressed(0) MUST abort with illegal_parameter.
+                    var pf = Cursor.init(body);
+                    const formats = try pf.take(try pf.readU8());
+                    try pf.expectEmpty();
+                    if (formats.len == 0) return error.BadHandshake;
+                    if (std.mem.indexOfScalar(u8, formats, 0) == null) return error.IllegalParameter;
+                },
+                0x000d => {
+                    // RFC 5246 §7.4.1.4.1: supported_signature_algorithms
+                    // <2..2^16-2>, an even number of bytes.
+                    var sa = Cursor.init(body);
+                    const list = try sa.take(try sa.readU16());
+                    try sa.expectEmpty();
+                    if (list.len == 0 or list.len % 2 != 0) return error.BadHandshake;
+                    sig_algs = body;
+                },
                 0x000a => {
                     var g = Cursor.init(body);
                     const list = try g.take(try g.readU16());
@@ -905,7 +1057,10 @@ pub const Server = struct {
                     }
                     try g.expectEmpty();
                 },
-                0x0010 => try self.selectAlpn(body),
+                0x0010 => {
+                    offered_alpn = true;
+                    try self.selectAlpn(body);
+                },
                 0x0005 => self.client_requested_ocsp = true, // status_request (OCSP)
                 ext_extended_master_secret => {
                     // RFC 7627: the extension is always empty.
@@ -968,14 +1123,26 @@ pub const Server = struct {
                         if (try v.readU16() == tls12.tls_version) offers_12 = true;
                     }
                     if (!offers_12) return error.ProtocolVersion;
+                    saw_versions = true;
                 },
                 else => {},
             }
         }
         if (!saw_p256) return error.UnsupportedGroup;
+        // RFC 7301 §3.2: ALPN offered, configured, and disjoint ⇒ refuse.
+        if (offered_alpn and self.selected_alpn == null and
+            self.config.alpn_protocols.len != 0 and self.config.alpn_mismatch_fatal)
+        {
+            return error.NoApplicationProtocol;
+        }
+        self.ske_scheme = selectSkeScheme(self.config, sig_algs);
+        return saw_versions;
     }
 
     fn selectAlpn(self: *Server, body: []const u8) Error!void {
+        // RFC 7301 §3.1: a malformed list (or an empty protocol name) is a
+        // decode error even when this server has no ALPN configured.
+        tls_server.validateAlpnExtension(body) catch return error.BadHandshake;
         if (self.config.alpn_protocols.len == 0) return;
         var c = Cursor.init(body);
         const list = try c.take(try c.readU16());
@@ -1001,10 +1168,18 @@ pub const Server = struct {
 
         var sh_body: std.ArrayList(u8) = .empty;
         defer sh_body.deinit(self.allocator);
+        // RFC 5246 §7.4.1.3 / RFC 5077 §3.4: a FULL handshake must not echo the
+        // client's session_id — the client would read the echo as an accepted
+        // resumption (BoGo CorruptTicket-TLS12, Resume-Server-UnofferedCipher).
+        // This engine keeps no session-ID cache and resumes only by ticket, so
+        // the ServerHello carries an empty session_id ("If a server is planning
+        // on issuing a session ticket to a client that does not present one, it
+        // SHOULD include an empty Session ID in the ServerHello"). Only the
+        // abbreviated ticket flight echoes it (`buildResumedServerFlight`).
+        if (self.ske_scheme == 0) return error.NoCommonSignatureAlgorithms;
         try appendU16(self.allocator, &sh_body, tls12.tls_version);
         try sh_body.appendSlice(self.allocator, &self.server_random);
-        try sh_body.append(self.allocator, @intCast(self.session_id_len));
-        try sh_body.appendSlice(self.allocator, self.session_id[0..self.session_id_len]);
+        try sh_body.append(self.allocator, 0);
         try appendU16(self.allocator, &sh_body, @backingInt(self.selected_suite orelse return error.BadState));
         try sh_body.append(self.allocator, 0);
         var exts: std.ArrayList(u8) = .empty;
@@ -1177,8 +1352,10 @@ pub const Server = struct {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(self.allocator);
         try out.appendSlice(self.allocator, &params);
+        const scheme = self.ske_scheme;
         switch (activeCertificateAuth(self.config) orelse return error.NoSigningKey) {
             .ecdsa_p256 => {
+                if (scheme != sig_ecdsa_secp256r1_sha256) return error.NoCommonSignatureAlgorithms;
                 const sig = ecdsa_p256.sign(signed.items, self.config.ecdsa_p256_signing_key.?) catch return error.BadState;
                 var der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
                 const der = try ecdsa_p256.signatureToDer(sig, &der_buf);
@@ -1187,12 +1364,26 @@ pub const Server = struct {
                 try out.appendSlice(self.allocator, der);
             },
             .rsa => {
-                var digest: [32]u8 = undefined;
-                std.crypto.hash.sha2.Sha256.hash(signed.items, &digest, .{});
+                const rsa_scheme = rsaSchemeHash(scheme) orelse return error.NoCommonSignatureAlgorithms;
+                const alg = rsa_scheme.alg;
+                var digest_buf: [64]u8 = undefined;
+                const digest = digest_buf[0..alg.digestLen()];
+                switch (alg) {
+                    .sha256 => std.crypto.hash.sha2.Sha256.hash(signed.items, digest[0..32], .{}),
+                    .sha384 => std.crypto.hash.sha2.Sha384.hash(signed.items, digest[0..48], .{}),
+                    .sha512 => std.crypto.hash.sha2.Sha512.hash(signed.items, digest[0..64], .{}),
+                }
                 var sig_buf: [512]u8 = undefined;
                 const key = self.config.rsa_signing_key.?;
-                const sig = rsa_sign.signPkcs1v15(key, .sha256, &digest, &sig_buf) catch return error.BadState;
-                try appendU16(self.allocator, &out, sig_rsa_pkcs1_sha256);
+                const sig = if (rsa_scheme.pss) blk: {
+                    // RFC 8446 §4.2.3 (applies to TLS 1.2): salt length = hash length.
+                    var salt_buf: [64]u8 = undefined;
+                    defer std.crypto.secureZero(u8, &salt_buf);
+                    const salt = salt_buf[0..alg.digestLen()];
+                    try osEntropy(salt);
+                    break :blk rsa_sign.signPss(key, alg, digest, salt, &sig_buf) catch return error.BadState;
+                } else rsa_sign.signPkcs1v15(key, alg, digest, &sig_buf) catch return error.BadState;
+                try appendU16(self.allocator, &out, scheme);
                 try appendU16(self.allocator, &out, @intCast(sig.len));
                 try out.appendSlice(self.allocator, sig);
             },
@@ -1481,10 +1672,77 @@ pub const Server = struct {
     }
 };
 
+/// Whether the ClientHello extensions block carries extension `typ`. Walks
+/// only the (type, length) framing; a malformed block is a decode error.
+fn extensionPresent(block: []const u8, typ: u16) Error!bool {
+    var c = Cursor.init(block);
+    var found = false;
+    while (c.remaining() != 0) {
+        if (try c.readU16() == typ) found = true;
+        _ = try c.take(try c.readU16());
+    }
+    return found;
+}
+
 fn activeCertificateAuth(config: Config) ?CertificateAuth {
     if (config.rsa_signing_key != null) return .rsa;
     if (config.ecdsa_p256_signing_key != null) return .ecdsa_p256;
     return null;
+}
+
+const RsaScheme = struct { alg: rsa_verify.HashAlg, pss: bool };
+
+/// The hash (and padding) of an RSA SignatureScheme usable in a TLS 1.2
+/// ServerKeyExchange: rsa_pkcs1_sha256/384/512 (RFC 5246 §7.4.1.4.1 pairs)
+/// and rsa_pss_rsae_sha256/384/512 (RFC 8446 §4.2.3, which defines them for
+/// TLS 1.2 too). SHA-1 and MD5 pairs are never produced.
+fn rsaSchemeHash(scheme: u16) ?RsaScheme {
+    return switch (scheme) {
+        0x0401 => .{ .alg = .sha256, .pss = false },
+        0x0501 => .{ .alg = .sha384, .pss = false },
+        0x0601 => .{ .alg = .sha512, .pss = false },
+        0x0804 => .{ .alg = .sha256, .pss = true },
+        0x0805 => .{ .alg = .sha384, .pss = true },
+        0x0806 => .{ .alg = .sha512, .pss = true },
+        else => null,
+    };
+}
+
+/// RFC 5246 §7.4.1.4.1: "If the client provided a signature_algorithms
+/// extension, then all certificates provided by the server MUST be signed by
+/// a hash/signature algorithm pair that appears in that extension" and the
+/// ServerKeyExchange signature uses one of those pairs. Picks, in this
+/// server's preference order, the first scheme the client listed that the key
+/// can produce; 0 when none (including a client that sent no
+/// signature_algorithms, whose §7.4.1.4.1 default is the SHA-1 pair this
+/// engine never signs with).
+fn selectSkeScheme(config: Config, sig_algs: ?[]const u8) u16 {
+    const offered = sig_algs orelse return 0;
+    const auth = activeCertificateAuth(config) orelse return 0;
+    const candidates: []const u16 = switch (auth) {
+        .ecdsa_p256 => &.{sig_ecdsa_secp256r1_sha256},
+        // rsa_pkcs1_sha256 first keeps the historical wire choice for clients
+        // that offer it; PSS and larger hashes serve clients that do not.
+        .rsa => &.{ 0x0401, 0x0804, 0x0501, 0x0805, 0x0601, 0x0806 },
+    };
+    for (candidates) |want| {
+        if (!schemeListed(offered, want)) continue;
+        if (auth == .rsa) {
+            const rs = rsaSchemeHash(want).?;
+            if (rs.pss and !tls_server.rsaPssFits(config.rsa_signing_key.?, rs.alg)) continue;
+        }
+        return want;
+    }
+    return 0;
+}
+
+/// Whether the validated signature_algorithms extension body lists `scheme`.
+fn schemeListed(body: []const u8, scheme: u16) bool {
+    var i: usize = 2;
+    while (i + 2 <= body.len) : (i += 2) {
+        if (std.mem.readInt(u16, body[i..][0..2], .big) == scheme) return true;
+    }
+    return false;
 }
 
 /// Extract the client leaf's public key for the CertificateVerify possession
@@ -2207,7 +2465,10 @@ fn runMtlsLoopback(client_cert: enum { ecdsa, rsa }, receive_limit: u16, layout:
     const arranged_cf = try arrangeMtlsClientFlight(allocator, cf, layout);
     defer allocator.free(arranged_cf);
     if (layout == .trailing_partial) {
-        try std.testing.expectError(error.BadHandshake, server.feed(arranged_cf));
+        // RFC 5246 §7.1: a partial handshake message straddling ChangeCipherSpec
+        // is unexpected_message (BoGo FragmentAcrossChangeCipherSpec); this
+        // asserted BadHandshake (decode_error) before.
+        try std.testing.expectError(error.UnexpectedMessage, server.feed(arranged_cf));
         try std.testing.expect(!server.handshakeDone());
         return;
     }
@@ -2520,14 +2781,18 @@ test "tls12 ClientHello reassembly rejects oversized, interleaved, and trailing 
         try std.testing.expectEqual(FeedResult.need_more, try server.feed(partial));
         const interleaved = try tls12.writePlainRecord(allocator, .change_cipher_spec, &.{1});
         defer allocator.free(interleaved);
-        try std.testing.expectError(error.BadHandshake, server.feed(interleaved));
+        // RFC 5246 §7.4: a non-handshake record mid-ClientHello is
+        // unexpected_message (this asserted decode_error/BadHandshake before).
+        try std.testing.expectError(error.UnexpectedMessage, server.feed(interleaved));
     }
     {
         var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
         defer server.deinit();
         const trailing = try tls12.writePlainRecord(allocator, .handshake, &.{ 1, 0, 0, 0, 1, 0, 0, 0 });
         defer allocator.free(trailing);
-        try std.testing.expectError(error.BadHandshake, server.feed(trailing));
+        // Handshake bytes behind the ClientHello: unexpected_message (BoGo
+        // PartialClientKeyExchangeWithClientHello); previously BadHandshake.
+        try std.testing.expectError(error.UnexpectedMessage, server.feed(trailing));
     }
     {
         var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
@@ -2641,7 +2906,7 @@ test "TLS 1.2 server rejects an out-of-range record_size_limit (RFC 8449)" {
     // (RFC 8449 section 4: a server MUST NOT enforce the upper bound);
     // effective outbound content is still capped at 16384.
     const future_limit = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 23, 0x00, 0x1c, 0x00, 0x02, 0x40, 0x02 };
-    try server.parseClientExtensions(&future_limit);
+    _ = try server.parseClientExtensions(&future_limit);
     try std.testing.expectEqual(@as(usize, 16386), server.peer_record_size_limit);
 
     // A wrong-length body (1 byte instead of 2) is also rejected.
@@ -2658,7 +2923,7 @@ test "TLS 1.2 server rejects an out-of-range record_size_limit (RFC 8449)" {
         0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17, // supported_groups: [secp256r1]
         0x00, 0x1c, 0x00, 0x02, 0x00, 0x40, // record_size_limit = 64
     };
-    try minimum.parseClientExtensions(&ok);
+    _ = try minimum.parseClientExtensions(&ok);
     try std.testing.expect(minimum.client_offered_record_size_limit);
     try std.testing.expectEqual(@as(usize, 64), minimum.peer_record_size_limit);
 }
@@ -3449,6 +3714,11 @@ fn synthClientHelloBody(
 const synth_ok_exts = [_]u8{
     0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17, // supported_groups: [secp256r1]
     0x00, 0x17, 0x00, 0x00, // extended_master_secret (empty)
+    // signature_algorithms: [ecdsa_secp256r1_sha256, rsa_pkcs1_sha256] — RFC
+    // 5246 §7.4.1.4.1: without it the ServerKeyExchange has no usable scheme.
+    0x00, 0x0d, 0x00, 0x06,
+    0x00, 0x04, 0x04, 0x03,
+    0x04, 0x01,
 };
 
 test "tls12 EMS: default loopback negotiates extended master secret on the wire" {
@@ -3648,7 +3918,7 @@ test "tls12 renegotiation_info: a non-empty renegotiated_connection in the initi
         0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17, // supported_groups
         0xff, 0x01, 0x00, 0x01, 0x00, // renegotiation_info: empty
     };
-    try server.parseClientExtensions(&ok);
+    _ = try server.parseClientExtensions(&ok);
 }
 
 test "tls12 compression: a ClientHello without null compression is rejected (CRIME closed)" {
@@ -3660,14 +3930,20 @@ test "tls12 compression: a ClientHello without null compression is rejected (CRI
     defer server.deinit();
 
     const suites = [_]u16{0xc02b};
-    // DEFLATE(1) only — and even DEFLATE+null is refused (list must be exactly [null]).
+    // DEFLATE(1) only: RFC 5246 §7.4.1.2 requires null in the list, so the
+    // offer is illegal_parameter.
     const deflate_only = try synthClientHelloBody(allocator, &suites, &.{1}, &synth_ok_exts);
     defer allocator.free(deflate_only);
-    try std.testing.expectError(error.BadHandshake, server.parseClientHello(deflate_only));
+    try std.testing.expectError(error.IllegalParameter, server.parseClientHello(deflate_only));
 
+    // DEFLATE+null: null is present, so the server simply selects null (no
+    // compression is ever negotiated, CRIME stays closed). This assertion
+    // previously expected BadHandshake, encoding the non-conformant
+    // "list must be exactly [null]" rule that BoGo ExtraCompressionMethods-TLS12
+    // flagged.
     const deflate_and_null = try synthClientHelloBody(allocator, &suites, &.{ 1, 0 }, &synth_ok_exts);
     defer allocator.free(deflate_and_null);
-    try std.testing.expectError(error.BadHandshake, server.parseClientHello(deflate_and_null));
+    try server.parseClientHello(deflate_and_null);
 }
 
 test "tls12 malformed handshake bytes yield typed errors, never a crash" {
@@ -3701,7 +3977,9 @@ test "tls12 malformed handshake bytes yield typed errors, never a crash" {
         var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
         defer server.deinit();
         const wrong_type = [_]u8{ 22, 0x03, 0x03, 0x00, 0x04, 20, 0x00, 0x00, 0x00 };
-        try std.testing.expectError(error.BadHandshake, server.feed(&wrong_type));
+        // RFC 5246 §7.4: unexpected_message (this asserted BadHandshake /
+        // decode_error before; BoGo WrongMessageType-ClientHello).
+        try std.testing.expectError(error.UnexpectedMessage, server.feed(&wrong_type));
     }
     // A truncated ClientHello body (random cut short) is refused, not crashed on.
     {
@@ -3928,7 +4206,7 @@ test "TLS record limit: TLS12 accepts future peer advertisement with protocol-ca
     var server = try Server.init(a, .{ .cert_chain = &.{fixture.cert}, .ecdsa_p256_signing_key = fixture.key });
     defer server.deinit();
     const future = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 23, 0, 28, 0, 2, 255, 255 };
-    try server.parseClientExtensions(&future);
+    _ = try server.parseClientExtensions(&future);
     try std.testing.expectEqual(@as(usize, 65535), server.peer_record_size_limit);
     server.state = .connected;
     server.selected_suite = .tls_ecdhe_ecdsa_with_aes_128_gcm_sha256;
@@ -4243,4 +4521,411 @@ test "TLS 1.2 exporter on a ticket-resumed (abbreviated) handshake: peers agree"
     var reference: [32]u8 = undefined;
     try tls12.exportKeyingMaterial(server.selected_suite.?.hashAlg(), &server.master_secret, &server.client_random, &server.server_random, "EXPORTER-Channel-Binding", "", &reference);
     try std.testing.expectEqualSlices(u8, &reference, &s_cb);
+}
+
+// ---- Armor wave 3 conformance (BoGo-found defects) ----
+
+/// A TLS 1.2 ClientHello RECORD for conformance tests: `legacy_version`,
+/// a 32-byte session_id, the given suites/compression/extensions, and the
+/// record-layer version `record_version`.
+fn conformanceHello12(
+    allocator: Allocator,
+    legacy_version: u16,
+    record_version: u16,
+    suites: []const u16,
+    compression: []const u8,
+    exts: []const u8,
+) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendU16(allocator, &body, legacy_version);
+    try body.appendNTimes(allocator, 0x11, 32);
+    try body.append(allocator, 32);
+    try body.appendNTimes(allocator, 0x5e, 32); // client session_id
+    try appendU16(allocator, &body, @intCast(suites.len * 2));
+    for (suites) |s| try appendU16(allocator, &body, s);
+    try body.append(allocator, @intCast(compression.len));
+    try body.appendSlice(allocator, compression);
+    try appendU16(allocator, &body, @intCast(exts.len));
+    try body.appendSlice(allocator, exts);
+    var hs: std.ArrayList(u8) = .empty;
+    defer hs.deinit(allocator);
+    try writeHandshake(allocator, &hs, .client_hello, body.items);
+    const rec = try allocator.alloc(u8, 5 + hs.items.len);
+    rec[0] = 22;
+    std.mem.writeInt(u16, rec[1..3], record_version, .big);
+    std.mem.writeInt(u16, rec[3..5], @intCast(hs.items.len), .big);
+    @memcpy(rec[5..], hs.items);
+    return rec;
+}
+
+/// Extract the ServerHello session_id from a server flight's first record.
+fn serverHelloSessionIdLen(flight: []const u8) !usize {
+    const rec = (try tls12.completeRecord(flight)) orelse return error.TestUnexpectedResult;
+    var off: usize = 0;
+    const msg = try parseHandshake(rec.fragment, &off);
+    if (msg.typ != .server_hello) return error.TestUnexpectedResult;
+    return msg.body[2 + 32];
+}
+
+const conformance_rsa_suites = [_]u16{0xc02f};
+const conformance_ecdsa_suites = [_]u16{0xc02b};
+
+test "tls12 conformance (RFC 5246 §7.4.1.3 / RFC 5077 §3.4): a full handshake does not echo the client session_id" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+    const ch = try conformanceHello12(allocator, 0x0303, 0x0301, &conformance_ecdsa_suites, &.{0}, &synth_ok_exts);
+    defer allocator.free(ch);
+    const flight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer allocator.free(flight);
+    // Before the fix the 32-byte client session_id was echoed, which a client
+    // reads as an accepted resumption (BoGo CorruptTicket-TLS12).
+    try std.testing.expectEqual(@as(usize, 0), try serverHelloSessionIdLen(flight));
+}
+
+test "tls12 conformance (RFC 5246 §7.4.1.4.1): ServerKeyExchange signs with a scheme from the client's signature_algorithms" {
+    const allocator = std.testing.allocator;
+    const rsa_key = rsaTestPrivateKey();
+    const cert_buf = try allocator.alloc(u8, 2048);
+    defer allocator.free(cert_buf);
+    const cert = try x509_selfsign.buildSelfSignedRsa(cert_buf, .{
+        .common_name = "localhost",
+        .not_before = 1_704_067_200,
+        .not_after = 1_893_456_000,
+        .serial = &.{ 5, 3, 0, 1 },
+        .public_modulus = rsa_key.n,
+        .public_exponent = rsa_key.e,
+        .private_key = rsa_key,
+        .dns_names = &.{"localhost"},
+        .is_ca = true,
+    });
+    const chain = [_][]const u8{cert};
+    const base = [_]u8{
+        0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17, // supported_groups: [secp256r1]
+        0x00, 0x17, 0x00, 0x00, // extended_master_secret
+    };
+    const Case = struct { sigs: []const u8, want: ?u16 };
+    const cases = [_]Case{
+        // Only rsa_pss_rsae_sha384: the server must sign with exactly that.
+        .{ .sigs = &.{ 0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x08, 0x05 }, .want = 0x0805 },
+        // Only rsa_pkcs1_sha512.
+        .{ .sigs = &.{ 0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x06, 0x01 }, .want = 0x0601 },
+        // pkcs1_sha256 listed after pss_sha256: server preference keeps pkcs1_sha256.
+        .{ .sigs = &.{ 0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x08, 0x04, 0x04, 0x01 }, .want = 0x0401 },
+        // ECDSA only: nothing an RSA key can produce ⇒ handshake_failure.
+        .{ .sigs = &.{ 0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x04, 0x03 }, .want = null },
+        // No signature_algorithms: the §7.4.1.4.1 default is SHA-1, never signed.
+        .{ .sigs = &.{}, .want = null },
+    };
+    for (cases) |case| {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .rsa_signing_key = rsa_key });
+        defer server.deinit();
+        const exts = try std.mem.concat(allocator, u8, &.{ &base, case.sigs });
+        defer allocator.free(exts);
+        const ch = try conformanceHello12(allocator, 0x0303, 0x0303, &conformance_rsa_suites, &.{0}, exts);
+        defer allocator.free(ch);
+        if (case.want) |want| {
+            const flight = switch (try server.feed(ch)) {
+                .bytes_to_send => |b| b,
+                .need_more => return error.TestUnexpectedResult,
+            };
+            defer allocator.free(flight);
+            try std.testing.expectEqual(want, server.ske_scheme);
+            // The ServerKeyExchange carries that SignatureAndHashAlgorithm right
+            // after its 69-byte P-256 ECParameters + point.
+            var off: usize = 0;
+            var found = false;
+            const plain = flight;
+            var pos: usize = 0;
+            var hs_bytes: std.ArrayList(u8) = .empty;
+            defer hs_bytes.deinit(allocator);
+            while (pos < plain.len) {
+                const rec = (try tls12.completeRecord(plain[pos..])) orelse break;
+                try hs_bytes.appendSlice(allocator, rec.fragment);
+                pos += rec.wire_len;
+            }
+            while (off < hs_bytes.items.len) {
+                const msg = try parseHandshake(hs_bytes.items, &off);
+                if (msg.typ == .server_key_exchange) {
+                    try std.testing.expectEqual(want, std.mem.readInt(u16, msg.body[69..71], .big));
+                    found = true;
+                }
+            }
+            try std.testing.expect(found);
+        } else {
+            try std.testing.expectError(error.NoCommonSignatureAlgorithms, server.feed(ch));
+            const alert = server.takeAlert(error.NoCommonSignatureAlgorithms).?;
+            defer allocator.free(alert);
+            try std.testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, 40 }, alert);
+        }
+    }
+}
+
+test "tls12 conformance (RFC 5246 App. E.1 / RFC 8446 §4.2.1): version negotiation tolerates higher legacy versions" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const sv12 = [_]u8{ 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x03 }; // supported_versions [1.2]
+    const with_sv = synth_ok_exts ++ sv12;
+    const Case = struct { legacy: u16, exts: []const u8, ok: bool };
+    const cases = [_]Case{
+        .{ .legacy = 0x0304, .exts = &synth_ok_exts, .ok = true }, // ClientHelloVersionTooHigh
+        .{ .legacy = 0x03ff, .exts = &synth_ok_exts, .ok = true }, // MinorVersionTolerance
+        .{ .legacy = 0x0400, .exts = &synth_ok_exts, .ok = true }, // MajorVersionTolerance
+        .{ .legacy = 0x0302, .exts = &with_sv, .ok = true }, // supported_versions decides
+        .{ .legacy = 0x0302, .exts = &synth_ok_exts, .ok = false }, // TLS 1.1 only
+        .{ .legacy = 0x0300, .exts = &.{}, .ok = false }, // SSL 3.0: protocol_version first
+    };
+    for (cases) |case| {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        const ch = try conformanceHello12(allocator, case.legacy, 0x0301, &conformance_ecdsa_suites, &.{0}, case.exts);
+        defer allocator.free(ch);
+        if (case.ok) {
+            const flight = switch (try server.feed(ch)) {
+                .bytes_to_send => |b| b,
+                .need_more => return error.TestUnexpectedResult,
+            };
+            allocator.free(flight);
+        } else {
+            try std.testing.expectError(error.ProtocolVersion, server.feed(ch));
+        }
+    }
+}
+
+test "tls12 conformance (RFC 5246 App. E.1): the ClientHello record may carry any {03,XX} version" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+    const ch = try conformanceHello12(allocator, 0x0303, 0x03ff, &conformance_ecdsa_suites, &.{0}, &synth_ok_exts);
+    defer allocator.free(ch);
+    const flight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    allocator.free(flight);
+}
+
+test "tls12 conformance: ClientHello extension, compression, point-format and ALPN rules" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const dup = synth_ok_exts ++ [_]u8{ 0x00, 0x17, 0x00, 0x00 }; // EMS twice
+    const pf_bad = synth_ok_exts ++ [_]u8{ 0x00, 0x0b, 0x00, 0x02, 0x01, 0x01 }; // only compressed
+    const pf_ok = synth_ok_exts ++ [_]u8{ 0x00, 0x0b, 0x00, 0x02, 0x01, 0x00 };
+    const alpn_h2 = synth_ok_exts ++ [_]u8{ 0x00, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02, 'h', '2' };
+    const alpn_empty_name = synth_ok_exts ++ [_]u8{ 0x00, 0x10, 0x00, 0x06, 0x00, 0x04, 0x00, 0x02, 'h', '2' };
+    const sni_trailing = synth_ok_exts ++ [_]u8{ 0x00, 0x00, 0x00, 0x09, 0x00, 0x06, 0x00, 0x00, 0x03, 'a', '.', 'b', 0xff };
+    const Case = struct { comp: []const u8 = &.{0}, exts: []const u8, alpn: []const []const u8 = &.{}, fatal_alpn: bool = true, want: ?anyerror };
+    const cases = [_]Case{
+        .{ .exts = &dup, .want = error.BadHandshake }, // RFC 5246 §7.4.1.4
+        .{ .comp = &.{ 1, 0 }, .exts = &synth_ok_exts, .want = null }, // null among others is fine
+        .{ .comp = &.{1}, .exts = &synth_ok_exts, .want = error.IllegalParameter }, // no null
+        .{ .exts = &pf_bad, .want = error.IllegalParameter }, // RFC 8422 §5.1.2
+        .{ .exts = &pf_ok, .want = null },
+        .{ .exts = &alpn_h2, .alpn = &.{"irc"}, .want = error.NoApplicationProtocol }, // RFC 7301 §3.2
+        .{ .exts = &alpn_h2, .alpn = &.{"irc"}, .fatal_alpn = false, .want = null },
+        .{ .exts = &synth_ok_exts, .alpn = &.{"irc"}, .want = null }, // no ALPN offered
+        .{ .exts = &alpn_empty_name, .want = error.BadHandshake }, // RFC 7301 §3.1
+        .{ .exts = &sni_trailing, .want = error.BadHandshake }, // RFC 6066 §3
+    };
+    for (cases) |case| {
+        var server = try Server.init(allocator, .{
+            .cert_chain = &chain,
+            .ecdsa_p256_signing_key = fixture.key,
+            .alpn_protocols = case.alpn,
+            .alpn_mismatch_fatal = case.fatal_alpn,
+        });
+        defer server.deinit();
+        const ch = try conformanceHello12(allocator, 0x0303, 0x0301, &conformance_ecdsa_suites, case.comp, case.exts);
+        defer allocator.free(ch);
+        if (case.want) |want| {
+            try std.testing.expectError(want, server.feed(ch));
+        } else {
+            const flight = switch (try server.feed(ch)) {
+                .bytes_to_send => |b| b,
+                .need_more => return error.TestUnexpectedResult,
+            };
+            allocator.free(flight);
+        }
+    }
+}
+
+/// Drive a real tls12_client to the point where its final flight
+/// (ClientKeyExchange, ChangeCipherSpec, encrypted Finished) is produced, feed
+/// the server the two plaintext records, and return the client Finished
+/// PLAINTEXT (opened under the server's view of the client write key).
+fn conformanceClientFinished(allocator: Allocator, server: *Server, client: *tls12_client.Client) ![]u8 {
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer allocator.free(sf);
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer allocator.free(cf);
+    var pos: usize = 0;
+    var fin_record: ?[]const u8 = null;
+    while (pos < cf.len) {
+        const rec = (try tls12.completeRecord(cf[pos..])) orelse return error.TestUnexpectedResult;
+        const raw = cf[pos .. pos + rec.wire_len];
+        if (server.state == .wait_client_finished) {
+            fin_record = raw;
+        } else {
+            try std.testing.expectEqual(FeedResult.need_more, try server.feed(raw));
+        }
+        pos += rec.wire_len;
+    }
+    const record = fin_record orelse return error.TestUnexpectedResult;
+    const opened = try tls12.openRecordAlloc(allocator, server.selected_suite.?, &server.keys.client_write, server.hs_read_seq, record);
+    return opened.plaintext;
+}
+
+test "tls12 conformance (RFC 5246 §6.2.1): a client Finished split across records completes the handshake" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors, .now_unix_seconds = 1_735_689_600 });
+    defer client.deinit();
+    const fin = try conformanceClientFinished(allocator, &server, &client);
+    defer allocator.free(fin);
+    try std.testing.expectEqual(@as(usize, 16), fin.len);
+    const suite = server.selected_suite.?;
+    // Re-seal the Finished as 5 + 11 bytes over two consecutive records.
+    const r0 = try tls12.sealRecordAlloc(allocator, suite, &server.keys.client_write, 0, .handshake, fin[0..5]);
+    defer allocator.free(r0);
+    const r1 = try tls12.sealRecordAlloc(allocator, suite, &server.keys.client_write, 1, .handshake, fin[5..]);
+    defer allocator.free(r1);
+    // Before the fix the first fragment failed parseHandshake (BadHandshake).
+    try std.testing.expectEqual(FeedResult.need_more, try server.feed(r0));
+    const reply = switch (try server.feed(r1)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer allocator.free(reply);
+    try std.testing.expect(server.handshakeDone());
+    // The handshake sequence continued across both records (app data at seq 2).
+    try std.testing.expectEqual(@as(u64, 2), server.app_read_seq);
+}
+
+test "tls12 conformance (RFC 5246 §7.4): handshake data after the client Finished is unexpected_message" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors, .now_unix_seconds = 1_735_689_600 });
+    defer client.deinit();
+    const fin = try conformanceClientFinished(allocator, &server, &client);
+    defer allocator.free(fin);
+    const padded = try std.mem.concat(allocator, u8, &.{ fin, &[_]u8{ 0, 0, 0, 0 } });
+    defer allocator.free(padded);
+    const rec = try tls12.sealRecordAlloc(allocator, server.selected_suite.?, &server.keys.client_write, 0, .handshake, padded);
+    defer allocator.free(rec);
+    try std.testing.expectError(error.UnexpectedMessage, server.feed(rec));
+    const alert = server.takeAlert(error.UnexpectedMessage).?;
+    defer allocator.free(alert);
+    try std.testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, 10 }, alert);
+}
+
+test "tls12 conformance: a wrong handshake message type is unexpected_message, not decode_error" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+    const ch = try conformanceHello12(allocator, 0x0303, 0x0301, &conformance_ecdsa_suites, &.{0}, &synth_ok_exts);
+    defer allocator.free(ch);
+    const flight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    allocator.free(flight);
+    // A Finished (type 20) where ClientKeyExchange is required.
+    const wrong = [_]u8{ 22, 3, 3, 0, 16, 20, 0, 0, 12 } ++ @as([12]u8, @splat(0));
+    try std.testing.expectError(error.UnexpectedMessage, server.feed(&wrong));
+}
+
+test "tls12 conformance (RFC 5246 §7.2.1): closeNotify seals one close_notify and ends writes" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors, .now_unix_seconds = 1_735_689_600 });
+    defer client.deinit();
+    try std.testing.expectError(error.BadState, server.closeNotify());
+    try driveFullHandshake(allocator, &server, &client);
+    const seq_before = server.app_write_seq;
+    const record = try server.closeNotify();
+    defer allocator.free(record);
+    try std.testing.expectEqual(seq_before + 1, server.app_write_seq);
+    const opened = try tls12.openRecordAlloc(allocator, server.selected_suite.?, &server.keys.server_write, seq_before, record);
+    defer allocator.free(opened.plaintext);
+    try std.testing.expectEqual(tls12.ContentType.alert, opened.content_type);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0 }, opened.plaintext);
+    try std.testing.expectError(error.BadState, server.closeNotify());
+    try std.testing.expectError(error.BadState, server.encrypt("after close"));
+}
+
+test "tls12 conformance: ALPN mismatch is lenient by default so the daemon IRC listener never refuses" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const cfg: Config = .{ .cert_chain = &chain };
+    try std.testing.expect(!cfg.alpn_mismatch_fatal);
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key, .alpn_protocols = &.{"irc"} });
+    defer server.deinit();
+    const alpn_h2 = synth_ok_exts ++ [_]u8{ 0x00, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02, 'h', '2' };
+    const ch = try conformanceHello12(allocator, 0x0303, 0x0301, &conformance_ecdsa_suites, &.{0}, &alpn_h2);
+    defer allocator.free(ch);
+    const flight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    allocator.free(flight);
+}
+
+test "tls12 conformance: after markTxOffloaded no userspace seal reuses a kernel-owned nonce" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors, .now_unix_seconds = 1_735_689_600 });
+    defer client.deinit();
+    try driveFullHandshake(allocator, &server, &client);
+    const seq = server.app_write_seq;
+    server.markTxOffloaded();
+    try std.testing.expectError(error.BadState, server.closeNotify());
+    try std.testing.expectError(error.BadState, server.encrypt("x"));
+    try std.testing.expectEqual(seq, server.app_write_seq);
 }

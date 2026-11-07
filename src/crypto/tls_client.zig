@@ -234,9 +234,10 @@ pub const Options = struct {
     /// supported_versions and (when offered) ALPN, a 1-byte GREASE key_share,
     /// and two GREASE extensions (one empty, one 1-byte). A server that
     /// negotiates any GREASE value is rejected regardless (RFC 8701 §3.1).
-    /// Default false keeps the ClientHello byte-identical to the pre-GREASE
-    /// wire until a caller opts in.
-    grease: bool = false,
+    /// Default true (Armor wave 3): RFC 8701 §1 exists to keep servers from
+    /// ossifying on unknown values, which only works if clients send them.
+    /// `false` opts out and keeps the pre-GREASE byte-identical wire.
+    grease: bool = true,
     /// draft-ietf-tls-esni §6.2 "GREASE ECH": when true and no usable
     /// `ech_config_list` makes this handshake offer real ECH, the ClientHello
     /// carries an `encrypted_client_hello` extension with a plausible random
@@ -8115,7 +8116,9 @@ test "GAP-K8 an HRR resumption with a correct binder resumes and an omitting bin
         const truncated_len = try gapK8TruncatedLen(bad_hs);
         const binder_at = tls_record.record_header_len + truncated_len + 2 + 1;
         try std.testing.expect(!std.mem.eql(u8, bad_ch2[binder_at..][0..hash_len], spliced[binder_at..][0..hash_len]));
-        try std.testing.expectError(error.BadHandshake, bad_server.feed(spliced));
+        // RFC 8446 §4.2.11 / §6.2: an invalid PSK binder is decrypt_error
+        // (`PskBinderMismatch`); this previously expected BadHandshake.
+        try std.testing.expectError(error.PskBinderMismatch, bad_server.feed(spliced));
         try std.testing.expect(!bad_server.acceptedSessionTicket());
         try std.testing.expect(!bad_server.handshakeDone());
     }
@@ -8814,7 +8817,8 @@ test "TLS AES128-only fixture offers exact wire suite and exchanges authenticate
     const cert = try x509_selfsign.buildSelfSigned(&cert_buf, .{ .common_name = "irc.test", .not_before = 1_704_067_200, .not_after = 4_102_444_800, .serial = &.{ 0x73, 1 }, .key_pair = kp, .dns_names = &.{"irc.test"}, .is_ca = true });
     var server = try server_mod.Server.init(a, .{ .cert_chain = &.{cert}, .signing_key = kp });
     defer server.deinit();
-    var client = try Client.init(a, .{ .server_name = "irc.test", .trust_anchors = &.{cert} });
+    // Exact-wire assertion: opt out of the (now default) RFC 8701 GREASE suite.
+    var client = try Client.init(a, .{ .server_name = "irc.test", .trust_anchors = &.{cert}, .grease = false });
     defer client.deinit();
     Client.TestSuiteOffer.aes128(&client);
     const ch = try client.start();
@@ -9000,11 +9004,18 @@ test "GREASE (RFC 8701 §3.1): the ClientHello carries GREASE in every listed po
     try std.testing.expect(scan.ech_ext == null); // ECH GREASE is opt-in
 }
 
-test "GREASE: off by default; grease=false sends no reserved value anywhere" {
+test "GREASE: on by default; grease=false sends no reserved value anywhere" {
     const allocator = std.testing.allocator;
+    // The default flipped to true (RFC 8701 §1); this assertion previously
+    // encoded the old opt-in default. ECH GREASE stays opt-in.
     const defaults = Options{ .server_name = "irc.test", .trust_anchors = &.{} };
-    try std.testing.expect(!defaults.grease);
+    try std.testing.expect(defaults.grease);
     try std.testing.expect(!defaults.ech_grease);
+    {
+        var by_default = try Client.init(allocator, defaults);
+        defer by_default.deinit();
+        try std.testing.expect(by_default.grease != null);
+    }
     var client = try Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &.{}, .alpn_protocols = &.{"irc"}, .grease = false });
     defer client.deinit();
     try std.testing.expect(client.grease == null);

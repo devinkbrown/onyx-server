@@ -383,6 +383,45 @@ pub fn completeRecord(buf: []const u8) Error!?Record {
     };
 }
 
+/// Frame the record carrying the initial ClientHello. RFC 5246 Appendix E.1:
+/// "TLS servers ... MUST accept any value {03,XX} as the record layer version
+/// number for ClientHello" — a client may stamp its first record with any TLS
+/// minor version (BoGo LooseInitialRecordVersion-TLS12 uses 0x03ff). A
+/// non-{03,XX} major (SSLv2 framing, garbage) is still refused. Every later
+/// record goes through `completeRecord`.
+pub fn completeInitialRecord(buf: []const u8) Error!?Record {
+    if (buf.len < record_header_len) return null;
+    const ct = ContentType.fromWire(buf[0]) orelse return error.BadRecord;
+    if (buf[1] != 0x03) return error.BadRecord;
+    const version = std.mem.readInt(u16, buf[1..3], .big);
+    const len = std.mem.readInt(u16, buf[3..5], .big);
+    if (len > max_ciphertext_len) return error.CiphertextTooLong;
+    const total = record_header_len + @as(usize, len);
+    if (buf.len < total) return null;
+    return .{
+        .content_type = ct,
+        .version = version,
+        .fragment = buf[record_header_len..total],
+        .wire_len = total,
+    };
+}
+
+test "tls12 initial ClientHello record accepts any {03,XX} record version and refuses another major" {
+    const body = [_]u8{ 0x01, 0x00, 0x00, 0x00 };
+    for ([_]u8{ 0x00, 0x01, 0x03, 0x04, 0xff }) |minor| {
+        const rec = [_]u8{ 22, 0x03, minor, 0x00, 0x04 } ++ body;
+        const got = (try completeInitialRecord(&rec)).?;
+        try std.testing.expectEqual(@as(usize, rec.len), got.wire_len);
+        try std.testing.expectEqualSlices(u8, &body, got.fragment);
+    }
+    // The strict framer used after the ClientHello still refuses 0x03ff.
+    const loose = [_]u8{ 22, 0x03, 0xff, 0x00, 0x04 } ++ body;
+    try std.testing.expectError(error.BadRecord, completeRecord(&loose));
+    const garbage = [_]u8{ 22, 0x12, 0x34, 0x00, 0x04 } ++ body;
+    try std.testing.expectError(error.BadRecord, completeInitialRecord(&garbage));
+    try std.testing.expect((try completeInitialRecord(loose[0..6])) == null);
+}
+
 pub fn writePlainRecord(
     allocator: std.mem.Allocator,
     content_type: ContentType,

@@ -177,6 +177,25 @@ pub const Error = error{
     /// `Config.groups` is empty, names a group this engine cannot negotiate, or
     /// lists a group twice. Raised only at `init` (see `validateGroups`).
     BadGroupConfig,
+    /// A handshake message arrived that is not permitted in the current state,
+    /// or handshake bytes followed a message that ends a key epoch (RFC 8446
+    /// §5.1, RFC 5246 §7.4). Fatal `unexpected_message`.
+    UnexpectedMessage,
+    /// A syntactically valid field carries a value the protocol forbids, e.g. a
+    /// TLS 1.3 compression list other than `[0]` (RFC 8446 §4.1.2), a
+    /// `pre_shared_key` that is not the last extension or whose identity and
+    /// binder counts differ (§4.2.11). Fatal `illegal_parameter`.
+    IllegalParameter,
+    /// RFC 8446 §4.2.3 / §4.4.3 (RFC 5246 §7.4.1.4.1 for TLS 1.2): none of the
+    /// client's `signature_algorithms` can be produced with the certificate's
+    /// key. Fatal `handshake_failure`.
+    NoCommonSignatureAlgorithms,
+    /// RFC 7301 §3.2: the server has ALPN configured, the client offered ALPN,
+    /// and the lists share no protocol. Fatal `no_application_protocol`.
+    NoApplicationProtocol,
+    /// RFC 8446 §4.2.11: the binder for the selected PSK identity has the wrong
+    /// length or does not verify. Fatal `decrypt_error`.
+    PskBinderMismatch,
 } || Allocator.Error || tls_record.Error || hkdf.Error ||
     tls_extension.Error || tls_alpn.Error || tls_keyshare.Error || tls_supported_versions.Error ||
     tls_signature_scheme.Error || tls_psk.Error || tls_session_ticket.EncodeError ||
@@ -204,12 +223,23 @@ pub const Config = struct {
     /// takes precedence over `signing_key`.
     ecdsa_p256_signing_key: ?ecdsa_p256.KeyPair = null,
     /// RSA private key whose public key is the leaf certificate's SPKI; signs
-    /// CertificateVerify with `rsa_pss_rsae_sha256`. When set, this takes
-    /// precedence over the Ed25519 and ECDSA signing keys.
+    /// CertificateVerify with the first of `rsa_pss_rsae_sha256/384/512` the
+    /// client's signature_algorithms offers (RFC 8446 §4.4.3). When set, this
+    /// takes precedence over the Ed25519 and ECDSA signing keys.
     rsa_signing_key: ?rsa_sign.PrivateKey = null,
     /// ALPN protocols the server is willing to select, in preference order.
     /// Empty disables ALPN negotiation.
     alpn_protocols: []const []const u8 = &.{},
+    /// RFC 7301 §3.2: when `alpn_protocols` is non-empty and the client offers
+    /// an ALPN list sharing no protocol with it, abort with a fatal
+    /// `no_application_protocol` alert (the RFC's SHALL). A client offering no
+    /// ALPN extension always proceeds. Defaults to `false` (lenient: complete
+    /// the handshake with no protocol selected) because the daemon's IRC and
+    /// WebSocket listeners deliberately never refuse a client over ALPN (see
+    /// the daemon test "ALPN on the IRC TLS listener selects irc and never
+    /// refuses a client offering none or other ids"); a listener opts into the
+    /// strict RFC behaviour explicitly, as the BoGo shim does.
+    alpn_mismatch_fatal: bool = false,
     /// Mutual TLS: when true the server sends a CertificateRequest and verifies
     /// the client's Certificate + CertificateVerify. CertFP pins by fingerprint,
     /// so any presented X.509 leaf or negotiated raw SPKI is accepted once its
@@ -452,6 +482,8 @@ pub const AlertLevel = enum(u8) { warning = 1, fatal = 2 };
 /// The subset of RFC 8446 §6 AlertDescription codes this server maps handshake
 /// errors to. Non-exhaustive: only the codes we actually emit are named.
 pub const AlertDescription = enum(u8) {
+    close_notify = 0,
+    unexpected_message = 10,
     bad_record_mac = 20,
     record_overflow = 22,
     illegal_parameter = 47,
@@ -462,6 +494,7 @@ pub const AlertDescription = enum(u8) {
     internal_error = 80,
     inappropriate_fallback = 86,
     missing_extension = 109,
+    no_application_protocol = 120,
     _,
 };
 
@@ -488,6 +521,17 @@ pub fn alertDescriptionForError(err: anyerror) ?AlertDescription {
         // draft-ietf-tls-esni §7.1.1: ECH after HelloRetryRequest.
         error.EchHrrMismatch => .illegal_parameter,
         error.EchDecryptError => .decrypt_error,
+        // draft-ietf-tls-esni §6.1: an inconsistent ECH acceptance signal.
+        error.EchInconsistent => .illegal_parameter,
+        // RFC 8446 §5.1 / RFC 5246 §7.4: message not allowed in this state.
+        error.UnexpectedMessage => .unexpected_message,
+        error.IllegalParameter => .illegal_parameter,
+        // RFC 8446 §4.4.3 / RFC 5246 §7.4.1.4.1: no usable signature scheme.
+        error.NoCommonSignatureAlgorithms => .handshake_failure,
+        // RFC 7301 §3.2.
+        error.NoApplicationProtocol => .no_application_protocol,
+        // RFC 8446 §4.2.11: the selected PSK's binder did not validate.
+        error.PskBinderMismatch => .decrypt_error,
         error.NoCertificate, error.NoSigningKey, error.LeafKeyMismatch => .internal_error,
         // Malformed handshake bytes or a wrong first-record content type: the peer
         // sent something we couldn't decode.
@@ -668,6 +712,22 @@ pub const Server = struct {
     /// PSK binder of the accepted resumption (for the 0-RTT anti-replay check).
     accepted_binder: [tls_resumption.max_binder_len]u8 = undefined,
     accepted_binder_len: usize = 0,
+    /// RFC 8446 §4.2.11: zero-based index of the accepted PSK identity, echoed
+    /// as the ServerHello `pre_shared_key.selected_identity`.
+    selected_psk_identity: u16 = 0,
+    /// RFC 8446 §4.4.3: the CertificateVerify SignatureScheme chosen from the
+    /// client's signature_algorithms for the leaf key (0 until selected).
+    cert_verify_scheme: u16 = 0,
+    /// The last alert received from the peer (RFC 8446 §6), recorded before the
+    /// engine fails with `TlsAlert` so a caller can tell an orderly
+    /// close_notify (§6.1) from an error alert.
+    peer_alert: ?tls_alert.Alert = null,
+    /// Set once `closeNotify` has emitted our close_notify (RFC 8446 §6.1).
+    close_notify_sent: bool = false,
+    /// Set by `markTxOffloaded` once the server→client direction has been
+    /// handed to the kernel (kTLS `TLS_TX`). From then on the userspace write
+    /// sequence is stale, so every userspace seal fails closed with BadState.
+    tx_offloaded: bool = false,
     /// RFC 8446 §8.2–8.3: false when the accepted PSK's reported
     /// `obfuscated_ticket_age` fell OUTSIDE the freshness window. It only gates
     /// early_data (a stale-age resumption still completes at 1-RTT). Defaults
@@ -1041,6 +1101,14 @@ pub const Server = struct {
     /// maps this to the kernel `TLS_CIPHER_*` code points.
     pub const KtlsCipher = enum { aes_128_gcm, aes_256_gcm, chacha20_poly1305 };
 
+    /// Record that TX has been installed into the kernel (kTLS `TLS_TX`) with
+    /// the parameters from `ktlsTxParams`. Afterwards `closeNotify`,
+    /// `prepareAppWrite` and `encrypt` return BadState instead of sealing
+    /// under a sequence number the kernel has already consumed.
+    pub fn markTxOffloaded(self: *Server) void {
+        self.tx_offloaded = true;
+    }
+
     /// The server→client (TX) crypto material a completed TLS 1.3 AEAD session
     /// hands to the kernel for `setsockopt(TLS_TX)`: the negotiated cipher, the
     /// application write key, the 12-byte static write IV, and the current write
@@ -1353,7 +1421,7 @@ pub const Server = struct {
             if (self.record_size_limit_offered and opened.inner_len > self.receive_record_size_limit) return error.RecordOverflow;
             consumePrefix(&self.recv_buf, rec.wire_len);
             if (opened.content_type == .alert) {
-                _ = tls_alert.parse(opened.content) catch return error.BadRecord;
+                self.peer_alert = tls_alert.parse(opened.content) catch return error.BadRecord;
                 return error.TlsAlert;
             }
             if (opened.content_type != .handshake) return error.BadRecord;
@@ -1379,10 +1447,16 @@ pub const Server = struct {
     fn nextClientHello(self: *Server) Error!?HandshakeMsg {
         while (true) {
             if (self.client_hello_reassembly.completeLen()) |message_len| {
-                if (self.client_hello_reassembly.bytes.items.len != message_len) return error.BadHandshake;
+                // RFC 8446 §5.1: handshake messages MUST NOT span a key change,
+                // and the ServerHello flight changes keys, so bytes after the
+                // ClientHello in its records are unexpected_message (BoGo
+                // Partial*WithClientHello / PartialSecondClientHelloAfterFirst).
+                if (self.client_hello_reassembly.bytes.items.len != message_len) return error.UnexpectedMessage;
                 var off: usize = 0;
                 const msg = try parseHandshake(self.client_hello_reassembly.bytes.items, &off);
-                if (off != message_len or msg.typ != .client_hello) return error.BadHandshake;
+                if (off != message_len) return error.BadHandshake;
+                // RFC 8446 §4: only a ClientHello is valid here.
+                if (msg.typ != .client_hello) return error.UnexpectedMessage;
                 return msg;
             }
 
@@ -1393,7 +1467,7 @@ pub const Server = struct {
                 continue;
             }
             if (rec.content_type == .alert) {
-                _ = tls_alert.parse(rec.fragment) catch return error.BadRecord;
+                self.peer_alert = tls_alert.parse(rec.fragment) catch return error.BadRecord;
                 return error.TlsAlert;
             }
             if (rec.content_type != .handshake) return error.BadRecord;
@@ -1426,7 +1500,7 @@ pub const Server = struct {
         const msg = parseHandshakeMaybe(self.client_flight.items, &off) orelse return false;
         switch (self.state) {
             .wait_client_cert => {
-                if (msg.typ != .certificate) return error.BadHandshake;
+                if (msg.typ != .certificate) return error.UnexpectedMessage;
                 try self.parseClientCertificate(msg.body);
                 try self.appendTranscript(msg.raw);
                 // A presented leaf must prove possession via CertificateVerify; an
@@ -1434,13 +1508,16 @@ pub const Server = struct {
                 self.state = if (self.client_leaf_key != null) .wait_client_cert_verify else .wait_client_finished;
             },
             .wait_client_cert_verify => {
-                if (msg.typ != .certificate_verify) return error.BadHandshake;
+                if (msg.typ != .certificate_verify) return error.UnexpectedMessage;
                 try self.verifyClientCertificateVerify(msg.body);
                 try self.appendTranscript(msg.raw);
                 self.state = .wait_client_finished;
             },
             .wait_client_finished => {
-                if (msg.typ != .finished or off != self.client_flight.items.len) return error.BadHandshake;
+                // RFC 8446 §4.4.4 / §5.1: only Finished is valid here, and no
+                // handshake data may follow it in the same epoch (it ends the
+                // client's handshake key epoch) ⇒ unexpected_message.
+                if (msg.typ != .finished or off != self.client_flight.items.len) return error.UnexpectedMessage;
                 if (!self.finishedVerify(&self.client_hs_secret, msg.body)) return error.FinishedMismatch;
                 try self.appendTranscript(msg.raw);
                 try self.deriveResumptionMasterSecret();
@@ -1582,6 +1659,8 @@ pub const Server = struct {
     /// Allocation/sequence exhaustion leaves the live TX epoch unchanged.
     pub fn prepareAppWrite(self: *Server, chunks: []const []const u8) Error!PreparedAppWrite {
         if (self.read_failed) return error.BadState;
+        // RFC 8446 §6.1: nothing may be written after our close_notify.
+        if (self.close_notify_sent or self.tx_offloaded) return error.BadState;
         if (self.state != .connected or self.app_write_active != null) return error.BadState;
         if (self.app_write_generation == std.math.maxInt(u64)) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
@@ -1666,7 +1745,7 @@ pub const Server = struct {
         if (self.record_size_limit_offered and opened.inner_len > self.receive_record_size_limit) return error.RecordOverflow;
         if (self.post_handshake_recv_len != 0 and opened.content_type != .handshake and opened.content_type != .alert) return error.BadHandshake;
         if (opened.content_type == .alert) {
-            _ = tls_alert.parse(opened.content) catch return error.BadRecord;
+            self.peer_alert = tls_alert.parse(opened.content) catch return error.BadRecord;
             return error.TlsAlert;
         }
         if (opened.content_type == .handshake) {
@@ -1952,12 +2031,19 @@ pub const Server = struct {
         const suite = self.selected_suite.?;
         const sh_record = try writePlainRecord(self.allocator, .handshake, sh_hs.items);
         defer self.allocator.free(sh_record);
-        const ccs = [_]u8{ @backingInt(tls_record.ContentType.change_cipher_spec), 0x03, 0x03, 0x00, 0x01, 0x01 };
+        // RFC 8446 Appendix D.4: "The server sends a dummy change_cipher_spec
+        // record immediately after its first handshake message. This may
+        // either be after a ServerHello or a HelloRetryRequest." Exactly once:
+        // after a HelloRetryRequest (which already carried it) the ServerHello
+        // is NOT followed by a second CCS — a peer that expects only one (Go /
+        // BoGo SendHelloRetryRequest-*) otherwise fails to decrypt the flight.
+        const ccs_full = [_]u8{ @backingInt(tls_record.ContentType.change_cipher_spec), 0x03, 0x03, 0x00, 0x01, 0x01 };
+        const ccs: []const u8 = if (self.hrr_sent) &.{} else &ccs_full;
         const encrypted = try sealRecordBatchAlloc(self.allocator, suite, &self.server_hs_keys, self.hs_write_seq, .handshake, flight.items, self.peer_record_size_limit);
         defer self.allocator.free(encrypted.bytes);
         const out = try self.allocator.alloc(u8, sh_record.len + ccs.len + encrypted.bytes.len);
         @memcpy(out[0..sh_record.len], sh_record);
-        @memcpy(out[sh_record.len..][0..ccs.len], &ccs);
+        @memcpy(out[sh_record.len..][0..ccs.len], ccs);
         @memcpy(out[sh_record.len + ccs.len ..], encrypted.bytes);
         self.hs_write_seq = encrypted.next_seq;
         return out;
@@ -2236,7 +2322,10 @@ pub const Server = struct {
 
     fn processClientHello(self: *Server, body: []const u8, raw: []const u8) Error!ClientHelloOutcome {
         var c = Cursor.init(body);
-        if (try c.readU16() != tls_record.legacy_record_version) return error.ProtocolVersion;
+        // RFC 8446 §4.2.1: with supported_versions present the server MUST NOT
+        // use legacy_version for negotiation. It is checked after the extension
+        // block, only against the TLS 1.x floor (see below).
+        const legacy_version = try c.readU16();
         _ = try c.take(32); // client random (unused by the server key schedule)
         const sid = try c.take(try c.readU8());
         if (sid.len > self.legacy_session_id.len) return error.BadHandshake;
@@ -2244,18 +2333,22 @@ pub const Server = struct {
         self.session_id_len = sid.len;
 
         const suites_block = try c.take(try c.readU16());
+        const comp = try c.take(try c.readU8());
+        const ext_block = try c.take(try c.readU16());
+        // RFC 8446 §4.1.2: the extensions block ends the ClientHello; anything
+        // after it is a decode error, never silently ignored.
+        if (c.remaining() != 0) return error.BadHandshake;
+        // RFC 8446 §4.1.2: "For every TLS 1.3 ClientHello, this vector MUST
+        // contain exactly one byte, set to zero ... If a TLS 1.3 ClientHello is
+        // received with any other value in this field, the server MUST abort the
+        // handshake with an "illegal_parameter" alert."
+        if (comp.len != 1 or comp[0] != 0) return error.IllegalParameter;
         const full_suite = pickSuite(suites_block) orelse return error.UnsupportedCipherSuite;
 
-        const comp = try c.take(try c.readU8());
-        var null_comp = false;
-        for (comp) |m| if (m == 0) {
-            null_comp = true;
-        };
-        if (!null_comp) return error.BadHandshake;
-
-        const ext_block = try c.take(try c.readU16());
-
         var offered_tls13 = false;
+        var offered_key_share = false; // §9.2 key_share/supported_groups pairing
+        var offered_psk_modes = false; // §4.2.9: required alongside pre_shared_key
+        var offered_alpn = false; // RFC 7301 §3.2: refusal only when offered
         var x25519_share: ?[]const u8 = null;
         var p256_share: ?[]const u8 = null;
         var hybrid_share: ?[]const u8 = null; // X25519MLKEM768 (post-quantum)
@@ -2285,6 +2378,8 @@ pub const Server = struct {
         // no false collisions between distinct types. A conforming peer never
         // repeats a type; one that does is fail-closed rejected before any of
         // its extension handling below runs.
+        // ALPN is re-selected from each ClientHello (§4.1.2 forbids a CH2 change).
+        self.selected_alpn = null;
         var seen_ext_types = std.bit_set.StaticBitSet(std.math.maxInt(u16) + 1).empty;
         var it = tls_extension.Iterator.init(ext_block);
         while (try it.next()) |ext| {
@@ -2296,8 +2391,11 @@ pub const Server = struct {
                 },
                 .supported_groups => offered_groups = ext.data,
                 .key_share => {
-                    var shares = tls_keyshare.parseClientShares(ext.data) catch continue;
-                    while (shares.next() catch null) |entry| {
+                    offered_key_share = true;
+                    // RFC 8446 §4.2.8: a malformed KeyShareClientHello (bad list
+                    // length, truncated entry, trailing bytes) is a decode error.
+                    var shares = tls_keyshare.parseClientShares(ext.data) catch return error.BadHandshake;
+                    while (shares.next() catch return error.BadHandshake) |entry| {
                         if (entry.group == .x25519 and entry.key_exchange.len == kx.X25519Kx.public_len) {
                             if (x25519_share == null) x25519_share = entry.key_exchange;
                         } else if (entry.group == .secp256r1 and entry.key_exchange.len == ecdh_p256.public_length) {
@@ -2307,7 +2405,11 @@ pub const Server = struct {
                         }
                     }
                 },
-                .alpn => self.maybeSelectAlpn(ext.data),
+                .alpn => {
+                    offered_alpn = true;
+                    try self.maybeSelectAlpn(ext.data);
+                },
+                .server_name => try validateServerNameExtension(ext.data),
                 .status_request => self.client_requested_ocsp = true,
                 .compress_certificate => if (self.config.enable_cert_compression) {
                     // RFC 8879: remember the first algorithm we can produce (zlib).
@@ -2360,7 +2462,10 @@ pub const Server = struct {
                     if (self.client_sig_algs_cert) |old| self.allocator.free(old);
                     self.client_sig_algs_cert = try self.allocator.dupe(u8, ext.data);
                 },
-                .psk_key_exchange_modes => psk_modes_ok = pskModesAllowDhe(ext.data),
+                .psk_key_exchange_modes => {
+                    offered_psk_modes = true;
+                    psk_modes_ok = pskModesAllowDhe(ext.data);
+                },
                 .delegated_credential => {
                     // RFC 9345: the body is a SignatureSchemeList of the schemes the
                     // client will accept as a DC's dc_cert_verify_algorithm. Present
@@ -2378,7 +2483,10 @@ pub const Server = struct {
                     offered_early_data = true;
                 },
                 .pre_shared_key => {
-                    if (it.remaining() != 0) return error.BadHandshake;
+                    // RFC 8446 §4.2.11: "servers MUST check that it is the last
+                    // extension and otherwise fail the handshake with an
+                    // "illegal_parameter" alert."
+                    if (it.remaining() != 0) return error.IllegalParameter;
                     psk_ext = ext.data;
                 },
                 else => {},
@@ -2386,6 +2494,29 @@ pub const Server = struct {
         }
 
         if (!offered_tls13) return error.ProtocolVersion;
+        // RFC 8446 §4.1.2 / §4.2.1: legacy_version is not used for negotiation
+        // once supported_versions selects TLS 1.3, and RFC 8446 Appendix D
+        // tolerates any value at or above TLS 1.0 there (BoGo
+        // VersionTolerance-TLS13 / IgnoreLegacyVersion-TLS13). Below TLS 1.0
+        // (SSL 3.0 or garbage) is refused.
+        if (legacy_version < 0x0301) return error.ProtocolVersion;
+        // RFC 8446 §9.2: a ClientHello "If containing a "supported_groups"
+        // extension, it MUST also contain a "key_share" extension, and vice
+        // versa", and without "pre_shared_key" it MUST contain
+        // "supported_groups"; otherwise abort with "missing_extension".
+        if (offered_key_share != (offered_groups != null)) return error.MissingExtension;
+        if (psk_ext == null and offered_groups == null) return error.MissingExtension;
+        // RFC 8446 §4.2.9: "If clients offer "pre_shared_key" without a
+        // "psk_key_exchange_modes" extension, servers MUST abort the handshake."
+        if (psk_ext != null and !offered_psk_modes) return error.MissingExtension;
+        // RFC 7301 §3.2: with ALPN configured and offered but no protocol in
+        // common, the server SHALL send a fatal "no_application_protocol" alert.
+        // A client that offers no ALPN at all still proceeds (plain IRC clients).
+        if (offered_alpn and self.selected_alpn == null and
+            self.config.alpn_protocols.len != 0 and self.config.alpn_mismatch_fatal)
+        {
+            return error.NoApplicationProtocol;
+        }
         self.selected_suite = full_suite;
         self.cert_compression = offered_cert_compression;
         self.server_cert_type_rpk = offered_rpk;
@@ -2469,29 +2600,30 @@ pub const Server = struct {
         }
 
         if (psk_ext) |ext| {
-            if (psk_modes_ok) {
-                if (try self.tryAcceptPsk(suites_block, raw, ext)) |suite| {
-                    self.selected_suite = suite;
-                    self.resumed = true;
-                    // Accept 0-RTT only when the limit is non-zero AND this PSK
-                    // binder has not been seen before (anti-replay) AND the
-                    // reported ticket age is inside the §8.2–8.3 freshness window
-                    // (`accepted_age_within_window`, set in tryAcceptPsk). Any of
-                    // these failing still resumes via 1-RTT; only early data is
-                    // refused. The replay check runs LAST (after the window) so a
-                    // stale-age attempt does not consume a binder-ring slot.
-                    if (offered_early_data and
-                        self.receive_record_size_limit == tls_record.record_size_limit_max and
-                        self.accepted_early_data_limit > 0 and
-                        self.accepted_age_within_window)
-                    {
-                        const guard = self.config.replay_guard orelse &builtin_0rtt_replay;
-                        const replay_ok = guard.checkAndRecord(self.accepted_binder[0..self.accepted_binder_len]);
-                        if (replay_ok) {
-                            self.early_data_accepted = true;
-                            self.early_data_done = false;
-                            try self.deriveClientEarlyTrafficKeys();
-                        }
+            // RFC 8446 §4.2.11: the extension is validated structurally (and its
+            // identity/binder counts compared) whether or not psk_dhe_ke allows
+            // this server to use it.
+            if (try self.tryAcceptPsk(suites_block, raw, ext, psk_modes_ok)) |suite| {
+                self.selected_suite = suite;
+                self.resumed = true;
+                // Accept 0-RTT only when the limit is non-zero AND this PSK
+                // binder has not been seen before (anti-replay) AND the
+                // reported ticket age is inside the §8.2–8.3 freshness window
+                // (`accepted_age_within_window`, set in tryAcceptPsk). Any of
+                // these failing still resumes via 1-RTT; only early data is
+                // refused. The replay check runs LAST (after the window) so a
+                // stale-age attempt does not consume a binder-ring slot.
+                if (offered_early_data and
+                    self.receive_record_size_limit == tls_record.record_size_limit_max and
+                    self.accepted_early_data_limit > 0 and
+                    self.accepted_age_within_window)
+                {
+                    const guard = self.config.replay_guard orelse &builtin_0rtt_replay;
+                    const replay_ok = guard.checkAndRecord(self.accepted_binder[0..self.accepted_binder_len]);
+                    if (replay_ok) {
+                        self.early_data_accepted = true;
+                        self.early_data_done = false;
+                        try self.deriveClientEarlyTrafficKeys();
                     }
                 }
             }
@@ -2503,6 +2635,10 @@ pub const Server = struct {
         // confidentiality against harvest-now-decrypt-later, then X25519, then
         // secp256r1).
         const group = chosen orelse return error.UnsupportedGroup;
+        // RFC 8446 §4.4.3: pick the CertificateVerify scheme from the client's
+        // signature_algorithms BEFORE any ServerHello, so a client whose list
+        // this key cannot satisfy gets a plaintext handshake_failure.
+        if (!self.resumed) try self.selectCertVerifyScheme();
         switch (group) {
             .x25519mlkem768 => {
                 const peer = hybrid_share.?;
@@ -2560,68 +2696,110 @@ pub const Server = struct {
         }
     }
 
-    fn tryAcceptPsk(self: *Server, suites_block: []const u8, client_hello_raw: []const u8, psk_ext: []const u8) Error!?CipherSuite {
-        var parsed = tls_psk.parseClientPsk(psk_ext) catch return null;
-        const identity = (parsed.identities.next() catch return null) orelse return null;
-        const binder = (parsed.binders.next() catch return null) orelse return null;
-        if ((parsed.identities.next() catch return null) != null) return null;
-        if ((parsed.binders.next() catch return null) != null) return null;
-
-        const opened = tls_resumption.openTicketWithRotation(self.allocator, self.ticket_key, self.config.previous_ticket_key, identity.identity) catch return null;
-        defer self.allocator.free(opened.plain);
-        const suite = CipherSuite.fromWire(opened.opened.suite) catch return null;
-        if (self.hrr_sent) {
-            const committed = self.hrr_suite orelse return error.BadHandshake;
-            if (suite != committed) return null;
+    /// RFC 8446 §4.2.11 server-side PSK selection.
+    ///
+    /// The `pre_shared_key` body is validated structurally first, whether or not
+    /// it will be used: a malformed body or an empty identity/binder list is a
+    /// decode error, and differing identity and binder counts are
+    /// `illegal_parameter`. When `psk_dhe_ok` (the client's
+    /// psk_key_exchange_modes allows psk_dhe_ke, §4.2.9) the identities are tried
+    /// in order and the FIRST one this server can use (a ticket that opens under
+    /// the current or previous key, names an offered cipher suite with a matching
+    /// hash and, once a clock is configured, is inside its lifetime) is selected.
+    /// "Prior to accepting PSK key establishment, the server MUST validate the
+    /// corresponding binder value ... If this value is not present or does not
+    /// validate, the server MUST abort the handshake": a wrong-length or invalid
+    /// binder for the selected identity is fatal `decrypt_error`, never a silent
+    /// fall back to a full handshake. Identities this server cannot use are
+    /// skipped (their binders are not inspected) and, if none is usable, the
+    /// handshake proceeds without a PSK.
+    fn tryAcceptPsk(self: *Server, suites_block: []const u8, client_hello_raw: []const u8, psk_ext: []const u8, psk_dhe_ok: bool) Error!?CipherSuite {
+        const parsed = tls_psk.parseClientPsk(psk_ext) catch return error.BadHandshake;
+        var identity_count: usize = 0;
+        var binder_count: usize = 0;
+        {
+            var ids = parsed.identities;
+            while (ids.next() catch return error.BadHandshake) |_| identity_count += 1;
+            var binders = parsed.binders;
+            while (binders.next() catch return error.BadHandshake) |_| binder_count += 1;
         }
-        if (!clientOfferedSuite(suites_block, suite)) return null;
-        if (opened.opened.psk.len != suite.hashLen()) return null;
-        if (binder.len != suite.hashLen()) return null;
+        // identities<7..2^16-1> and binders<33..2^16-1> are never empty.
+        if (identity_count == 0 or binder_count == 0) return error.BadHandshake;
+        if (identity_count != binder_count) return error.IllegalParameter;
+        if (!psk_dhe_ok) return null;
 
-        // Ticket-lifetime enforcement once a clock is configured. A missing
-        // issue time, or a ticket that does not carry the lifetime advertised
-        // at mint, cannot be shown to be inside that window, so it does not
-        // resume. Lengthening this node's config does not extend a ticket.
-        if (self.config.now_unix_seconds) |now_s| {
-            const issued_s = @divTrunc(opened.opened.issued_unix_ms, 1000);
-            const sealed_lifetime = opened.opened.ticket_lifetime orelse return null;
-            if (issued_s == 0) return null;
-            if (now_s < issued_s) return null;
-            const window = @min(sealed_lifetime, max_ticket_lifetime_seconds);
-            if (now_s - issued_s > @as(i64, window)) return null;
-            // RFC 8446 §8.2–8.3 0-RTT freshness window. Un-obfuscate the client's
-            // reported age with the ticket's sealed age_add and compare it to the
-            // server's own measured elapsed time. Runs only for a v3 ticket
-            // (age_add present) with a real issue time; a mismatch beyond the skew
-            // window refuses early_data (still resumes 1-RTT). Gated separately
-            // from the lifetime check because it only affects 0-RTT, not resumption.
-            self.accepted_age_within_window = self.ticketAgeWithinWindow(
-                opened.opened,
-                identity.obfuscated_ticket_age,
-                now_s,
-            );
+        var ids = parsed.identities;
+        var binders = parsed.binders;
+        // identities<7..2^16-1> holds at most 9362 entries, so a u16 index (the
+        // ServerHello selected_identity width) never overflows.
+        var index: u16 = 0;
+        while (ids.next() catch return error.BadHandshake) |identity| : (index += 1) {
+            const binder = (binders.next() catch return error.BadHandshake) orelse return error.IllegalParameter;
+            self.accepted_age_within_window = false;
+            const opened = tls_resumption.openTicketWithRotation(self.allocator, self.ticket_key, self.config.previous_ticket_key, identity.identity) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            defer self.allocator.free(opened.plain);
+            const suite = CipherSuite.fromWire(opened.opened.suite) catch continue;
+            if (self.hrr_sent) {
+                const committed = self.hrr_suite orelse return error.BadHandshake;
+                if (suite != committed) continue;
+            }
+            if (!clientOfferedSuite(suites_block, suite)) continue;
+            if (opened.opened.psk.len != suite.hashLen()) continue;
+
+            // Ticket-lifetime enforcement once a clock is configured. A missing
+            // issue time, or a ticket that does not carry the lifetime advertised
+            // at mint, cannot be shown to be inside that window, so it does not
+            // resume. Lengthening this node's config does not extend a ticket.
+            if (self.config.now_unix_seconds) |now_s| {
+                const issued_s = @divTrunc(opened.opened.issued_unix_ms, 1000);
+                const sealed_lifetime = opened.opened.ticket_lifetime orelse continue;
+                if (issued_s == 0) continue;
+                if (now_s < issued_s) continue;
+                const window = @min(sealed_lifetime, max_ticket_lifetime_seconds);
+                if (now_s - issued_s > @as(i64, window)) continue;
+                // RFC 8446 §8.2–8.3 0-RTT freshness window. Un-obfuscate the client's
+                // reported age with the ticket's sealed age_add and compare it to the
+                // server's own measured elapsed time. Runs only for a v3 ticket
+                // (age_add present) with a real issue time; a mismatch beyond the skew
+                // window refuses early_data (still resumes 1-RTT). Gated separately
+                // from the lifetime check because it only affects 0-RTT, not resumption.
+                self.accepted_age_within_window = self.ticketAgeWithinWindow(
+                    opened.opened,
+                    identity.obfuscated_ticket_age,
+                    now_s,
+                );
+            }
+
+            // This identity is selected: its binder MUST validate (§4.2.11).
+            if (binder.len != suite.hashLen()) return error.PskBinderMismatch;
+            const binder_list_offset = tls_psk.binderListOffset(psk_ext) catch return error.BadHandshake;
+            const psk_body_offset = findPskExtensionBodyOffset(client_hello_raw) catch return error.BadHandshake;
+            const truncated_len = psk_body_offset + binder_list_offset;
+            if (truncated_len > client_hello_raw.len) return error.BadHandshake;
+            if (!self.verifyPskBinder(suite, opened.opened.psk, client_hello_raw, client_hello_raw[0..truncated_len], binder)) {
+                return error.PskBinderMismatch;
+            }
+
+            @memcpy(self.accepted_psk[0..opened.opened.psk.len], opened.opened.psk);
+            self.accepted_psk_len = opened.opened.psk.len;
+            // Zero config refuses early data for every ticket. A non-zero config
+            // accepts only up to the smaller of this node's limit and the limit
+            // sealed when the ticket was minted. RFC 8446 §4.2.10: early data is
+            // only ever keyed to the FIRST identity.
+            self.accepted_early_data_limit = if (index == 0)
+                @min(opened.opened.max_early_data_size, self.config.max_early_data_size)
+            else
+                0;
+            @memcpy(self.accepted_binder[0..binder.len], binder);
+            self.accepted_binder_len = binder.len;
+            self.selected_psk_identity = index;
+            return suite;
         }
-
-        const binder_list_offset = tls_psk.binderListOffset(psk_ext) catch return null;
-        const psk_body_offset = findPskExtensionBodyOffset(client_hello_raw) catch return null;
-        const truncated_len = psk_body_offset + binder_list_offset;
-        if (truncated_len > client_hello_raw.len) return null;
-        if (!self.verifyPskBinder(suite, opened.opened.psk, client_hello_raw, client_hello_raw[0..truncated_len], binder)) {
-            // RFC 8446 §4.2.11.2: a binder that skips the HelloRetryRequest
-            // transcript aborts. A first ClientHello falls through.
-            if (self.hrr_sent) return error.BadHandshake;
-            return null;
-        }
-
-        @memcpy(self.accepted_psk[0..opened.opened.psk.len], opened.opened.psk);
-        self.accepted_psk_len = opened.opened.psk.len;
-        // Zero config refuses early data for every ticket. A non-zero config
-        // accepts only up to the smaller of this node's limit and the limit
-        // sealed when the ticket was minted.
-        self.accepted_early_data_limit = @min(opened.opened.max_early_data_size, self.config.max_early_data_size);
-        @memcpy(self.accepted_binder[0..binder.len], binder);
-        self.accepted_binder_len = binder.len;
-        return suite;
+        self.accepted_age_within_window = false;
+        return null;
     }
 
     /// RFC 8446 §8.2–8.3: decide whether a 0-RTT attempt's reported ticket age is
@@ -2692,10 +2870,16 @@ pub const Server = struct {
         };
     }
 
-    fn maybeSelectAlpn(self: *Server, data: []const u8) void {
+    /// RFC 7301 §3.1: validate the client's ProtocolNameList ("Empty strings
+    /// MUST NOT be included and byte strings MUST NOT be truncated"; the list
+    /// itself is `<2..2^16-1>`), then select the first client-offered protocol
+    /// the server supports. A malformed list is a decode error whether or not
+    /// ALPN is configured.
+    fn maybeSelectAlpn(self: *Server, data: []const u8) Error!void {
+        try validateAlpnExtension(data);
         if (self.config.alpn_protocols.len == 0) return;
-        var names = tls_alpn.Iterator.fromBlock(data) catch return;
-        while (names.next() catch null) |offered| {
+        var names = tls_alpn.Iterator.fromBlock(data) catch return error.BadHandshake;
+        while (names.next() catch return error.BadHandshake) |offered| {
             for (self.config.alpn_protocols) |pref| {
                 if (std.mem.eql(u8, pref, offered)) {
                     self.selected_alpn = pref;
@@ -2753,7 +2937,7 @@ pub const Server = struct {
         try ext_builder.addTyped(.key_share, ks);
         if (self.resumed) {
             var psk_buf: [2]u8 = undefined;
-            try ext_builder.addTyped(.pre_shared_key, try tls_psk.buildServerPsk(&psk_buf, 0));
+            try ext_builder.addTyped(.pre_shared_key, try tls_psk.buildServerPsk(&psk_buf, self.selected_psk_identity));
         }
         try body.appendSlice(self.allocator, try ext_builder.finish());
 
@@ -3114,19 +3298,94 @@ pub const Server = struct {
                 try body.appendSlice(self.allocator, der);
             },
             .rsa => |key| {
-                var digest: [32]u8 = undefined;
-                std.crypto.hash.sha2.Sha256.hash(input, &digest, .{});
-                var salt: [32]u8 = undefined;
-                try osEntropy(&salt);
-                defer secureZero(&salt);
+                // RFC 8446 §4.2.3: rsa_pss_rsae_* with salt length = hash length.
+                // A delegated credential keeps its fixed sha256 scheme (RFC 9345).
+                const scheme: u16 = if (self.activeDelegatedCredential() != null)
+                    scheme_rsa_pss_rsae_sha256
+                else
+                    self.cert_verify_scheme;
+                const alg = rsaPssHash(scheme) orelse return error.NoCommonSignatureAlgorithms;
+                var digest_buf: [64]u8 = undefined;
+                const digest = digest_buf[0..alg.digestLen()];
+                switch (alg) {
+                    .sha256 => std.crypto.hash.sha2.Sha256.hash(input, digest[0..32], .{}),
+                    .sha384 => std.crypto.hash.sha2.Sha384.hash(input, digest[0..48], .{}),
+                    .sha512 => std.crypto.hash.sha2.Sha512.hash(input, digest[0..64], .{}),
+                }
+                var salt_buf: [64]u8 = undefined;
+                const salt = salt_buf[0..alg.digestLen()];
+                try osEntropy(salt);
+                defer secureZero(&salt_buf);
                 var sig_buf: [512]u8 = undefined;
-                const sig = rsa_sign.signPss(key, .sha256, &digest, &salt, &sig_buf) catch return error.BadHandshake;
-                try appendU16(self.allocator, &body, @backingInt(tls_signature_scheme.SignatureScheme.rsa_pss_rsae_sha256));
+                const sig = rsa_sign.signPss(key, alg, digest, salt, &sig_buf) catch return error.BadHandshake;
+                try appendU16(self.allocator, &body, scheme);
                 try appendU16(self.allocator, &body, @intCast(sig.len));
                 try body.appendSlice(self.allocator, sig);
             },
         }
         try self.emit(out, .certificate_verify, body.items);
+    }
+
+    /// RFC 8446 §4.2.3 / §4.4.3: choose the CertificateVerify SignatureScheme.
+    /// "If a server is authenticating via a certificate and the client has not
+    /// sent a "signature_algorithms" extension, then the server MUST abort the
+    /// handshake with a "missing_extension" alert"; the server's signature MUST
+    /// use a scheme the client offered and that the leaf key can produce,
+    /// otherwise the handshake fails with `handshake_failure`. Candidates are
+    /// tried in this server's preference order (Ed25519 → ed25519; P-256 →
+    /// ecdsa_secp256r1_sha256; RSA → rsa_pss_rsae_sha256/384/512 where the
+    /// modulus is large enough for salt = hash length, RFC 8017 §9.1.1). The
+    /// rsa_pkcs1_* codepoints are never used: §4.2.3 forbids them in TLS 1.3
+    /// handshake signatures. A delegated credential (RFC 9345) signs with its
+    /// own `dc_cert_verify_algorithm`, already accepted via the client's
+    /// delegated_credential extension, so it skips this selection.
+    fn selectCertVerifyScheme(self: *Server) Error!void {
+        self.cert_verify_scheme = 0;
+        const offered = self.client_sig_algs orelse return error.MissingExtension;
+        var parsed = tls_signature_scheme.parse(offered) catch return error.BadHandshake;
+        // supported_signature_algorithms<2..2^16-2>: never empty.
+        if (parsed.remaining() == 0) return error.BadHandshake;
+        if (self.activeDelegatedCredential() != null) return;
+        const key = self.activeSigningKeyResolved() orelse return error.NoSigningKey;
+        const candidates: []const u16 = switch (key) {
+            .ed25519 => &.{scheme_ed25519},
+            .ecdsa_p256 => &.{scheme_ecdsa_secp256r1_sha256},
+            .rsa => &.{ scheme_rsa_pss_rsae_sha256, scheme_rsa_pss_rsae_sha384, scheme_rsa_pss_rsae_sha512 },
+        };
+        for (candidates) |want| {
+            if (!tls_signature_scheme.offers(offered, tls_signature_scheme.SignatureScheme.fromInt(want))) continue;
+            switch (key) {
+                .rsa => |rsa| if (!rsaPssFits(rsa, rsaPssHash(want).?)) continue,
+                else => {},
+            }
+            self.cert_verify_scheme = want;
+            return;
+        }
+        return error.NoCommonSignatureAlgorithms;
+    }
+
+    /// Encode an orderly-shutdown `close_notify` alert (RFC 8446 §6.1: "Each
+    /// party MUST send a "close_notify" alert before closing its write side of
+    /// the connection, unless it has already sent some error alert"). Valid only
+    /// once the handshake completed; the record is sealed under the current
+    /// server application traffic key at the next write sequence, and no further
+    /// application data may be written afterwards. Caller owns the bytes.
+    ///
+    /// Userspace-TX connections only. Once TX has been offloaded to kTLS the
+    /// kernel owns the write sequence; re-sealing here would reuse a
+    /// (key, nonce) pair the kernel already used, breaking AES-GCM and
+    /// ChaCha20-Poly1305. The caller must then send the alert as a kernel
+    /// control record (`TLS_SET_RECORD_TYPE` cmsg with type 21) instead. Call
+    /// `markTxOffloaded` at kTLS TX install so this fails closed (BadState).
+    pub fn closeNotify(self: *Server) Error![]u8 {
+        if (self.state != .connected or self.app_write_active != null or self.close_notify_sent or self.tx_offloaded) return error.BadState;
+        const suite = self.selected_suite orelse return error.BadState;
+        const seq = try tls_record.reserveAppSeq(self.app_write_seq);
+        const body = [_]u8{ @backingInt(AlertLevel.warning), @backingInt(AlertDescription.close_notify) };
+        const record = try sealRecordAlloc(self.allocator, suite, &self.server_app_keys, seq, .alert, &body);
+        self.app_write_seq = seq + 1;
+        self.close_notify_sent = true;
+        return record;
     }
 
     fn writeServerFinished(self: *Server, out: *std.ArrayList(u8)) Error!void {
@@ -3478,6 +3737,71 @@ pub const Server = struct {
         }
     }
 };
+
+const scheme_ed25519: u16 = 0x0807;
+const scheme_ecdsa_secp256r1_sha256: u16 = 0x0403;
+const scheme_rsa_pss_rsae_sha256: u16 = 0x0804;
+const scheme_rsa_pss_rsae_sha384: u16 = 0x0805;
+const scheme_rsa_pss_rsae_sha512: u16 = 0x0806;
+
+/// The hash of an `rsa_pss_rsae_*` SignatureScheme (RFC 8446 §4.2.3), or null.
+fn rsaPssHash(scheme: u16) ?rsa_verify.HashAlg {
+    return switch (scheme) {
+        scheme_rsa_pss_rsae_sha256 => .sha256,
+        scheme_rsa_pss_rsae_sha384 => .sha384,
+        scheme_rsa_pss_rsae_sha512 => .sha512,
+        else => null,
+    };
+}
+
+/// RFC 8017 §9.1.1 step 3: EMSA-PSS needs emLen >= hLen + sLen + 2, with TLS
+/// 1.3's salt length sLen = hLen (RFC 8446 §4.2.3) and
+/// emLen = ceil((modBits - 1) / 8). False for a key too small for `alg`
+/// (e.g. RSA-1024 with SHA-512), so selection never picks a scheme that cannot
+/// be signed (BoGo RSA-PSS-Large).
+pub fn rsaPssFits(key: rsa_sign.PrivateKey, alg: rsa_verify.HashAlg) bool {
+    var n = key.n;
+    while (n.len != 0 and n[0] == 0) n = n[1..];
+    if (n.len == 0) return false;
+    const mod_bits = (n.len - 1) * 8 + (8 - @as(usize, @clz(n[0])));
+    const em_len = (mod_bits - 1 + 7) / 8;
+    return em_len >= 2 * alg.digestLen() + 2;
+}
+
+/// RFC 7301 §3.1: `ProtocolName protocol_name_list<2..2^16-1>` of
+/// `opaque ProtocolName<1..2^8-1>`. "Empty strings MUST NOT be included and
+/// byte strings MUST NOT be truncated." Shared by the TLS 1.2 engine.
+pub fn validateAlpnExtension(data: []const u8) error{BadHandshake}!void {
+    if (data.len < 2) return error.BadHandshake;
+    const list_len = std.mem.readInt(u16, data[0..2], .big);
+    if (list_len == 0 or list_len != data.len - 2) return error.BadHandshake;
+    var names = tls_alpn.Iterator.fromBlock(data) catch return error.BadHandshake;
+    while (names.next() catch return error.BadHandshake) |_| {}
+}
+
+/// RFC 6066 §3: `ServerName server_name_list<1..2^16-1>`, each entry a
+/// `NameType name_type` followed by (for host_name, type 0) an
+/// `opaque HostName<1..2^16-1>`. The list must fill the extension exactly —
+/// trailing data is a decode error (BoGo ExtensionTrailingData-ServerName) —
+/// and "The ServerNameList MUST NOT contain more than one name of the same
+/// name_type". An unknown name_type cannot be skipped (its body length is not
+/// self-describing), so it is also refused. Shared by the TLS 1.2 engine.
+pub fn validateServerNameExtension(data: []const u8) error{BadHandshake}!void {
+    if (data.len < 2) return error.BadHandshake;
+    const list_len = std.mem.readInt(u16, data[0..2], .big);
+    if (list_len == 0 or list_len != data.len - 2) return error.BadHandshake;
+    var rest = data[2..];
+    var saw_host_name = false;
+    while (rest.len != 0) {
+        if (rest.len < 3) return error.BadHandshake;
+        if (rest[0] != 0) return error.BadHandshake; // only host_name(0) is defined
+        if (saw_host_name) return error.BadHandshake;
+        saw_host_name = true;
+        const name_len = std.mem.readInt(u16, rest[1..3], .big);
+        if (name_len == 0 or rest.len - 3 < name_len) return error.BadHandshake;
+        rest = rest[3 + @as(usize, name_len) ..];
+    }
+}
 
 fn activeSigningKey(config: Config) ?SigningKey {
     if (config.rsa_signing_key) |key| return .{ .rsa = key };
@@ -6167,7 +6491,7 @@ test "loopback: exportResume/resumeConnected carries a live session across Serve
     try std.testing.expectEqualStrings("after keyupdate", got_rot);
 }
 
-test "loopback: TLS 1.3 PSK-DHE session resumption and binder tamper fallback" {
+test "loopback: TLS 1.3 PSK-DHE session resumption and binder tamper abort" {
     const tls_client = @import("tls_client.zig");
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const alloc = std.testing.allocator;
@@ -6270,21 +6594,16 @@ test "loopback: TLS 1.3 PSK-DHE session resumption and binder tamper fallback" {
     const tch = try alloc.dupe(u8, tch_orig);
     defer alloc.free(tch);
     tch[tch.len - 1] ^= 0x01; // pre_shared_key is last; this flips a binder byte.
-    tamper_client.transcript.items[tamper_client.transcript.items.len - 1] ^= 0x01;
-    const tsflight = switch (try tamper_server.feed(tch)) {
-        .bytes_to_send => |b| b,
-        .need_more => return error.TestUnexpectedResult,
-    };
-    defer alloc.free(tsflight);
+    // RFC 8446 §4.2.11: "If this value is not present or does not validate,
+    // the server MUST abort the handshake" — decrypt_error. This test used to
+    // assert a silent fall back to a full handshake, the behaviour BoGo
+    // Resume-Server-InvalidPSKBinder flagged as non-conformant.
+    try std.testing.expectError(error.PskBinderMismatch, tamper_server.feed(tch));
     try std.testing.expect(!tamper_server.acceptedSessionTicket());
-    const tcfin = switch (try tamper_client.feed(tsflight)) {
-        .bytes_to_send => |b| b,
-        .need_more => return error.TestUnexpectedResult,
-    };
-    defer alloc.free(tcfin);
-    _ = try tamper_server.feed(tcfin);
-    try std.testing.expect(tamper_server.handshakeDone());
-    try std.testing.expect(!tamper_server.acceptedSessionTicket());
+    try std.testing.expect(!tamper_server.handshakeDone());
+    const alert = tamper_server.takeAlert(error.PskBinderMismatch).?;
+    defer alloc.free(alert);
+    try std.testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, 51 }, alert);
 }
 
 test "loopback: TLS 1.3 PSK-DHE resumption accepts 0-RTT early data" {
@@ -11095,7 +11414,10 @@ fn greaseChromeHello(alloc: Allocator, opts: GreaseHelloOptions, hybrid: *const 
     try addExt(alloc, &exts, 35, ""); // session_ticket
     try addExt(alloc, &exts, 16, "\x00\x0f\x02\x0a\x0a\x02h2\x08http/1.1"); // ALPN: GREASE, h2, http/1.1
     try addExt(alloc, &exts, 5, &.{ 1, 0, 0, 0, 0 }); // status_request
-    try addExt(alloc, &exts, 13, &.{ 0x00, 0x12, 0x6a, 0x6a, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06, 0x06, 0x01 });
+    // Chrome's signature_algorithms plus ed25519 (as Firefox sends): the GREASE
+    // fixture servers use an Ed25519 leaf, and RFC 8446 §4.4.3 now requires the
+    // CertificateVerify scheme to be one the client offered.
+    try addExt(alloc, &exts, 13, &.{ 0x00, 0x14, 0x6a, 0x6a, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06, 0x06, 0x01, 0x08, 0x07 });
     try addExt(alloc, &exts, 18, ""); // signed_certificate_timestamp
     scratch.clearRetainingCapacity();
     try appendU16(alloc, &scratch, 0); // patched below
@@ -11335,4 +11657,587 @@ test "ECH GREASE: syntactically broken retry_configs abort the GREASE-ECH client
     };
     defer alloc.free(flight);
     try std.testing.expectError(error.BadHandshake, client.feed(flight));
+}
+
+// ---- Armor wave 3 conformance (BoGo-found defects) ----
+
+const ConfPsk = struct {
+    /// (identity bytes) per entry; `real` marks the one whose binder is computed.
+    identities: []const []const u8,
+    /// Binder lengths per entry (placeholders are zero bytes).
+    binder_lens: []const u8,
+    /// Index whose binder is computed over the truncated ClientHello with `psk`.
+    compute: ?usize = null,
+    psk: []const u8 = &.{},
+    /// Flip one bit in the computed binder (an invalid binder).
+    corrupt: bool = false,
+};
+
+const ConfHello = struct {
+    legacy_version: u16 = 0x0303,
+    suites: []const u16 = &.{0x1301},
+    compression: []const u8 = &.{0},
+    sig_algs: ?[]const u16 = &.{ 0x0807, 0x0403, 0x0804 },
+    groups: bool = true,
+    key_share: bool = true,
+    key_share_trailing: bool = false,
+    alpn: ?[]const u8 = null,
+    sni: ?[]const u8 = null,
+    psk_modes: ?[]const u8 = null,
+    psk: ?ConfPsk = null,
+    psk_not_last: bool = false,
+    trailing: []const u8 = &.{},
+};
+
+/// A hand-built TLS 1.3 ClientHello record for conformance tests. The
+/// pre_shared_key extension (when present) is last unless `psk_not_last`, and a
+/// requested binder is computed exactly as RFC 8446 §4.2.11.2 specifies over the
+/// ClientHello truncated before the binders list.
+fn confHello(alloc: Allocator, opts: ConfHello) ![]u8 {
+    var exts: std.ArrayList(u8) = .empty;
+    defer exts.deinit(alloc);
+    const add = struct {
+        fn f(a: Allocator, list: *std.ArrayList(u8), typ: u16, data: []const u8) !void {
+            try appendU16(a, list, typ);
+            try appendU16(a, list, @intCast(data.len));
+            try list.appendSlice(a, data);
+        }
+    }.f;
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(alloc);
+
+    try add(alloc, &exts, 43, &.{ 2, 0x03, 0x04 });
+    if (opts.groups) try add(alloc, &exts, 10, &.{ 0, 2, 0x00, 0x1d });
+    if (opts.key_share) {
+        const pk = X25519.recoverPublicKey(@splat(0x42));
+        scratch.clearRetainingCapacity();
+        try appendU16(alloc, &scratch, if (opts.key_share_trailing) 37 else 36);
+        try appendU16(alloc, &scratch, 0x001d);
+        try appendU16(alloc, &scratch, 32);
+        try scratch.appendSlice(alloc, &pk);
+        if (opts.key_share_trailing) try scratch.append(alloc, 0);
+        try add(alloc, &exts, 51, scratch.items);
+    }
+    if (opts.sig_algs) |list| {
+        scratch.clearRetainingCapacity();
+        try appendU16(alloc, &scratch, @intCast(list.len * 2));
+        for (list) |v| try appendU16(alloc, &scratch, v);
+        try add(alloc, &exts, 13, scratch.items);
+    }
+    if (opts.alpn) |data| try add(alloc, &exts, 16, data);
+    if (opts.sni) |data| try add(alloc, &exts, 0, data);
+    if (opts.psk_modes) |data| try add(alloc, &exts, 45, data);
+    var binders_total: usize = 0;
+    if (opts.psk) |psk| {
+        scratch.clearRetainingCapacity();
+        var ids_len: usize = 0;
+        for (psk.identities) |id| ids_len += 2 + id.len + 4;
+        try appendU16(alloc, &scratch, @intCast(ids_len));
+        for (psk.identities) |id| {
+            try appendU16(alloc, &scratch, @intCast(id.len));
+            try scratch.appendSlice(alloc, id);
+            try scratch.appendSlice(alloc, &.{ 0, 0, 0, 0 });
+        }
+        var b_len: usize = 0;
+        for (psk.binder_lens) |l| b_len += 1 + l;
+        try appendU16(alloc, &scratch, @intCast(b_len));
+        for (psk.binder_lens) |l| {
+            try scratch.append(alloc, l);
+            try scratch.appendNTimes(alloc, 0, l);
+        }
+        binders_total = 2 + b_len;
+        try add(alloc, &exts, 41, scratch.items);
+        if (opts.psk_not_last) try add(alloc, &exts, 21, ""); // padding after PSK
+    }
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(alloc);
+    try appendU16(alloc, &body, opts.legacy_version);
+    try body.appendNTimes(alloc, 0x11, 32);
+    try body.append(alloc, 32);
+    try body.appendNTimes(alloc, 0x22, 32);
+    try appendU16(alloc, &body, @intCast(opts.suites.len * 2));
+    for (opts.suites) |s| try appendU16(alloc, &body, s);
+    try body.append(alloc, @intCast(opts.compression.len));
+    try body.appendSlice(alloc, opts.compression);
+    try appendU16(alloc, &body, @intCast(exts.items.len));
+    try body.appendSlice(alloc, exts.items);
+    try body.appendSlice(alloc, opts.trailing);
+    var hs: std.ArrayList(u8) = .empty;
+    defer hs.deinit(alloc);
+    try writeHandshake(alloc, &hs, .client_hello, body.items);
+
+    if (opts.psk) |psk| if (psk.compute) |index| {
+        std.debug.assert(!opts.psk_not_last and opts.trailing.len == 0);
+        const list_start = hs.items.len - binders_total;
+        var slot = list_start + 2;
+        for (psk.binder_lens[0..index]) |l| slot += 1 + l;
+        slot += 1;
+        const truncated = hs.items[0..list_start];
+        var early = Sha256.earlySecret(psk.psk);
+        defer early.wipe();
+        var binder_key = try Sha256.deriveSecret(&early, "res binder", &Sha256.emptyTranscriptHash());
+        defer binder_key.wipe();
+        var binder = tls_finished.For(Sha256).verifyData(binder_key.declassify(), Sha256.transcriptHash(truncated));
+        if (psk.corrupt) binder[0] ^= 1;
+        const want_len = psk.binder_lens[index];
+        @memcpy(hs.items[slot..][0..want_len], binder[0..want_len]);
+    };
+    return writePlainRecord(alloc, .handshake, hs.items);
+}
+
+fn confFeedOk(server: *Server, rec: []const u8) !void {
+    const out = switch (try server.feed(rec)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    server.allocator.free(out);
+}
+
+test "conformance (RFC 8446 §4.4.3 / §4.2.3): CertificateVerify uses a scheme from the client's signature_algorithms" {
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x61);
+    {
+        // Ed25519 leaf: only ed25519 can be produced.
+        const Case = struct { sigs: ?[]const u16, want: anyerror!u16 };
+        const cases = [_]Case{
+            .{ .sigs = &.{ 0x0403, 0x0807 }, .want = 0x0807 },
+            .{ .sigs = &.{ 0x0403, 0x0804 }, .want = error.NoCommonSignatureAlgorithms },
+            .{ .sigs = null, .want = error.MissingExtension },
+            .{ .sigs = &.{}, .want = error.BadHandshake },
+        };
+        for (cases) |case| {
+            var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+            defer server.deinit();
+            const ch = try confHello(alloc, .{ .sig_algs = case.sigs });
+            defer alloc.free(ch);
+            if (case.want) |want| {
+                try confFeedOk(&server, ch);
+                try std.testing.expectEqual(want, server.cert_verify_scheme);
+            } else |want_err| {
+                try std.testing.expectError(want_err, server.feed(ch));
+            }
+        }
+    }
+    {
+        // RSA leaf: rsa_pss_rsae_sha256/384/512 in server order, never PKCS#1.
+        const x509_selfsign = @import("../proto/x509_selfsign.zig");
+        const rsa_key = rsaTestPrivateKey();
+        var rsa_buf: [2048]u8 = undefined;
+        const der = try x509_selfsign.buildSelfSignedRsa(&rsa_buf, .{
+            .common_name = "irc.test",
+            .not_before = 1_704_067_200,
+            .not_after = 4_102_444_800,
+            .serial = &.{ 0x52, 0x61 },
+            .public_modulus = rsa_key.n,
+            .public_exponent = rsa_key.e,
+            .private_key = rsa_key,
+            .dns_names = &.{"irc.test"},
+            .is_ca = true,
+        });
+        const Case = struct { sigs: []const u16, want: anyerror!u16 };
+        const cases = [_]Case{
+            .{ .sigs = &.{0x0805}, .want = 0x0805 },
+            .{ .sigs = &.{0x0806}, .want = 0x0806 },
+            .{ .sigs = &.{ 0x0806, 0x0804 }, .want = 0x0804 },
+            .{ .sigs = &.{ 0x0401, 0x0501 }, .want = error.NoCommonSignatureAlgorithms },
+        };
+        for (cases) |case| {
+            var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .rsa_signing_key = rsa_key });
+            defer server.deinit();
+            const ch = try confHello(alloc, .{ .sig_algs = case.sigs });
+            defer alloc.free(ch);
+            if (case.want) |want| {
+                try confFeedOk(&server, ch);
+                try std.testing.expectEqual(want, server.cert_verify_scheme);
+            } else |want_err| {
+                try std.testing.expectError(want_err, server.feed(ch));
+                const alert = server.takeAlert(want_err).?;
+                defer alloc.free(alert);
+                // Plaintext (pre-ServerHello) handshake_failure.
+                try std.testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, 40 }, alert);
+            }
+        }
+    }
+}
+
+test "conformance (RFC 8017 §9.1.1): rsa_pss is only selected when the modulus fits salt = hash length" {
+    var n1024: [128]u8 = @splat(0xff);
+    var n2048: [256]u8 = @splat(0xff);
+    n1024[0] = 0xc3;
+    n2048[0] = 0x80;
+    const k1024 = rsa_sign.PrivateKey{ .n = &n1024, .e = &.{ 1, 0, 1 }, .d = &.{1} };
+    const k2048 = rsa_sign.PrivateKey{ .n = &n2048, .e = &.{ 1, 0, 1 }, .d = &.{1} };
+    try std.testing.expect(rsaPssFits(k1024, .sha256));
+    try std.testing.expect(rsaPssFits(k1024, .sha384));
+    // emLen 128 < 2*64 + 2: RSA-1024 cannot carry PSS-SHA512 (BoGo RSA-PSS-Large).
+    try std.testing.expect(!rsaPssFits(k1024, .sha512));
+    try std.testing.expect(rsaPssFits(k2048, .sha512));
+}
+
+test "conformance (RFC 8446 §4.1.2 / §4.2.1): legacy_version, compression and trailing-byte rules" {
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x62);
+    const Case = struct { opts: ConfHello, want: ?anyerror };
+    const cases = [_]Case{
+        .{ .opts = .{ .legacy_version = 0x1234 }, .want = null }, // IgnoreLegacyVersion-TLS13
+        .{ .opts = .{ .legacy_version = 0x0400 }, .want = null }, // VersionTolerance-TLS13
+        .{ .opts = .{ .legacy_version = 0x0301 }, .want = null },
+        .{ .opts = .{ .legacy_version = 0x0300 }, .want = error.ProtocolVersion },
+        .{ .opts = .{ .compression = &.{ 1, 0 } }, .want = error.IllegalParameter }, // ExtraCompressionMethods-TLS13
+        .{ .opts = .{ .compression = &.{1} }, .want = error.IllegalParameter }, // NoNullCompression-TLS13
+        .{ .opts = .{ .trailing = &.{0} }, .want = error.BadHandshake }, // TrailingMessageData-TLS13-ClientHello
+    };
+    for (cases) |case| {
+        var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+        defer server.deinit();
+        const ch = try confHello(alloc, case.opts);
+        defer alloc.free(ch);
+        if (case.want) |want| {
+            try std.testing.expectError(want, server.feed(ch));
+        } else try confFeedOk(&server, ch);
+    }
+}
+
+test "conformance (RFC 8446 §9.2 / §4.2.8): key_share and supported_groups pairing and strict key_share parsing" {
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x63);
+    const Case = struct { opts: ConfHello, want: anyerror };
+    const cases = [_]Case{
+        // supported_groups without key_share: missing_extension, not a HelloRetryRequest.
+        .{ .opts = .{ .key_share = false }, .want = error.MissingExtension },
+        // key_share without supported_groups.
+        .{ .opts = .{ .groups = false }, .want = error.MissingExtension },
+        // A trailing byte inside KeyShareClientHello.
+        .{ .opts = .{ .key_share_trailing = true }, .want = error.BadHandshake },
+    };
+    for (cases) |case| {
+        var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+        defer server.deinit();
+        const ch = try confHello(alloc, case.opts);
+        defer alloc.free(ch);
+        try std.testing.expectError(case.want, server.feed(ch));
+    }
+    var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+    defer server.deinit();
+    const missing = try confHello(alloc, .{ .key_share = false });
+    defer alloc.free(missing);
+    try std.testing.expectError(error.MissingExtension, server.feed(missing));
+    const alert = server.takeAlert(error.MissingExtension).?;
+    defer alloc.free(alert);
+    try std.testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, 109 }, alert);
+}
+
+test "conformance (RFC 7301 §3.1-3.2 / RFC 6066 §3): ALPN refusal, empty names and SNI trailing data" {
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x64);
+    const alpn_h2 = "\x00\x03\x02h2";
+    const alpn_h2_irc = "\x00\x07\x02h2\x03irc";
+    const alpn_empty = "\x00\x04\x00\x02h2";
+    const sni_ok = "\x00\x06\x00\x00\x03a.b";
+    const sni_trailing = "\x00\x06\x00\x00\x03a.b\xff";
+    const Case = struct { opts: ConfHello, alpn: []const []const u8 = &.{"irc"}, fatal: bool = true, want: anyerror!?[]const u8 };
+    const cases = [_]Case{
+        .{ .opts = .{ .alpn = alpn_h2 }, .want = error.NoApplicationProtocol },
+        .{ .opts = .{ .alpn = alpn_h2 }, .fatal = false, .want = null },
+        .{ .opts = .{}, .want = null }, // a plain IRC client offers no ALPN
+        .{ .opts = .{ .alpn = alpn_h2_irc }, .want = "irc" },
+        .{ .opts = .{ .alpn = alpn_h2 }, .alpn = &.{}, .want = null }, // ALPN not configured
+        .{ .opts = .{ .alpn = alpn_empty }, .want = error.BadHandshake },
+        .{ .opts = .{ .alpn = alpn_empty }, .alpn = &.{}, .want = error.BadHandshake },
+        .{ .opts = .{ .sni = sni_ok }, .want = null },
+        .{ .opts = .{ .sni = sni_trailing }, .want = error.BadHandshake },
+    };
+    for (cases) |case| {
+        var server = try Server.init(alloc, .{
+            .cert_chain = &.{fx.der},
+            .signing_key = fx.kp,
+            .alpn_protocols = case.alpn,
+            .alpn_mismatch_fatal = case.fatal,
+        });
+        defer server.deinit();
+        const ch = try confHello(alloc, case.opts);
+        defer alloc.free(ch);
+        if (case.want) |want| {
+            try confFeedOk(&server, ch);
+            if (want) |name| {
+                try std.testing.expectEqualStrings(name, server.selectedAlpn().?);
+            } else try std.testing.expect(server.selectedAlpn() == null);
+        } else |want_err| {
+            try std.testing.expectError(want_err, server.feed(ch));
+            if (want_err == error.NoApplicationProtocol) {
+                const alert = server.takeAlert(want_err).?;
+                defer alloc.free(alert);
+                try std.testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, 120 }, alert);
+            }
+        }
+    }
+}
+
+/// Mint a real TLS 1.3 ticket with `tls_client` and return its ticket key and
+/// the client's serialized stored session (caller frees).
+fn confMintTicket(alloc: Allocator, der: []const u8, kp: Ed25519.KeyPair) !struct { key: tls_resumption.TicketKey, stored: []u8 } {
+    const tls_client = @import("tls_client.zig");
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp, .enable_session_tickets = true });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "exploit.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    const ticket_record = (try server.takePendingSend()) orelse return error.TestUnexpectedResult;
+    defer alloc.free(ticket_record);
+    try std.testing.expectEqual(tls_client.AppRead.control, try client.decryptApp(ticket_record));
+    const stored = client.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    return .{ .key = server.ticketKey(), .stored = stored };
+}
+
+test "conformance (RFC 8446 §4.2.11 / §4.2.9): PSK identity selection, binder validation and structure" {
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x65);
+    const minted = try confMintTicket(alloc, fx.der, fx.kp);
+    defer alloc.free(minted.stored);
+    const session = try tls_resumption.decodeStoredSession(minted.stored);
+    // The SHA-256 binder helper needs a SHA-256 suite (AES-128-GCM or ChaCha20).
+    try std.testing.expect(session.suite == 0x1301 or session.suite == 0x1303);
+    const suites = [_]u16{session.suite};
+    const modes = "\x01\x01"; // psk_dhe_ke
+
+    const Expect = union(enum) { resumed: u16, full, err: anyerror };
+    const Case = struct { opts: ConfHello, want: Expect };
+    const cases = [_]Case{
+        // One valid identity resumes at index 0.
+        .{ .opts = .{ .suites = &suites, .psk_modes = modes, .psk = .{ .identities = &.{session.ticket}, .binder_lens = &.{32}, .compute = 0, .psk = session.psk } }, .want = .{ .resumed = 0 } },
+        // An unusable identity first is skipped; the second one is selected
+        // (BoGo ExtraPSKIdentity-TLS13; before: never resumed with >1 identity).
+        .{ .opts = .{ .suites = &suites, .psk_modes = modes, .psk = .{ .identities = &.{ "not-a-ticket", session.ticket }, .binder_lens = &.{ 32, 32 }, .compute = 1, .psk = session.psk } }, .want = .{ .resumed = 1 } },
+        // An invalid binder for the selected identity aborts (before: silent
+        // full handshake). BoGo Resume-Server-InvalidPSKBinder.
+        .{ .opts = .{ .suites = &suites, .psk_modes = modes, .psk = .{ .identities = &.{session.ticket}, .binder_lens = &.{32}, .compute = 0, .psk = session.psk, .corrupt = true } }, .want = .{ .err = error.PskBinderMismatch } },
+        // A wrong-length binder aborts. BoGo Resume-Server-BinderWrongLength.
+        .{ .opts = .{ .suites = &suites, .psk_modes = modes, .psk = .{ .identities = &.{session.ticket}, .binder_lens = &.{31}, .compute = 0, .psk = session.psk } }, .want = .{ .err = error.PskBinderMismatch } },
+        // Identity/binder count mismatch: illegal_parameter.
+        .{ .opts = .{ .suites = &suites, .psk_modes = modes, .psk = .{ .identities = &.{ session.ticket, session.ticket }, .binder_lens = &.{32} } }, .want = .{ .err = error.IllegalParameter } },
+        .{ .opts = .{ .suites = &suites, .psk_modes = modes, .psk = .{ .identities = &.{session.ticket}, .binder_lens = &.{ 32, 32 } } }, .want = .{ .err = error.IllegalParameter } },
+        // An empty binders list is a decode error.
+        .{ .opts = .{ .suites = &suites, .psk_modes = modes, .psk = .{ .identities = &.{session.ticket}, .binder_lens = &.{} } }, .want = .{ .err = error.BadHandshake } },
+        // pre_shared_key without psk_key_exchange_modes: §4.2.9 MUST abort.
+        .{ .opts = .{ .suites = &suites, .psk = .{ .identities = &.{session.ticket}, .binder_lens = &.{32}, .compute = 0, .psk = session.psk } }, .want = .{ .err = error.MissingExtension } },
+        // psk_ke only (no psk_dhe_ke): the PSK is ignored, full handshake.
+        .{ .opts = .{ .suites = &suites, .psk_modes = "\x01\x00", .psk = .{ .identities = &.{session.ticket}, .binder_lens = &.{32}, .compute = 0, .psk = session.psk } }, .want = .full },
+        // pre_shared_key not last: illegal_parameter (was decode_error).
+        .{ .opts = .{ .suites = &suites, .psk_modes = modes, .psk_not_last = true, .psk = .{ .identities = &.{session.ticket}, .binder_lens = &.{32} } }, .want = .{ .err = error.IllegalParameter } },
+    };
+    for (cases) |case| {
+        var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp, .ticket_key = minted.key });
+        defer server.deinit();
+        const ch = try confHello(alloc, case.opts);
+        defer alloc.free(ch);
+        switch (case.want) {
+            .err => |want| try std.testing.expectError(want, server.feed(ch)),
+            .full => {
+                try confFeedOk(&server, ch);
+                try std.testing.expect(!server.acceptedSessionTicket());
+            },
+            .resumed => |index| {
+                const flight = switch (try server.feed(ch)) {
+                    .bytes_to_send => |b| b,
+                    .need_more => return error.TestUnexpectedResult,
+                };
+                defer alloc.free(flight);
+                try std.testing.expect(server.acceptedSessionTicket());
+                try std.testing.expectEqual(index, server.selected_psk_identity);
+                // ServerHello pre_shared_key(41) echoes selected_identity.
+                var want_ext: [6]u8 = .{ 0x00, 0x29, 0x00, 0x02, 0, 0 };
+                std.mem.writeInt(u16, want_ext[4..6], index, .big);
+                const rec = (try completePlainRecord(flight)).?;
+                try std.testing.expect(std.mem.indexOf(u8, rec.fragment, &want_ext) != null);
+            },
+        }
+    }
+    // The new failures map to the RFC 8446 §6.2 alerts BoGo expects.
+    try std.testing.expectEqual(AlertDescription.decrypt_error, alertDescriptionForError(error.PskBinderMismatch).?);
+    try std.testing.expectEqual(AlertDescription.illegal_parameter, alertDescriptionForError(error.IllegalParameter).?);
+    try std.testing.expectEqual(AlertDescription.unexpected_message, alertDescriptionForError(error.UnexpectedMessage).?);
+    try std.testing.expectEqual(AlertDescription.illegal_parameter, alertDescriptionForError(error.EchInconsistent).?);
+}
+
+test "conformance (RFC 8446 §5.1 / §4): bytes after the ClientHello and a wrong first message are unexpected_message" {
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x66);
+    {
+        var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+        defer server.deinit();
+        const ch = try confHello(alloc, .{});
+        defer alloc.free(ch);
+        // Re-frame the ClientHello with one extra handshake byte in its record.
+        const frag = ch[5..];
+        const joined = try alloc.alloc(u8, 5 + frag.len + 1);
+        defer alloc.free(joined);
+        joined[0] = 22;
+        joined[1] = 3;
+        joined[2] = 3;
+        std.mem.writeInt(u16, joined[3..5], @intCast(frag.len + 1), .big);
+        @memcpy(joined[5..][0..frag.len], frag);
+        joined[5 + frag.len] = 20;
+        try std.testing.expectError(error.UnexpectedMessage, server.feed(joined));
+    }
+    {
+        var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+        defer server.deinit();
+        const not_hello = [_]u8{ 22, 3, 3, 0, 8, 20, 0, 0, 4, 1, 2, 3, 4 };
+        try std.testing.expectError(error.UnexpectedMessage, server.feed(&not_hello));
+        const alert = server.takeAlert(error.UnexpectedMessage).?;
+        defer alloc.free(alert);
+        try std.testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, 10 }, alert);
+    }
+}
+
+test "conformance (RFC 8446 Appendix D.4): the server sends one compatibility CCS, after the HelloRetryRequest only" {
+    const tls_client = @import("tls_client.zig");
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x67);
+    var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "exploit.test", .trust_anchors = &.{fx.der} });
+    defer client.deinit();
+    client.offerNoSharesForTest();
+    const ch1 = try client.start();
+    defer alloc.free(ch1);
+    const hrr = switch (try server.feed(ch1)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(hrr);
+    try std.testing.expect(server.hrr_sent);
+    const hrr_rec = (try completePlainRecord(hrr)).?;
+    try std.testing.expectEqual(tls_record.ContentType.change_cipher_spec, (try completePlainRecord(hrr[hrr_rec.wire_len..])).?.content_type);
+    const ch2 = switch (try client.feed(hrr)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(ch2);
+    const flight = switch (try server.feed(ch2)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(flight);
+    // ServerHello, then directly the encrypted flight — no second CCS
+    // (BoGo SendHelloRetryRequest-TLS13 failed "bad record MAC" before).
+    const sh = (try completePlainRecord(flight)).?;
+    try std.testing.expectEqual(tls_record.ContentType.handshake, sh.content_type);
+    try std.testing.expectEqual(tls_record.ContentType.application_data, (try completePlainRecord(flight[sh.wire_len..])).?.content_type);
+    const fin = switch (try client.feed(flight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(fin);
+    _ = try server.feed(fin);
+    try std.testing.expect(server.handshakeDone());
+}
+
+test "conformance (RFC 8446 §6.1): closeNotify emits one encrypted close_notify; peer alerts are recorded" {
+    const tls_client = @import("tls_client.zig");
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x68);
+    {
+        var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+        defer server.deinit();
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "exploit.test", .trust_anchors = &.{fx.der} });
+        defer client.deinit();
+        try std.testing.expectError(error.BadState, server.closeNotify());
+        const ch = try client.start();
+        defer alloc.free(ch);
+        const sflight = switch (try server.feed(ch)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer alloc.free(sflight);
+        const cfin = switch (try client.feed(sflight)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer alloc.free(cfin);
+        _ = try server.feed(cfin);
+        try std.testing.expect(server.handshakeDone());
+        const record = try server.closeNotify();
+        defer alloc.free(record);
+        try std.testing.expectError(error.TlsAlert, client.decryptApp(record));
+        try std.testing.expectEqual(tls_alert.AlertDescription.close_notify, client.last_alert.?.description);
+        try std.testing.expectError(error.BadState, server.closeNotify());
+        try std.testing.expectError(error.BadState, server.encrypt("after close"));
+    }
+    {
+        // A plaintext close_notify before the ClientHello is recorded.
+        var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+        defer server.deinit();
+        const alert = [_]u8{ 21, 3, 3, 0, 2, 1, 0 };
+        try std.testing.expectError(error.TlsAlert, server.feed(&alert));
+        try std.testing.expectEqual(tls_alert.AlertDescription.close_notify, server.peer_alert.?.description);
+    }
+}
+
+test "conformance: ALPN mismatch is lenient by default so the daemon IRC listener never refuses" {
+    // The daemon's tls13Config does not set alpn_mismatch_fatal; its policy
+    // test requires an {"h2"} offer on the IRC listener to proceed.
+    const cfg: Config = .{ .cert_chain = &.{} };
+    try std.testing.expect(!cfg.alpn_mismatch_fatal);
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x69);
+    var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp, .alpn_protocols = &.{"irc"} });
+    defer server.deinit();
+    const alpn_h2 = "\x00\x03\x02h2";
+    const ch = try confHello(alloc, .{ .alpn = alpn_h2 });
+    defer alloc.free(ch);
+    try confFeedOk(&server, ch);
+    try std.testing.expect(server.selectedAlpn() == null);
+}
+
+test "conformance: after markTxOffloaded no userspace seal reuses a kernel-owned nonce" {
+    const tls_client = @import("tls_client.zig");
+    const alloc = std.testing.allocator;
+    var cert_buf: [1024]u8 = undefined;
+    const fx = try exploitServerFixture(&cert_buf, 0x6a);
+    var server = try Server.init(alloc, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "exploit.test", .trust_anchors = &.{fx.der} });
+    defer client.deinit();
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try server.feed(cfin);
+    try std.testing.expect(server.handshakeDone());
+    const seq = server.app_write_seq;
+    server.markTxOffloaded();
+    try std.testing.expectError(error.BadState, server.closeNotify());
+    try std.testing.expectError(error.BadState, server.encrypt("x"));
+    try std.testing.expectEqual(seq, server.app_write_seq);
 }

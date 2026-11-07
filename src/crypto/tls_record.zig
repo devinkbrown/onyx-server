@@ -952,12 +952,31 @@ pub fn fatalAlertBytes(failure: anyerror) ?[2]u8 {
         error.RecordAuthenticationFailed, error.AeadAuthFailed => 20,
         error.RecordOverflow, error.CiphertextTooLong => 22,
         error.InvalidRecordSizeLimit => 47,
+        // draft-ietf-tls-esni §6.1.4/§6.1.6: an ECH acceptance signal that is
+        // inconsistent with the handshake is illegal_parameter.
+        error.EchInconsistent, error.IllegalParameter => 47,
+        error.UnexpectedMessage => 10,
+        error.MissingExtension => 109,
+        error.NoApplicationProtocol => 120,
         error.FinishedMismatch => 51,
         error.ProtocolVersion => 70,
         error.BadHandshake, error.BadRecord, error.BadRecordHeader => 50,
         else => 40,
     };
     return .{ 2, description };
+}
+
+test "fatalAlertBytes maps ECH inconsistency to illegal_parameter and protocol-state errors to their RFC alerts" {
+    // draft-ietf-tls-esni §6.1.4 / §6.1.6: inconsistent ECH acceptance.
+    try std.testing.expectEqual([2]u8{ 2, 47 }, fatalAlertBytes(error.EchInconsistent).?);
+    try std.testing.expectEqual([2]u8{ 2, 47 }, fatalAlertBytes(error.IllegalParameter).?);
+    // RFC 8446 §6.2 codes.
+    try std.testing.expectEqual([2]u8{ 2, 10 }, fatalAlertBytes(error.UnexpectedMessage).?);
+    try std.testing.expectEqual([2]u8{ 2, 109 }, fatalAlertBytes(error.MissingExtension).?);
+    try std.testing.expectEqual([2]u8{ 2, 120 }, fatalAlertBytes(error.NoApplicationProtocol).?);
+    // Unchanged mappings.
+    try std.testing.expectEqual([2]u8{ 2, 50 }, fatalAlertBytes(error.BadHandshake).?);
+    try std.testing.expect(fatalAlertBytes(error.TlsAlert) == null);
 }
 
 test "TLS record limit: full inner global maximum includes padding and overflow-safe sizing" {
