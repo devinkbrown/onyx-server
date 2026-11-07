@@ -128,6 +128,11 @@ pub const Error = error{
     /// A peer declared or streamed more handshake bytes than any legitimate
     /// flight needs (pre-authentication memory-exhaustion guard).
     HandshakeTooLarge,
+    /// The server's connection-id transport parameters did not authenticate
+    /// the connection ids the client actually observed (RFC 9000 §7.3):
+    /// `original_destination_connection_id`, `initial_source_connection_id`,
+    /// or `retry_source_connection_id` was missing, unexpected, or different.
+    ConnectionIdMismatch,
 } || Allocator.Error || hkdf.Error ||
     tls_extension.Error || tls_alpn.Error || tls_keyshare.Error ||
     tls_supported_versions.Error || tls_signature_scheme.Error ||
@@ -958,6 +963,9 @@ fn mapClientError(e: anyerror) Error {
         error.NoCertificate => error.NoCertificate,
         error.SignatureFailed => error.SignatureFailed,
         error.Entropy => error.Entropy,
+        error.HandshakeTooLarge => error.HandshakeTooLarge,
+        error.ConnectionIdMismatch => error.ConnectionIdMismatch,
+        error.DuplicateParameter => error.DuplicateParameter,
         else => error.BadHandshake,
     };
 }
@@ -976,6 +984,46 @@ fn flightHasFinished(buf: []const u8) bool {
         pos = end;
     }
     return false;
+}
+
+/// Append server Handshake-level CRYPTO bytes to the client's flight buffer.
+/// The client buffers the whole server flight (EE..Finished) before processing,
+/// so — unlike `appendBounded`, which inspects only the leading message — every
+/// message header already present is checked: any declared length whose end
+/// would land past `max_handshake_buffer` is refused at once instead of being
+/// streamed up to the cap.
+fn appendFlightBounded(allocator: Allocator, buf: *std.ArrayList(u8), data: []const u8) Error!void {
+    if (data.len > max_handshake_buffer - @min(buf.items.len, max_handshake_buffer)) return error.HandshakeTooLarge;
+    try buf.appendSlice(allocator, data);
+    var pos: usize = 0;
+    while (pos + 4 <= buf.items.len) {
+        const declared = (@as(usize, buf.items[pos + 1]) << 16) | (@as(usize, buf.items[pos + 2]) << 8) | buf.items[pos + 3];
+        const end = pos + 4 + declared;
+        if (end > max_handshake_buffer) return error.HandshakeTooLarge;
+        if (end > buf.items.len) break;
+        pos = end;
+    }
+}
+
+/// A connection id held inline (QUIC v1 caps them at 20 bytes).
+const CidBuf = struct {
+    bytes: [quic_transport_params.max_connection_id_len]u8 = undefined,
+    len: u8 = 0,
+
+    fn init(cid: []const u8) Error!CidBuf {
+        if (cid.len > quic_transport_params.max_connection_id_len) return error.Malformed;
+        var out: CidBuf = .{ .len = @intCast(cid.len) };
+        @memcpy(out.bytes[0..cid.len], cid);
+        return out;
+    }
+    fn slice(self: *const CidBuf) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+fn cidEql(expected: *const CidBuf, got: ?[]const u8) bool {
+    const g = got orelse return false;
+    return std.mem.eql(u8, expected.slice(), g);
 }
 
 // ===========================================================================
@@ -1009,6 +1057,16 @@ pub const ClientConfig = struct {
     /// Deterministic ClientHello random (tests). When null a fresh 32-byte
     /// random is drawn from the OS.
     client_random: ?[32]u8 = null,
+    /// The Destination Connection ID of the client's very first Initial packet
+    /// (before any Retry). When set, the client authenticates the server's
+    /// connection-id transport parameters (RFC 9000 §7.3): the server MUST echo
+    /// this as `original_destination_connection_id`, MUST send
+    /// `initial_source_connection_id` equal to the SCID the driver reports via
+    /// `Client.setServerInitialScid`, and MUST send `retry_source_connection_id`
+    /// exactly when the driver reported a Retry via `Client.setRetryScid`.
+    /// A connection driver always sets this; null skips the check and is only
+    /// for socketless stepwise tests that have no packet layer.
+    original_dcid: ?[]const u8 = null,
 };
 
 pub const Client = struct {
@@ -1049,6 +1107,13 @@ pub const Client = struct {
     handshake_keys: ?KeySet = null,
     application_keys: ?KeySet = null,
 
+    /// RFC 9000 §7.3 connection-id authentication inputs. `expected_odcid`
+    /// non-null turns the check on; the others are reported by the driver as
+    /// it observes server packets.
+    expected_odcid: ?CidBuf = null,
+    server_initial_scid: ?CidBuf = null,
+    retry_scid: ?CidBuf = null,
+
     /// Construct a client from a `ClientConfig` (the public path).
     pub fn initConfig(allocator: Allocator, config: ClientConfig) Error!Client {
         var seed: [kx.X25519Kx.seed_len]u8 = undefined;
@@ -1064,13 +1129,54 @@ pub const Client = struct {
         } else {
             try osEntropy(&random);
         }
+        const expected_odcid: ?CidBuf = if (config.original_dcid) |d| try CidBuf.init(d) else null;
         return .{
             .allocator = allocator,
             .x25519_pair = kx.X25519Kx.generateDeterministic(seed) catch return error.BadState,
             .client_random = random,
             .alpn_protocols = config.alpn_protocols,
             .transport_params = config.transport_params,
+            .expected_odcid = expected_odcid,
         };
+    }
+
+    /// Record the Source Connection ID of the first server packet the driver
+    /// accepted (RFC 9000 §7.2). The server's `initial_source_connection_id`
+    /// transport parameter must equal it. Must be called before the server's
+    /// EncryptedExtensions are processed; later calls with a different value
+    /// are refused so the authenticated id cannot be swapped.
+    pub fn setServerInitialScid(self: *Client, scid: []const u8) Error!void {
+        const cid = try CidBuf.init(scid);
+        if (self.server_initial_scid) |prev| {
+            if (!std.mem.eql(u8, prev.slice(), cid.slice())) return error.ConnectionIdMismatch;
+            return;
+        }
+        if (self.peer_params != null) return error.BadState;
+        self.server_initial_scid = cid;
+    }
+
+    /// Record that the client processed a Retry whose SCID was `scid`
+    /// (RFC 9000 §17.2.5). The server must then echo it as
+    /// `retry_source_connection_id`; without a call, that parameter must be
+    /// absent. At most one Retry is accepted per connection.
+    pub fn setRetryScid(self: *Client, scid: []const u8) Error!void {
+        if (self.retry_scid != null or self.peer_params != null) return error.BadState;
+        self.retry_scid = try CidBuf.init(scid);
+    }
+
+    /// RFC 9000 §7.3 — authenticate the server's connection-id transport
+    /// parameters against what this client observed. A no-op when the driver
+    /// did not configure `original_dcid` (stepwise tests only).
+    fn authenticateConnectionIds(self: *const Client, params: quic_transport_params.TransportParameters) Error!void {
+        const odcid = self.expected_odcid orelse return;
+        if (!cidEql(&odcid, params.original_destination_connection_id)) return error.ConnectionIdMismatch;
+        const iscid = self.server_initial_scid orelse return error.ConnectionIdMismatch;
+        if (!cidEql(&iscid, params.initial_source_connection_id)) return error.ConnectionIdMismatch;
+        if (self.retry_scid) |rs| {
+            if (!cidEql(&rs, params.retry_source_connection_id)) return error.ConnectionIdMismatch;
+        } else if (params.retry_source_connection_id != null) {
+            return error.ConnectionIdMismatch;
+        }
     }
 
     fn init(
@@ -1172,8 +1278,7 @@ pub const Client = struct {
             },
             .handshake => {
                 if (self.hs_done) return;
-                if (data.len > max_handshake_buffer - @min(self.recv_handshake.items.len, max_handshake_buffer)) return error.HandshakeTooLarge;
-                try self.recv_handshake.appendSlice(self.allocator, data);
+                try appendFlightBounded(self.allocator, &self.recv_handshake, data);
                 // Need the entire server flight (through Finished) buffered. Scan
                 // for a Finished message; until it arrives, wait for more.
                 if (!flightHasFinished(self.recv_handshake.items)) return;
@@ -1328,6 +1433,7 @@ pub const Client = struct {
 
     fn parseEncryptedExtensions(self: *Client, body: []const u8) !void {
         var it = tls_extension.Iterator.init(try tls_extension.unwrap(body));
+        var have_params = false;
         while (try it.next()) |ext| {
             if (ext.ext_type == @backingInt(tls_extension.ExtensionType.alpn)) {
                 var names = tls_alpn.Iterator.fromBlock(ext.data) catch continue;
@@ -1338,11 +1444,19 @@ pub const Client = struct {
                     }
                 }
             } else if (ext.ext_type == quic_transport_parameters_ext) {
+                // A second copy of the extension is a TLS decode error, not a
+                // chance to overwrite the authenticated parameters.
+                if (have_params) return error.BadHandshake;
+                have_params = true;
                 self.peer_params_storage.clearRetainingCapacity();
                 try self.peer_params_storage.appendSlice(self.allocator, ext.data);
-                self.peer_params = try quic_transport_params.decode(self.peer_params_storage.items);
+                const params = try quic_transport_params.decode(self.peer_params_storage.items);
+                try self.authenticateConnectionIds(params);
+                self.peer_params = params;
             }
         }
+        // RFC 9001 §8.2: the server MUST send quic_transport_parameters.
+        if (!have_params) return error.MissingExtension;
     }
 
     fn parseCertificate(self: *Client, body: []const u8) !void {
@@ -2055,4 +2169,210 @@ test "quic handshake caps total buffered initial bytes even under the declared l
     while (fed + chunk.len < max_handshake_buffer) : (fed += chunk.len) try server.feedCrypto(.initial, &chunk);
     try testing.expect(server.recv.items.len <= max_handshake_buffer);
     try testing.expectError(error.HandshakeTooLarge, server.feedCrypto(.initial, &chunk));
+}
+
+// --- RFC 9000 §7.3 connection-id authentication (client) -------------------
+
+const cid_test_odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+const cid_test_server_scid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+const cid_test_retry_scid = [_]u8{ 0x71, 0x72, 0x73, 0x74, 0x75 };
+
+const CidCase = struct {
+    /// Server transport-parameter CIDs as sent on the wire.
+    server_odcid: ?[]const u8 = &cid_test_odcid,
+    server_iscid: ?[]const u8 = &cid_test_server_scid,
+    server_retry_scid: ?[]const u8 = null,
+    /// What the client driver observed and reports.
+    observed_scid: ?[]const u8 = &cid_test_server_scid,
+    observed_retry_scid: ?[]const u8 = null,
+};
+
+/// Drive the public `feedCrypto`/`takeFlight` client surface against a real
+/// `Server` whose connection-id transport parameters are set from `case`.
+fn runCidCase(case: CidCase) !void {
+    const alloc = testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x61)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try mintEd25519Cert(&cert_buf, kp);
+    var server_params = test_server_params;
+    server_params.original_destination_connection_id = case.server_odcid;
+    server_params.initial_source_connection_id = case.server_iscid;
+    server_params.retry_source_connection_id = case.server_retry_scid;
+    var server = try Server.init(alloc, .{
+        .cert_chain = &.{der},
+        .signing_key = .{ .ed25519 = kp },
+        .alpn_protocols = &.{"h3"},
+        .transport_params = server_params,
+        .x25519_seed = @as([kx.X25519Kx.seed_len]u8, @splat(0x21)),
+        .server_random = @as([32]u8, @splat(0x55)),
+    });
+    defer server.deinit();
+
+    var client = try Client.initConfig(alloc, .{
+        .alpn_protocols = &.{"h3"},
+        .transport_params = test_client_params,
+        .x25519_seed = @as([kx.X25519Kx.seed_len]u8, @splat(0x42)),
+        .client_random = @as([32]u8, @splat(0x11)),
+        .original_dcid = &cid_test_odcid,
+    });
+    defer client.deinit();
+
+    try client.startHandshake();
+    const ch = try client.takeFlight(.initial);
+    defer alloc.free(ch);
+    try server.feedCrypto(.initial, ch);
+    const s_initial = try server.takeFlight(.initial);
+    defer alloc.free(s_initial);
+    const s_handshake = try server.takeFlight(.handshake);
+    defer alloc.free(s_handshake);
+
+    if (case.observed_retry_scid) |rs| try client.setRetryScid(rs);
+    if (case.observed_scid) |scid| try client.setServerInitialScid(scid);
+    try client.feedCrypto(.initial, s_initial);
+    try client.feedCrypto(.handshake, s_handshake);
+    try testing.expect(client.isComplete());
+    try testing.expectEqualSlices(u8, &cid_test_odcid, client.peerTransportParams().?.original_destination_connection_id.?);
+}
+
+test "quic client accepts server connection-id params that match what it observed" {
+    try runCidCase(.{});
+}
+
+test "quic client accepts retry_source_connection_id that matches the Retry it processed" {
+    try runCidCase(.{ .server_retry_scid = &cid_test_retry_scid, .observed_retry_scid = &cid_test_retry_scid });
+}
+
+test "quic client rejects a mismatched original_destination_connection_id" {
+    try testing.expectError(error.ConnectionIdMismatch, runCidCase(.{ .server_odcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x09 } }));
+}
+
+test "quic client rejects a missing original_destination_connection_id" {
+    try testing.expectError(error.ConnectionIdMismatch, runCidCase(.{ .server_odcid = null }));
+}
+
+test "quic client rejects an initial_source_connection_id that differs from the observed server SCID" {
+    try testing.expectError(error.ConnectionIdMismatch, runCidCase(.{ .observed_scid = &[_]u8{ 0xaa, 0xbb, 0xcc, 0xde } }));
+}
+
+test "quic client rejects a missing initial_source_connection_id" {
+    try testing.expectError(error.ConnectionIdMismatch, runCidCase(.{ .server_iscid = null }));
+}
+
+test "quic client fails closed when the driver never reported the server SCID" {
+    try testing.expectError(error.ConnectionIdMismatch, runCidCase(.{ .observed_scid = null }));
+}
+
+test "quic client rejects a missing retry_source_connection_id after a Retry" {
+    try testing.expectError(error.ConnectionIdMismatch, runCidCase(.{ .observed_retry_scid = &cid_test_retry_scid }));
+}
+
+test "quic client rejects a mismatched retry_source_connection_id" {
+    try testing.expectError(error.ConnectionIdMismatch, runCidCase(.{
+        .server_retry_scid = &[_]u8{ 0x71, 0x72, 0x73, 0x74, 0x76 },
+        .observed_retry_scid = &cid_test_retry_scid,
+    }));
+}
+
+test "quic client rejects retry_source_connection_id when no Retry happened" {
+    try testing.expectError(error.ConnectionIdMismatch, runCidCase(.{ .server_retry_scid = &cid_test_retry_scid }));
+}
+
+test "quic client refuses to swap the reported server SCID" {
+    var client = try Client.initConfig(testing.allocator, .{
+        .x25519_seed = @as([kx.X25519Kx.seed_len]u8, @splat(0x42)),
+        .client_random = @as([32]u8, @splat(0x11)),
+        .original_dcid = &cid_test_odcid,
+    });
+    defer client.deinit();
+    try client.setServerInitialScid(&cid_test_server_scid);
+    try client.setServerInitialScid(&cid_test_server_scid); // idempotent
+    try testing.expectError(error.ConnectionIdMismatch, client.setServerInitialScid(&[_]u8{0x01}));
+    try client.setRetryScid(&cid_test_retry_scid);
+    try testing.expectError(error.BadState, client.setRetryScid(&cid_test_retry_scid));
+}
+
+/// Encode an EncryptedExtensions handshake message carrying `tp_body` as the
+/// quic_transport_parameters extension (or no extension when null).
+fn buildTestEncryptedExtensions(alloc: Allocator, out: *std.ArrayList(u8), tp_body: ?[]const u8) !void {
+    var ext_storage: [512]u8 = undefined;
+    var ext_builder = try tls_extension.Builder.begin(&ext_storage);
+    if (tp_body) |b| try ext_builder.add(quic_transport_parameters_ext, b);
+    try writeHandshake(alloc, out, .encrypted_extensions, try ext_builder.finish());
+}
+
+test "quic client rejects EncryptedExtensions without transport parameters" {
+    const alloc = testing.allocator;
+    var client = try Client.initConfig(alloc, .{
+        .x25519_seed = @as([kx.X25519Kx.seed_len]u8, @splat(0x42)),
+        .client_random = @as([32]u8, @splat(0x11)),
+    });
+    defer client.deinit();
+    var flight: std.ArrayList(u8) = .empty;
+    defer flight.deinit(alloc);
+    try buildTestEncryptedExtensions(alloc, &flight, null);
+    try writeHandshake(alloc, &flight, .finished, &(@as([32]u8, @splat(0))));
+    try testing.expectError(error.MissingExtension, client.feedCrypto(.handshake, flight.items));
+}
+
+test "quic client surfaces a duplicated server transport parameter as a typed error" {
+    const alloc = testing.allocator;
+    var client = try Client.initConfig(alloc, .{
+        .x25519_seed = @as([kx.X25519Kx.seed_len]u8, @splat(0x42)),
+        .client_random = @as([32]u8, @splat(0x11)),
+    });
+    defer client.deinit();
+    // initial_max_data (0x04) twice, each a 1-byte varint.
+    const tp = [_]u8{ 0x04, 0x01, 0x07, 0x04, 0x01, 0x09 };
+    var flight: std.ArrayList(u8) = .empty;
+    defer flight.deinit(alloc);
+    try buildTestEncryptedExtensions(alloc, &flight, &tp);
+    try writeHandshake(alloc, &flight, .finished, &(@as([32]u8, @splat(0))));
+    try testing.expectError(error.DuplicateParameter, client.feedCrypto(.handshake, flight.items));
+    try testing.expect(client.peerTransportParams() == null);
+}
+
+// --- Client receive-buffer bounds -------------------------------------------
+
+test "quic client refuses an oversized ServerHello declaration" {
+    var client = try Client.initConfig(testing.allocator, .{
+        .x25519_seed = @as([kx.X25519Kx.seed_len]u8, @splat(0x42)),
+        .client_random = @as([32]u8, @splat(0x11)),
+    });
+    defer client.deinit();
+    const header = [_]u8{ 2, 0xff, 0xff, 0xff };
+    try testing.expectError(error.HandshakeTooLarge, client.feedCrypto(.initial, &header));
+    try testing.expect(client.recv_initial.items.len <= max_handshake_buffer);
+}
+
+test "quic client refuses an oversized declaration behind a complete message in the server flight" {
+    const alloc = testing.allocator;
+    var client = try Client.initConfig(alloc, .{
+        .x25519_seed = @as([kx.X25519Kx.seed_len]u8, @splat(0x42)),
+        .client_random = @as([32]u8, @splat(0x11)),
+    });
+    defer client.deinit();
+    // A small, complete EncryptedExtensions followed by a Certificate header
+    // that declares 16 MiB: refused at once, not streamed up to the cap.
+    var flight: std.ArrayList(u8) = .empty;
+    defer flight.deinit(alloc);
+    try buildTestEncryptedExtensions(alloc, &flight, &.{});
+    try flight.appendSlice(alloc, &.{ 11, 0xff, 0xff, 0xff });
+    try testing.expectError(error.HandshakeTooLarge, client.feedCrypto(.handshake, flight.items));
+}
+
+test "quic client caps total buffered handshake-flight bytes" {
+    var client = try Client.initConfig(testing.allocator, .{
+        .x25519_seed = @as([kx.X25519Kx.seed_len]u8, @splat(0x42)),
+        .client_random = @as([32]u8, @splat(0x11)),
+    });
+    defer client.deinit();
+    // A declared length just under the cap is accepted while incomplete.
+    const declared = max_handshake_buffer - 4;
+    const header = [_]u8{ 11, @intCast(declared >> 16), @intCast((declared >> 8) & 0xff), @intCast(declared & 0xff) };
+    try client.feedCrypto(.handshake, &header);
+    var chunk: [4096]u8 = @splat(0);
+    var fed: usize = 4;
+    while (fed + chunk.len < max_handshake_buffer) : (fed += chunk.len) try client.feedCrypto(.handshake, &chunk);
+    try testing.expect(client.recv_handshake.items.len <= max_handshake_buffer);
+    try testing.expectError(error.HandshakeTooLarge, client.feedCrypto(.handshake, &chunk));
 }

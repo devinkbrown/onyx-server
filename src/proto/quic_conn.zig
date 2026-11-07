@@ -1178,6 +1178,9 @@ pub const Conn = struct {
             .transport_params = config.transport_params,
             .x25519_seed = config.x25519_seed,
             .client_random = config.client_random,
+            // RFC 9000 §7.3: authenticate the server's connection-id transport
+            // parameters against the DCID of our first Initial.
+            .original_dcid = config.initial_dcid,
         }) catch return error.HandshakeFailed;
         errdefer client.deinit();
 
@@ -1819,6 +1822,12 @@ pub const Conn = struct {
         // §7.2). Until then it used the random Initial DCID it invented; the
         // server's real SCID is what 1-RTT short headers must address.
         if (self.role == .client and !self.server_cid_learned) {
+            // The handshake authenticates this SCID against the server's
+            // `initial_source_connection_id` transport parameter (RFC 9000 §7.3).
+            switch (self.handshake) {
+                .client => |*c| c.setServerInitialScid(dec.header.scid.slice()) catch return error.HandshakeFailed,
+                .server => unreachable,
+            }
             self.dcid = dec.header.scid;
             self.server_cid_learned = true;
         }
@@ -3565,6 +3574,8 @@ fn mintCert(out: *[1024]u8, kp: Ed25519.KeyPair) ![]const u8 {
 }
 
 const test_server_params: quic_transport_params.TransportParameters = .{
+    // RFC 9000 §7.3: the client authenticates both connection-id parameters.
+    .original_destination_connection_id = &test_initial_dcid,
     .initial_source_connection_id = &test_server_cid,
     .max_idle_timeout = 30_000,
     .initial_max_data = 1 << 20,
@@ -3648,6 +3659,57 @@ fn driveHandshake(alloc: Allocator, lb: *Loopback) !void {
         if (lb.client.isEstablished() and lb.server.isEstablished()) return;
     }
     return error.HandshakeDidNotComplete;
+}
+
+/// Drive a client against a server whose transport parameters carry the given
+/// connection ids, returning the handshake outcome (RFC 9000 §7.3).
+fn driveWithServerCids(alloc: Allocator, odcid: ?[]const u8, iscid: ?[]const u8) !void {
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
+    var cert_buf: [1024]u8 = undefined;
+    const cert = try mintCert(&cert_buf, kp);
+    var params = test_server_params;
+    params.original_destination_connection_id = odcid;
+    params.initial_source_connection_id = iscid;
+    var server = try Conn.initServer(alloc, .{
+        .cert_chain = &.{cert},
+        .signing_key = .{ .ed25519 = kp },
+        .alpn_protocols = &test_alpn,
+        .transport_params = params,
+        .local_cid = &test_server_cid,
+        .x25519_seed = @as([32]u8, @splat(0x21)),
+        .server_random = @as([32]u8, @splat(0x55)),
+    });
+    defer server.deinit();
+    var client = try Conn.initClient(alloc, .{
+        .alpn_protocols = &test_alpn,
+        .transport_params = test_client_params,
+        .local_cid = &test_client_cid,
+        .initial_dcid = &test_initial_dcid,
+        .x25519_seed = @as([32]u8, @splat(0x42)),
+        .client_random = @as([32]u8, @splat(0x11)),
+    });
+    defer client.deinit();
+    var rounds: usize = 0;
+    while (rounds < 12) : (rounds += 1) {
+        _ = try pump(alloc, &client, &server);
+        _ = try pump(alloc, &server, &client);
+        if (client.isEstablished() and server.isEstablished()) return;
+    }
+    return error.HandshakeDidNotComplete;
+}
+
+test "quic conn client authenticates the server's connection-id transport parameters" {
+    const alloc = testing.allocator;
+    // Matching ODCID (our first Initial DCID) and ISCID (the server's SCID).
+    try driveWithServerCids(alloc, &test_initial_dcid, &test_server_cid);
+    // A refused handshake is a per-packet drop at the datagram layer (RFC 9000
+    // §5.2), so the client simply never becomes established.
+    // ODCID that is not our first Initial DCID.
+    try testing.expectError(error.HandshakeDidNotComplete, driveWithServerCids(alloc, &test_client_cid, &test_server_cid));
+    // ODCID omitted.
+    try testing.expectError(error.HandshakeDidNotComplete, driveWithServerCids(alloc, null, &test_server_cid));
+    // ISCID that is not the SCID on the server's packets.
+    try testing.expectError(error.HandshakeDidNotComplete, driveWithServerCids(alloc, &test_initial_dcid, &test_initial_dcid));
 }
 
 test "quic conn snapshot restores established server stream loss and owned handshake state" {
