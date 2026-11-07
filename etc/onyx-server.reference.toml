@@ -168,6 +168,8 @@ news_insecure_tls = false
 # PEM CA bundle whose certificates are the trust anchors for the live news
 # fetch. Loaded once; a missing, oversize, or empty bundle disables the live
 # fetch with an error log (never a silent fallback to news_insecure_tls).
+# NOT YET EFFECTIVE: parsed but not yet passed to the geo service; the live
+# fetch always uses /etc/ssl/certs/ca-certificates.crt and the 4194304 bound.
 news_ca_bundle = "/etc/ssl/certs/ca-certificates.crt"
 # Read bound for news_ca_bundle, in bytes. Range 65536..67108864.
 news_ca_bundle_max_bytes = 4194304

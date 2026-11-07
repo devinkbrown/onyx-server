@@ -1025,9 +1025,6 @@ fn fileKey(k: []const u8, buf: []u8) []const u8 {
     return buf[0..n];
 }
 
-/// Finite regular-cache acquisition. NONBLOCK prevents a configured FIFO from
-/// trapping shutdown/pause before type validation; the held descriptor, not an
-/// earlier pathname stat, supplies the regular-file proof.
 /// Read and decode a PEM CA bundle with the fetcher's raw-syscall reader (no
 /// reactor io). A file larger than `max_bytes` is refused, not truncated: a
 /// silently cut bundle would drop roots without notice.
@@ -1042,6 +1039,9 @@ fn loadBundle(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) 
     return ca_bundle.TrustStore.fromPem(allocator, text);
 }
 
+/// Finite regular-cache acquisition. NONBLOCK prevents a configured FIFO from
+/// trapping shutdown/pause before type validation; the held descriptor, not an
+/// earlier pathname stat, supplies the regular-file proof.
 fn readFileZ(path: [*:0]const u8, buf: []u8) ?[]u8 {
     const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows) return readFileWindows(path, buf);
