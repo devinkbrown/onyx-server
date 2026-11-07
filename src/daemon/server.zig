@@ -73038,6 +73038,16 @@ pub const LinuxServer = struct {
         var claim_hlc: u64 = 0;
         var claim_revision: u64 = 1;
         var renew = prior == null;
+        // A published incarnation carried across Helix arrives with an empty
+        // route authority (not carried). Restarting at revision 1 with a fresh
+        // claim would be obsolete at a peer holding a higher revision, or
+        // quarantined forever at one holding revision 1 with another body.
+        // Continue the carried history instead: next revision, same claim.
+        if (prior == null and conn.guest_revision != 0 and conn.guest_claim_revision != 0 and conn.guest_claim_hlc != 0) {
+            revision = mesh_presence_v2.nextRevision(conn.guest_revision) catch return;
+            claim_hlc = conn.guest_claim_hlc;
+            claim_revision = conn.guest_claim_revision;
+        }
         if (prior) |kept| {
             revision = kept.revision;
             claim_hlc = kept.claim_hlc;
@@ -188015,6 +188025,54 @@ test "Helix adopt: a carried unpublished id that a peer retired is replaced by a
     try std.testing.expect(server.durable_guest_presence.?.metadata.issued_through >= subject.counter);
     const published = server.guest_presence.?.retainedByGuest(origin, conn.guest_id) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(guest_presence_route.Disposition.inserted, try peer.admit(published.wire, &roots, now, 7, false));
+    const seen = peer.liveByGuest(origin, conn.guest_id, now) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Ariadne", seen.nick);
+}
+
+test "Helix adopt: a carried published durable guest continues its revision history so a peer updates it" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const store_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/presence.wal", .{tmp.sub_path});
+    var ident = try node_identity.fromSeed(@splat(0xB4), "carried-durable-guest-test");
+    defer ident.deinit();
+    const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .node_identity = &ident, .node_id = ident.shortId(), .crypto_io = std.testing.io, .mesh_presence_store_path = store_path });
+    defer {
+        server.deinit();
+        a.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+    const origin = ident.sign_kp.public_key;
+    const roots = [_][32]u8{origin};
+    const now = server.guestNowMs();
+    const peer = try guest_presence_route.Authority.create(a);
+    defer peer.destroy();
+
+    const sockets = try sameIPTestSocketPair();
+    defer closeFd(sockets[1]);
+    try std.testing.expect(server.adoptInheritedClient(.{ .nick = "Ariadne", .realname = "Helix guest", .username = "ariadne", .fd = sockets[0] }, null, null, false));
+    var it = server.reactors[0].clients.iterator();
+    const conn = it.next().?.value;
+    conn.session.registration.registered = true;
+    server.publishOrdinaryGuest(conn, false);
+    try std.testing.expectEqual(@as(u64, 1), conn.guest_revision);
+    const first = server.guest_presence.?.retainedByGuest(origin, conn.guest_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(guest_presence_route.Disposition.inserted, try peer.admit(first.wire, &roots, now, 7, false));
+
+    // Same-image Helix: the successor adopts the published incarnation with
+    // an empty route authority (it is never carried).
+    server.guest_presence.?.destroy();
+    server.guest_presence = null;
+    const carried_claim_hlc = conn.guest_claim_hlc;
+    server.publishOrdinaryGuest(conn, false);
+    try std.testing.expectEqual(@as(u64, 2), conn.guest_revision);
+    try std.testing.expectEqual(carried_claim_hlc, conn.guest_claim_hlc);
+    const continued = server.guest_presence.?.retainedByGuest(origin, conn.guest_id) orelse return error.TestUnexpectedResult;
+    // Before the fix this was revision 1 with a fresh claim: quarantined.
+    try std.testing.expectEqual(guest_presence_route.Disposition.updated, try peer.admit(continued.wire, &roots, now, 7, false));
     const seen = peer.liveByGuest(origin, conn.guest_id, now) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("Ariadne", seen.nick);
 }
