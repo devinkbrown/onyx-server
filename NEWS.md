@@ -11,6 +11,14 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
+## 0.11.2 — Registration keeps the connection on nick delay and reservation (2026-11-07)
+
+- A nick under nick delay (`437`) or reserved (`432`) is now answered before
+  `001`, and the connection stays open for a `NICK` retry, like the in-use
+  `433` case in 0.11.1. Before, the client got the welcome burst and then a
+  closed socket. The Onyx web client reconnecting as `guest` right after its
+  previous `guest` quit hit the nick-delay hold on every attempt.
+
 ## 0.11.1 — Helix and registration fixes after the 0.11.0 rollout (2026-11-07)
 
 Fixes for problems seen while rolling out 0.11.0 on the two-node mesh.

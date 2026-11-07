@@ -24439,15 +24439,29 @@ pub const LinuxServer = struct {
         if (conn.s2s != null or conn.s2s_secured != null) return false;
         const nick = conn.session.displayName();
         if (std.mem.eql(u8, nick, "*")) return false;
-        const holder = self.world.findNick(nick) orelse return false;
-        if (holder.eql(worldIdFromClient(id))) return false;
-        if (conn.session.account()) |acct| {
-            if (self.nickHeldBySameAccount(nick, acct, worldIdFromClient(id))) return false;
+        // Reservation and nick delay are decided by registerConnNick after
+        // 001 too; answer them here first so the client can pick another
+        // nick on the same transport (a reconnecting web client re-offering
+        // its just-released nick hit the delay hold and was closed).
+        var numeric: Numeric = .ERR_NICKNAMEINUSE;
+        var reason: []const u8 = "Nickname is already in use";
+        if (self.nickReservationBlocks(conn, nick)) |entry| {
+            numeric = .ERR_ERRONEUSNICKNAME;
+            reason = serverAccessReason(entry, "Nickname is reserved");
+        } else if (self.nickDelayBlocks(conn, nick)) {
+            numeric = .ERR_UNAVAILRESOURCE;
+            reason = "Nick is held (nick delay); try again shortly";
+        } else {
+            const holder = self.world.findNick(nick) orelse return false;
+            if (holder.eql(worldIdFromClient(id))) return false;
+            if (conn.session.account()) |acct| {
+                if (self.nickHeldBySameAccount(nick, acct, worldIdFromClient(id))) return false;
+            }
         }
         conn.session.registration.registered = false;
         conn.session.registration.nick_seen = false;
         conn.session.client.registration.prereg = .user_seen;
-        queueNumeric(conn, .ERR_NICKNAMEINUSE, &.{nick}, "Nickname is already in use") catch |err| switch (err) {
+        queueNumeric(conn, numeric, &.{nick}, reason) catch |err| switch (err) {
             error.OutputTooSmall,
             error.TextTooLong,
             error.NoSpaceLeft,
@@ -126741,6 +126755,51 @@ test "threaded server: pre-registration REGISTER fails and CAP LS 302 advertises
     try writeAllFd(fd, "REGISTER newacct * pw\r\n");
     try recvUntil(&client, "FAIL REGISTER COMPLETE_CONNECTION_REQUIRED", 200);
     try std.testing.expect(std.mem.indexOf(u8, client.written(), " 421 ") == null);
+}
+
+test "threaded server: a nick under nick delay answers 437 before 001 and keeps the connection for a retry" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .nick_delay_ms = 60_000 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_first = connectLoopback(port) catch return error.SkipZigTest;
+    var first = LiveClient{ .fd = fd_first };
+    try writeAllFd(fd_first, "NICK guest\r\nUSER webchat 0 * :guest\r\n");
+    try recvUntil(&first, " 001 guest ", 200);
+    try writeAllFd(fd_first, "QUIT :reconnecting\r\n");
+    closeFd(fd_first);
+
+    // A web client reconnecting with its just-released nick hits the nick
+    // delay hold: 437 before any welcome, transport kept for a NICK retry.
+    var attempts: usize = 0;
+    while (attempts < 50) : (attempts += 1) {
+        const fd = connectLoopback(port) catch return error.SkipZigTest;
+        defer closeFd(fd);
+        var again = LiveClient{ .fd = fd };
+        try writeAllFd(fd, "NICK guest\r\nUSER webchat 0 * :guest\r\n");
+        recvUntil(&again, " 437 ", 40) catch {
+            // The quit may not have released the nick yet (still held as in use).
+            if (std.mem.indexOf(u8, again.written(), " 433 ") != null) continue;
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(std.mem.indexOf(u8, again.written(), " 001 ") == null);
+        again.reset();
+        try writeAllFd(fd, "NICK guest3\r\nPING :delay-retry-alive\r\n");
+        try recvUntil(&again, " :delay-retry-alive\r\n", 200);
+        try std.testing.expectEqual(@as(usize, 1), countOccurrences(again.written(), " 001 guest3 "));
+        return;
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "threaded server: a nick already in use answers 433 before 001 and keeps the connection for a retry" {
