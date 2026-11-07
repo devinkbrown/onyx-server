@@ -226,6 +226,11 @@ pub const Server = struct {
     receive_record_size_limit: u16 = tls_record.record_size_limit_max12,
     read_failed: bool = false,
     alert_taken: bool = false,
+    /// Set only when THIS engine completed an EMS handshake (full or
+    /// abbreviated) and so holds the session-hash-bound master secret plus the
+    /// handshake randoms. `resumeConnected` (Helix) never carries the master
+    /// secret, so it leaves this false and the exporter fails closed.
+    exporter_ready: bool = false,
 
     // ---- mTLS (only meaningful when config.request_client_cert) ----
     /// Owned copy of the presented client leaf DER, or null if the client
@@ -357,6 +362,41 @@ pub const Server = struct {
         return self.client_cert_der;
     }
 
+    /// RFC 5705 TLS 1.2 keying-material exporter, "context provided" form
+    /// (the two-byte context length is always in the seed, so an empty
+    /// `context` differs from `exportKeyingMaterialNoContext`). Mirrors the
+    /// TLS 1.3 `tls_server.Server.exportKeyingMaterial` signature.
+    ///
+    /// Fails closed with `BadState` unless this engine completed a handshake
+    /// that negotiated the RFC 7627 extended master secret: without EMS the
+    /// master secret is not bound to the handshake (triple handshake), and a
+    /// Helix-resumed engine (`resumeConnected`) holds no master secret at all.
+    pub fn exportKeyingMaterial(self: *const Server, label: []const u8, context: []const u8, out: []u8) Error!void {
+        const suite = try self.exporterSuite();
+        try tls12.exportKeyingMaterial(suite.hashAlg(), &self.master_secret, &self.client_random, &self.server_random, label, context, out);
+    }
+
+    /// RFC 5705 exporter, "no context" form. Same preconditions as
+    /// `exportKeyingMaterial`.
+    pub fn exportKeyingMaterialNoContext(self: *const Server, label: []const u8, out: []u8) Error!void {
+        const suite = try self.exporterSuite();
+        try tls12.exportKeyingMaterial(suite.hashAlg(), &self.master_secret, &self.client_random, &self.server_random, label, null, out);
+    }
+
+    /// RFC 9266 tls-exporter channel binding for SCRAM-SHA-*-PLUS over TLS 1.2
+    /// (label "EXPORTER-Channel-Binding", zero-length context, 32 bytes).
+    /// RFC 9266 section 3 permits this on TLS 1.2 only with EMS, which the
+    /// exporter precondition enforces.
+    pub fn channelBindingTlsExporter(self: *const Server, out: *[32]u8) Error!void {
+        try self.exportKeyingMaterial("EXPORTER-Channel-Binding", "", out[0..]);
+    }
+
+    fn exporterSuite(self: *const Server) Error!tls12.CipherSuite {
+        if (self.read_failed or self.state != .connected) return error.BadState;
+        if (!self.exporter_ready or !self.ems_negotiated) return error.BadState;
+        return self.selected_suite orelse error.BadState;
+    }
+
     pub fn selectedAlpn(self: *const Server) ?[]const u8 {
         return if (self.selected_alpn) |p| p else null;
     }
@@ -453,6 +493,7 @@ pub const Server = struct {
                     self.app_read_seq = self.hs_read_seq;
                     self.app_write_seq = self.hs_write_seq;
                     self.state = .connected;
+                    self.exporter_ready = self.ems_negotiated;
                     return .{ .bytes_to_send = reply };
                 },
                 .wait_resumed_client_ccs => {
@@ -483,6 +524,7 @@ pub const Server = struct {
                     self.app_read_seq = self.hs_read_seq;
                     self.app_write_seq = self.hs_write_seq;
                     self.state = .connected;
+                    self.exporter_ready = self.ems_negotiated;
                 },
                 .connected => return error.BadState,
             }
@@ -810,7 +852,11 @@ pub const Server = struct {
                     // records honor it and echo our own limit in the ServerHello.
                     if (body.len != 2) return error.InvalidRecordSizeLimit;
                     const limit = std.mem.readInt(u16, body[0..2], .big);
-                    if (limit < tls_record.record_size_limit_min) return error.InvalidRecordSizeLimit;
+                    // RFC 8449 section 4: a server MAY enforce the upper bound.
+                    // 2^14+1 is the largest value any TLS version defines (TLS
+                    // 1.3; dual-version clients send it on a 1.2 fallback), so
+                    // anything above it is refused rather than silently clamped.
+                    if (limit < tls_record.record_size_limit_min or limit > tls_record.record_size_limit_max) return error.InvalidRecordSizeLimit;
                     self.peer_record_size_limit = limit;
                     self.client_offered_record_size_limit = true;
                 },
@@ -986,7 +1032,10 @@ pub const Server = struct {
 
     /// Capture the presented client leaf (certfp pins the leaf only). An empty
     /// certificate_list = the client declined; `client_leaf_key` stays null and
-    /// the handshake proceeds without client auth.
+    /// the handshake proceeds without client auth. Every entry after the leaf
+    /// is still framed and bounded (RFC 5246 ASN.1Cert<1..2^24-1>): a
+    /// zero-length entry or trailing bytes that do not form a whole entry are a
+    /// malformed message, never silently ignored.
     fn parseClientCertificate(self: *Server, body: []const u8) Error!void {
         var c = Cursor.init(body);
         const list = try c.take(try c.readU24());
@@ -994,6 +1043,11 @@ pub const Server = struct {
         var certs = Cursor.init(list);
         if (certs.remaining() == 0) return; // declined
         const der = try certs.take(try certs.readU24());
+        if (der.len == 0) return error.BadHandshake;
+        while (certs.remaining() != 0) {
+            const extra = try certs.take(try certs.readU24());
+            if (extra.len == 0) return error.BadHandshake;
+        }
         const leaf = try self.allocator.dupe(u8, der);
         errdefer self.allocator.free(leaf);
         self.client_leaf_key = try clientKeyFromCert(leaf);
@@ -2358,11 +2412,22 @@ test "TLS 1.2 server rejects an out-of-range record_size_limit (RFC 8449)" {
     const too_small = [_]u8{ 0x00, 0x1c, 0x00, 0x02, 0x00, 0x3f };
     try std.testing.expectError(error.InvalidRecordSizeLimit, server.parseClientExtensions(&too_small));
 
-    // Future raw advertisements above the current protocol maximum are valid;
-    // effective outbound content is still capped at 16384.
-    const future_limit = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 23, 0x00, 0x1c, 0x00, 0x02, 0x40, 0x02 };
-    try server.parseClientExtensions(&future_limit);
-    try std.testing.expectEqual(@as(usize, 16386), server.peer_record_size_limit);
+    // A9: 16386 is one above the largest value any TLS version defines
+    // (2^14+1); it is refused as illegal_parameter instead of being clamped.
+    var above = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer above.deinit();
+    const too_large = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 23, 0x00, 0x1c, 0x00, 0x02, 0x40, 0x02 };
+    try std.testing.expectError(error.InvalidRecordSizeLimit, above.parseClientExtensions(&too_large));
+    try std.testing.expect(!above.client_offered_record_size_limit);
+    try std.testing.expectEqual(tls_server.AlertDescription.illegal_parameter, tls_server.alertDescriptionForError(error.InvalidRecordSizeLimit).?);
+
+    // 2^14+1 (what dual-version TLS 1.3 clients advertise on a 1.2 fallback)
+    // is the accepted maximum; effective outbound content stays capped at 16384.
+    var at_max = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer at_max.deinit();
+    const max_limit = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 23, 0x00, 0x1c, 0x00, 0x02, 0x40, 0x01 };
+    try at_max.parseClientExtensions(&max_limit);
+    try std.testing.expectEqual(@as(usize, 16385), at_max.peer_record_size_limit);
 
     // A wrong-length body (1 byte instead of 2) is also rejected.
     var malformed = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
@@ -3641,15 +3706,21 @@ test "TLS record limit: TLS12 negotiated64 full and resumed flights use version-
     }
 }
 
-test "TLS record limit: TLS12 accepts future peer advertisement with protocol-capped output" {
+test "TLS record limit: TLS12 rejects above-maximum advertisement and caps output at the maximum" {
     const a = std.testing.allocator;
     const fixture = try makeFixture(a);
     defer fixture.deinit(a);
+    // A9 (RFC 8449 section 4): values above 2^14+1 are illegal_parameter.
+    var rejecting = try Server.init(a, .{ .cert_chain = &.{fixture.cert}, .ecdsa_p256_signing_key = fixture.key });
+    defer rejecting.deinit();
+    const future = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 23, 0, 28, 0, 2, 255, 255 };
+    try std.testing.expectError(error.InvalidRecordSizeLimit, rejecting.parseClientExtensions(&future));
+
     var server = try Server.init(a, .{ .cert_chain = &.{fixture.cert}, .ecdsa_p256_signing_key = fixture.key });
     defer server.deinit();
-    const future = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 23, 0, 28, 0, 2, 255, 255 };
-    try server.parseClientExtensions(&future);
-    try std.testing.expectEqual(@as(usize, 65535), server.peer_record_size_limit);
+    const at_max = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 23, 0, 28, 0, 2, 0x40, 0x01 };
+    try server.parseClientExtensions(&at_max);
+    try std.testing.expectEqual(@as(usize, 16385), server.peer_record_size_limit);
     server.state = .connected;
     server.selected_suite = .tls_ecdhe_ecdsa_with_aes_128_gcm_sha256;
     const payload: [17000]u8 = @splat(0x77);
@@ -3699,4 +3770,268 @@ test "TLS record limit: output custody TLS12 server Finished OOM preserves pre-C
 
 test "TLS record limit: TLS12 authenticated mTLS negotiates64 in both directions" {
     try runMtlsLoopback(.ecdsa, 64, .records);
+}
+
+test "A9 TLS 1.2 client certificate_list: every entry is framed, trailing bytes are rejected" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const leaf = fixture.cert;
+
+    const bad_tails = [_][]const u8{
+        &.{ 0x00, 0x01 }, // partial u24 length after the leaf
+        &.{ 0x00, 0x00, 0x05, 0xaa }, // entry claims 5 bytes, 1 present
+        &.{ 0x00, 0x00, 0x00 }, // zero-length trailing entry
+        &.{0xff}, // one stray byte
+    };
+    for (bad_tails) |tail| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(allocator);
+        var hdr: [3]u8 = undefined;
+        std.mem.writeInt(u24, &hdr, @intCast(3 + leaf.len + tail.len), .big);
+        try body.appendSlice(allocator, &hdr);
+        std.mem.writeInt(u24, &hdr, @intCast(leaf.len), .big);
+        try body.appendSlice(allocator, &hdr);
+        try body.appendSlice(allocator, leaf);
+        try body.appendSlice(allocator, tail);
+
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key, .request_client_cert = true });
+        defer server.deinit();
+        try std.testing.expectError(error.BadHandshake, server.parseClientCertificate(body.items));
+        try std.testing.expect(server.client_cert_der == null and server.client_leaf_key == null);
+    }
+
+    // A zero-length leaf entry is malformed (ASN.1Cert<1..2^24-1>).
+    {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key, .request_client_cert = true });
+        defer server.deinit();
+        try std.testing.expectError(error.BadHandshake, server.parseClientCertificate(&.{ 0x00, 0x00, 0x03, 0x00, 0x00, 0x00 }));
+        try std.testing.expect(server.client_cert_der == null);
+    }
+
+    // A well-formed two-entry chain is accepted and the LEAF (first entry) is
+    // what certfp pins, not the trailing intermediate.
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(allocator);
+        const other = [_]u8{ 0x30, 0x03, 0x02, 0x01, 0x01 };
+        var hdr: [3]u8 = undefined;
+        std.mem.writeInt(u24, &hdr, @intCast(3 + leaf.len + 3 + other.len), .big);
+        try body.appendSlice(allocator, &hdr);
+        std.mem.writeInt(u24, &hdr, @intCast(leaf.len), .big);
+        try body.appendSlice(allocator, &hdr);
+        try body.appendSlice(allocator, leaf);
+        std.mem.writeInt(u24, &hdr, other.len, .big);
+        try body.appendSlice(allocator, &hdr);
+        try body.appendSlice(allocator, &other);
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key, .request_client_cert = true });
+        defer server.deinit();
+        try server.parseClientCertificate(body.items);
+        try std.testing.expectEqualSlices(u8, leaf, server.client_cert_der.?);
+    }
+}
+
+/// Drive a full TLS 1.2 handshake between `server` and `client` to completion,
+/// checking that neither exporter is available before the server finishes.
+fn driveFullHandshake(allocator: Allocator, server: *Server, client: *tls12_client.Client) !void {
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    var early: [32]u8 = undefined;
+    try std.testing.expectError(error.BadState, server.channelBindingTlsExporter(&early));
+    try std.testing.expectError(error.BadState, client.channelBindingTlsExporter(&early));
+    const sfin = switch (try server.feed(cf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sfin);
+    _ = try client.feed(sfin);
+    try std.testing.expect(server.handshakeDone() and client.handshakeDone());
+}
+
+test "TLS 1.2 RFC 5705 exporter: server and client agree; label, context and connection separate" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+
+    inline for (.{ LoopbackSuite.aes128, LoopbackSuite.aes256, LoopbackSuite.chacha }) |suite_kind| {
+        var bindings: [2][32]u8 = undefined;
+        for (&bindings) |*binding| {
+            var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+            defer server.deinit();
+            var client = try tls12_client.Client.init(allocator, .{
+                .server_name = "localhost",
+                .trust_anchors = &anchors,
+                .now_unix_seconds = 1_735_689_600,
+            });
+            defer client.deinit();
+            switch (suite_kind) {
+                .aes128 => client.offerOnlyAes128ForTest(),
+                .aes256 => client.offerOnlyAes256ForTest(),
+                .chacha => client.offerOnlyChaChaForTest(),
+            }
+            var before: [32]u8 = undefined;
+            try std.testing.expectError(error.BadState, server.exportKeyingMaterial("EXPERIMENTAL-x", "", &before));
+            try std.testing.expectError(error.BadState, client.exportKeyingMaterialNoContext("EXPERIMENTAL-x", &before));
+            try driveFullHandshake(allocator, &server, &client);
+            try std.testing.expect(server.ems_negotiated and client.ems_negotiated);
+
+            // RFC 9266 tls-exporter: both ends derive the same 32 bytes.
+            var s_cb: [32]u8 = undefined;
+            var c_cb: [32]u8 = undefined;
+            try server.channelBindingTlsExporter(&s_cb);
+            try client.channelBindingTlsExporter(&c_cb);
+            try std.testing.expectEqualSlices(u8, &s_cb, &c_cb);
+            binding.* = s_cb;
+
+            // It is exactly the RFC 5705 "context provided, zero length" form
+            // over the EMS master secret and this handshake's randoms.
+            var reference: [32]u8 = undefined;
+            try tls12.exportKeyingMaterial(server.selected_suite.?.hashAlg(), &server.master_secret, &server.client_random, &server.server_random, "EXPORTER-Channel-Binding", "", &reference);
+            try std.testing.expectEqualSlices(u8, &reference, &s_cb);
+
+            // Arbitrary lengths, labels and contexts agree across the peers.
+            var server_long: [77]u8 = undefined;
+            var client_long: [77]u8 = undefined;
+            try server.exportKeyingMaterial("EXPERIMENTAL-onyx", "ctx-a", &server_long);
+            try client.exportKeyingMaterial("EXPERIMENTAL-onyx", "ctx-a", &client_long);
+            try std.testing.expectEqualSlices(u8, &server_long, &client_long);
+
+            // Different label, different context, and no-context all differ.
+            var other: [32]u8 = undefined;
+            try server.exportKeyingMaterial("EXPERIMENTAL-other", "", &other);
+            try std.testing.expect(!std.mem.eql(u8, &other, &s_cb));
+            try server.exportKeyingMaterial("EXPORTER-Channel-Binding", "ctx-b", &other);
+            try std.testing.expect(!std.mem.eql(u8, &other, &s_cb));
+            try server.exportKeyingMaterialNoContext("EXPORTER-Channel-Binding", &other);
+            try std.testing.expect(!std.mem.eql(u8, &other, &s_cb));
+            var c_noctx: [32]u8 = undefined;
+            try client.exportKeyingMaterialNoContext("EXPORTER-Channel-Binding", &c_noctx);
+            try std.testing.expectEqualSlices(u8, &other, &c_noctx);
+
+            // Key-schedule labels are never exportable.
+            try std.testing.expectError(error.InvalidExporterLabel, server.exportKeyingMaterial("key expansion", "", &other));
+            try std.testing.expectError(error.InvalidExporterLabel, client.exportKeyingMaterialNoContext("master secret", &other));
+        }
+        // Two independent connections never share a binding.
+        try std.testing.expect(!std.mem.eql(u8, &bindings[0], &bindings[1]));
+    }
+}
+
+test "TLS 1.2 exporter fails closed without EMS, after Helix resumeConnected, and after a read failure" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var out: [32]u8 = undefined;
+
+    // Non-EMS (operator loosened the requirement): no exporter on either end.
+    {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key, .require_extended_master_secret = false });
+        defer server.deinit();
+        var client = try tls12_client.Client.init(allocator, .{
+            .server_name = "localhost",
+            .trust_anchors = &anchors,
+            .now_unix_seconds = 1_735_689_600,
+            .require_extended_master_secret = false,
+        });
+        defer client.deinit();
+        client.omit_ems_for_test = true;
+        try driveFullHandshake(allocator, &server, &client);
+        try std.testing.expect(!server.ems_negotiated and !client.ems_negotiated);
+        try std.testing.expectError(error.BadState, server.channelBindingTlsExporter(&out));
+        try std.testing.expectError(error.BadState, client.channelBindingTlsExporter(&out));
+        try std.testing.expectError(error.BadState, server.exportKeyingMaterialNoContext("EXPERIMENTAL-x", &out));
+    }
+
+    // EMS session handed to a Helix successor: the master secret is not carried,
+    // so the successor refuses rather than exporting from a zero secret.
+    {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        var client = try tls12_client.Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors, .now_unix_seconds = 1_735_689_600 });
+        defer client.deinit();
+        try driveFullHandshake(allocator, &server, &client);
+        try server.channelBindingTlsExporter(&out);
+        var successor = try Server.resumeConnected(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key }, try server.exportResume());
+        defer successor.deinit();
+        try std.testing.expect(successor.handshakeDone());
+        try std.testing.expectError(error.BadState, successor.channelBindingTlsExporter(&out));
+        try std.testing.expectError(error.BadState, successor.exportKeyingMaterial("EXPERIMENTAL-x", "", &out));
+
+        // A failed read poisons the engine; the exporter follows.
+        server.read_failed = true;
+        try std.testing.expectError(error.BadState, server.channelBindingTlsExporter(&out));
+        client.read_failed = true;
+        try std.testing.expectError(error.BadState, client.channelBindingTlsExporter(&out));
+    }
+}
+
+test "TLS 1.2 exporter on a ticket-resumed (abbreviated) handshake: peers agree" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var guard = tls_resumption.ReplayGuard{};
+
+    const stored = try fullHandshakeIssuingTicket(allocator, &chain, &anchors, fixture.key, &guard, 1_700_000_000);
+    defer allocator.free(stored);
+
+    var server = try Server.init(allocator, .{
+        .cert_chain = &chain,
+        .ecdsa_p256_signing_key = fixture.key,
+        .enable_session_tickets = true,
+        .ticket_key = test_ticket_key,
+        .replay_guard = &guard,
+        .now_unix_seconds = 1_700_000_001,
+    });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors, .now_unix_seconds = 1_735_689_600 });
+    defer client.deinit();
+    try client.setSessionTicket(stored);
+
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+    try std.testing.expect(server.resuming);
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    // The client finishes first on the abbreviated path; the server has not.
+    var out: [32]u8 = undefined;
+    try std.testing.expectError(error.BadState, server.channelBindingTlsExporter(&out));
+    switch (try server.feed(cf)) {
+        .bytes_to_send => |b| allocator.free(b),
+        .need_more => {},
+    }
+    try std.testing.expect(server.handshakeDone() and client.handshakeDone());
+
+    var s_cb: [32]u8 = undefined;
+    var c_cb: [32]u8 = undefined;
+    try server.channelBindingTlsExporter(&s_cb);
+    try client.channelBindingTlsExporter(&c_cb);
+    try std.testing.expectEqualSlices(u8, &s_cb, &c_cb);
+    var reference: [32]u8 = undefined;
+    try tls12.exportKeyingMaterial(server.selected_suite.?.hashAlg(), &server.master_secret, &server.client_random, &server.server_random, "EXPORTER-Channel-Binding", "", &reference);
+    try std.testing.expectEqualSlices(u8, &reference, &s_cb);
 }
