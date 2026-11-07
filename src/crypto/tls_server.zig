@@ -2264,7 +2264,7 @@ pub const Server = struct {
         const have_usable_share = x25519_share != null or p256_share != null or hybrid_share != null;
         if (!have_usable_share and !self.hrr_sent) {
             if (offered_groups) |groups| {
-                const server_prefs = [_]supported_groups.NamedGroup{ .x25519, .secp256r1, .x25519mlkem768 };
+                const server_prefs = [_]supported_groups.NamedGroup{ .x25519mlkem768, .x25519, .secp256r1 };
                 if (supported_groups.selectPreferred(groups, &server_prefs)) |g| {
                     return ClientHelloOutcome{ .retry = tls_keyshare.NamedGroup.fromInt(g.toInt()) };
                 }
@@ -2331,26 +2331,10 @@ pub const Server = struct {
         }
         if (!self.early_data_accepted) self.early_data_done = true;
 
-        // Prefer classical X25519, then secp256r1, then the X25519MLKEM768 hybrid
-        // (used when the client — e.g. modern Chrome — offered only the PQ share).
-        if (x25519_share) |peer| {
-            self.selected_group = .x25519;
-            var peer_pub: kx.PublicKey = undefined;
-            @memcpy(&peer_pub, peer);
-            var secret = kx.X25519Kx.sharedSecret(&self.x25519_pair.secret_key, peer_pub) catch return error.BadHandshake;
-            defer secret.wipe();
-            var out = KexShared{ .len = 32 };
-            const ss = secret.declassify();
-            @memcpy(out.buf[0..32], &ss);
-            return ClientHelloOutcome{ .proceed = out };
-        }
-        if (p256_share) |peer| {
-            self.selected_group = .secp256r1;
-            const ss = ecdh_p256.sharedSecret(self.p256_pair.secret, peer[0..ecdh_p256.public_length].*) catch return error.BadHandshake;
-            var out = KexShared{ .len = 32 };
-            @memcpy(out.buf[0..32], &ss);
-            return ClientHelloOutcome{ .proceed = out };
-        }
+        // Prefer the X25519MLKEM768 hybrid (post-quantum confidentiality against
+        // harvest-now-decrypt-later), then classical X25519, then secp256r1.
+        // Modern Chrome/Firefox send both a hybrid and an X25519 share; picking
+        // X25519 first left the PQ exchange unused for real clients.
         if (hybrid_share) |peer| {
             // X25519MLKEM768 (0x11ec): client share = ml-kem_ek(1184) || x25519_pk(32).
             self.selected_group = .x25519mlkem768;
@@ -2380,6 +2364,24 @@ pub const Server = struct {
             @memcpy(out.buf[0..32], &enc.shared_secret);
             const x_ss = x_secret.declassify();
             @memcpy(out.buf[32..64], &x_ss);
+            return ClientHelloOutcome{ .proceed = out };
+        }
+        if (x25519_share) |peer| {
+            self.selected_group = .x25519;
+            var peer_pub: kx.PublicKey = undefined;
+            @memcpy(&peer_pub, peer);
+            var secret = kx.X25519Kx.sharedSecret(&self.x25519_pair.secret_key, peer_pub) catch return error.BadHandshake;
+            defer secret.wipe();
+            var out = KexShared{ .len = 32 };
+            const ss = secret.declassify();
+            @memcpy(out.buf[0..32], &ss);
+            return ClientHelloOutcome{ .proceed = out };
+        }
+        if (p256_share) |peer| {
+            self.selected_group = .secp256r1;
+            const ss = ecdh_p256.sharedSecret(self.p256_pair.secret, peer[0..ecdh_p256.public_length].*) catch return error.BadHandshake;
+            var out = KexShared{ .len = 32 };
+            @memcpy(out.buf[0..32], &ss);
             return ClientHelloOutcome{ .proceed = out };
         }
         return error.UnsupportedGroup;
@@ -7105,10 +7107,11 @@ test "loopback: fragmented ClientHello, ClientHello2, ServerHello, and HelloRetr
     defer alloc.free(hrr);
     try std.testing.expect(firstHandshakeIsHelloRetryRequest(hrr));
     try std.testing.expect(server.hrr_sent);
-    try std.testing.expectEqual(tls_keyshare.NamedGroup.x25519, server.hrr_group);
+    // HRR requests the post-quantum hybrid first (server preference).
+    try std.testing.expectEqual(tls_keyshare.NamedGroup.x25519mlkem768, server.hrr_group);
     try std.testing.expectEqual(State.wait_second_client_hello, server.state);
 
-    // Client consumes the HRR and emits ClientHello2 with the x25519 share.
+    // Client consumes the HRR and emits ClientHello2 with the hybrid share.
     const hrr_parts = try splitFirstHandshakeRecord(alloc, hrr, 3);
     defer hrr_parts.deinit(alloc);
     switch (try client.feed(hrr_parts.first)) {
@@ -7124,7 +7127,7 @@ test "loopback: fragmented ClientHello, ClientHello2, ServerHello, and HelloRetr
     };
     defer alloc.free(ch2);
 
-    // ClientHello2 → the real server flight; the exchange binds to x25519.
+    // ClientHello2 → the real server flight; the exchange binds to the hybrid.
     const ch2_parts = try splitFirstHandshakeRecord(alloc, ch2, 4);
     defer ch2_parts.deinit(alloc);
     switch (try server.feed(ch2_parts.first)) {
@@ -7139,7 +7142,7 @@ test "loopback: fragmented ClientHello, ClientHello2, ServerHello, and HelloRetr
         .need_more => return error.TestUnexpectedResult,
     };
     defer alloc.free(sflight);
-    try std.testing.expectEqual(tls_keyshare.NamedGroup.x25519, server.selected_group);
+    try std.testing.expectEqual(tls_keyshare.NamedGroup.x25519mlkem768, server.selected_group);
 
     const sh_parts = try splitFirstHandshakeRecord(alloc, sflight, 6);
     defer sh_parts.deinit(alloc);
@@ -10242,4 +10245,39 @@ test "suite policy offered subsets and malformed lists" {
     const duplicates = [_]u8{ 0x13, 0x03, 0x13, 0x01, 0x13, 0x03, 0x13, 0x01 };
     try std.testing.expectEqual(CipherSuite.tls_chacha20_poly1305_sha256, pickSuiteWithPolicy(&duplicates, true).?);
     try std.testing.expectEqual(CipherSuite.tls_aes_128_gcm_sha256, pickSuiteWithPolicy(&duplicates, false).?);
+}
+
+test "group preference: a client offering hybrid and X25519 shares negotiates X25519MLKEM768" {
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const alloc = std.testing.allocator;
+    const tls_client = @import("tls_client.zig");
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x5c)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try x509_selfsign.buildSelfSigned(&cert_buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x5c, 0x01 },
+        .key_pair = kp,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+    var server = try Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp, .enable_raw_public_key = true });
+    defer server.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{}, .offer_raw_public_key = true });
+    defer client.deinit();
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sflight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(sflight);
+    try std.testing.expectEqual(tls_keyshare.NamedGroup.x25519mlkem768, server.selected_group);
+    const cfin = switch (try client.feed(sflight)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    try std.testing.expect(client.handshakeDone());
 }

@@ -125,6 +125,9 @@ pub const Error = error{
     NoSigningKey,
     SignatureFailed,
     Entropy,
+    /// A peer declared or streamed more handshake bytes than any legitimate
+    /// flight needs (pre-authentication memory-exhaustion guard).
+    HandshakeTooLarge,
 } || Allocator.Error || hkdf.Error ||
     tls_extension.Error || tls_alpn.Error || tls_keyshare.Error ||
     tls_supported_versions.Error || tls_signature_scheme.Error ||
@@ -352,12 +355,12 @@ pub const Server = struct {
         switch (self.state) {
             .wait_client_hello => {
                 if (level != .initial) return error.BadState;
-                try self.recv.appendSlice(self.allocator, data);
+                try appendBounded(self.allocator, &self.recv, data);
                 try self.driveClientHello();
             },
             .wait_client_finished => {
                 if (level != .handshake) return error.BadState;
-                try self.recv.appendSlice(self.allocator, data);
+                try appendBounded(self.allocator, &self.recv, data);
                 try self.driveClientFinished();
             },
             .connected => return error.BadState,
@@ -461,19 +464,8 @@ pub const Server = struct {
         if (!have_params) return error.MissingExtension;
         self.suite = suite;
 
-        // Prefer classical X25519; fall back to the X25519MLKEM768 hybrid (offered
-        // as the sole QUIC key_share by modern Chrome/Edge).
-        if (x25519_share) |peer| {
-            self.selected_group = .x25519;
-            var peer_pub: kx.PublicKey = undefined;
-            @memcpy(&peer_pub, peer);
-            var secret = kx.X25519Kx.sharedSecret(&self.x25519_pair.secret_key, peer_pub) catch return error.BadHandshake;
-            defer secret.wipe();
-            var out = KexShared{ .len = 32 };
-            const ss = secret.declassify();
-            @memcpy(out.buf[0..32], &ss);
-            return out;
-        }
+        // Prefer the X25519MLKEM768 hybrid (post-quantum confidentiality) over
+        // classical X25519 whenever the client offered both shares.
         if (hybrid_share) |peer| {
             // X25519MLKEM768 (0x11ec): client share = ml-kem_ek(1184) ‖ x25519_pk(32).
             self.selected_group = .x25519mlkem768;
@@ -503,6 +495,17 @@ pub const Server = struct {
             @memcpy(out.buf[0..32], &enc.shared_secret);
             const x_ss = x_secret.declassify();
             @memcpy(out.buf[32..64], &x_ss);
+            return out;
+        }
+        if (x25519_share) |peer| {
+            self.selected_group = .x25519;
+            var peer_pub: kx.PublicKey = undefined;
+            @memcpy(&peer_pub, peer);
+            var secret = kx.X25519Kx.sharedSecret(&self.x25519_pair.secret_key, peer_pub) catch return error.BadHandshake;
+            defer secret.wipe();
+            var out = KexShared{ .len = 32 };
+            const ss = secret.declassify();
+            @memcpy(out.buf[0..32], &ss);
             return out;
         }
         return error.UnsupportedGroup;
@@ -855,6 +858,24 @@ fn writeHandshake(allocator: Allocator, out: *std.ArrayList(u8), typ: HandshakeT
     try out.appendSlice(allocator, body);
 }
 
+/// Upper bound on buffered, not-yet-consumed handshake bytes per encryption
+/// level. A ClientHello (even with an X25519MLKEM768 share and ECH) or a
+/// server flight with a full certificate chain is far below this; without it a
+/// peer could declare a 16 MiB ClientHello and stream it in order, pinning
+/// memory per connection before any authentication.
+pub const max_handshake_buffer: usize = 64 * 1024;
+
+/// Append peer CRYPTO bytes to a per-level buffer, refusing growth past
+/// `max_handshake_buffer` and any declared message length that could not fit.
+fn appendBounded(allocator: Allocator, buf: *std.ArrayList(u8), data: []const u8) Error!void {
+    if (data.len > max_handshake_buffer - @min(buf.items.len, max_handshake_buffer)) return error.HandshakeTooLarge;
+    try buf.appendSlice(allocator, data);
+    if (buf.items.len >= 4) {
+        const declared = (@as(usize, buf.items[1]) << 16) | (@as(usize, buf.items[2]) << 8) | buf.items[3];
+        if (4 + declared > max_handshake_buffer) return error.HandshakeTooLarge;
+    }
+}
+
 /// Parse one handshake message, or null when fewer than a whole message is
 /// buffered. Fully bounds-checked: a declared length overrunning the buffer
 /// returns null (wait for more) rather than reading out of bounds.
@@ -1143,7 +1164,7 @@ pub const Client = struct {
         switch (level) {
             .initial => {
                 if (self.handshake_keys != null) return; // ServerHello already done
-                try self.recv_initial.appendSlice(self.allocator, data);
+                try appendBounded(self.allocator, &self.recv_initial, data);
                 var off: usize = 0;
                 if (parseHandshakeMaybe(self.recv_initial.items, &off) == null) return;
                 self.feedInitial(self.recv_initial.items[0..off]) catch |e| return mapClientError(e);
@@ -1151,6 +1172,7 @@ pub const Client = struct {
             },
             .handshake => {
                 if (self.hs_done) return;
+                if (data.len > max_handshake_buffer - @min(self.recv_handshake.items.len, max_handshake_buffer)) return error.HandshakeTooLarge;
                 try self.recv_handshake.appendSlice(self.allocator, data);
                 // Need the entire server flight (through Finished) buffered. Scan
                 // for a Finished message; until it arrives, wait for more.
@@ -2002,4 +2024,35 @@ test "quic handshake accepts an X25519MLKEM768 hybrid key_share and emits a hybr
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+fn testServerForLimits(alloc: Allocator, cert_buf: *[1024]u8) !Server {
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x51)));
+    const der = try mintEd25519Cert(cert_buf, kp);
+    return Server.init(alloc, .{ .cert_chain = &.{der}, .signing_key = .{ .ed25519 = kp }, .alpn_protocols = &.{"h3"}, .transport_params = test_server_params });
+}
+
+test "quic handshake refuses an oversized in-order ClientHello before buffering it" {
+    var cert_buf: [1024]u8 = undefined;
+    var server = try testServerForLimits(testing.allocator, &cert_buf);
+    defer server.deinit();
+    // Declare a 16 MiB ClientHello, then stream filler in order.
+    const header = [_]u8{ 1, 0xff, 0xff, 0xff };
+    try testing.expectError(error.HandshakeTooLarge, server.feedCrypto(.initial, &header));
+    try testing.expect(server.recv.items.len <= max_handshake_buffer);
+}
+
+test "quic handshake caps total buffered initial bytes even under the declared limit" {
+    var cert_buf: [1024]u8 = undefined;
+    var server = try testServerForLimits(testing.allocator, &cert_buf);
+    defer server.deinit();
+    // A declared length just under the cap is accepted while incomplete.
+    const declared = max_handshake_buffer - 4;
+    const header = [_]u8{ 1, @intCast(declared >> 16), @intCast((declared >> 8) & 0xff), @intCast(declared & 0xff) };
+    try server.feedCrypto(.initial, &header);
+    var chunk: [4096]u8 = @splat(0);
+    var fed: usize = 4;
+    while (fed + chunk.len < max_handshake_buffer) : (fed += chunk.len) try server.feedCrypto(.initial, &chunk);
+    try testing.expect(server.recv.items.len <= max_handshake_buffer);
+    try testing.expectError(error.HandshakeTooLarge, server.feedCrypto(.initial, &chunk));
 }
