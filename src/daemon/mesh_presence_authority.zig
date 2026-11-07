@@ -219,6 +219,27 @@ pub const Authority = struct {
         return .{ .epoch = candidate.epoch, .counter = candidate.issued_through };
     }
 
+    /// Durably reserve `count` consecutive counters in the current epoch with
+    /// one commit, first raising `issued_through` to at least `floor`. Returns
+    /// the first subject; the caller owns counters [first, first + count).
+    /// Unused counters are burned (never reissued): Helix carries
+    /// `issued_through` and cold boot advances the epoch.
+    pub fn reserveSubjectBlock(self: *Authority, key: *const sign.KeyPair, count: u64, floor: u64) !wire.Subject {
+        if (count == 0) return error.InvalidState;
+        try self.writable(key, true);
+        var candidate = self.metadata;
+        const base = @max(candidate.issued_through, floor);
+        candidate.issued_through = std.math.add(u64, base, count) catch return error.GenerationExhausted;
+        const raw = candidate.encode();
+        const encoded = try package.prepareHeadUpdate(&self.durable, self.context, .{ .metadata = &raw, .frontier = self.durable.get(.props, issuer.frontier_key).? }, self.head.expiry_floor_ms, key);
+        var batch = try self.durable.prepareBatch(&.{ .{ .family = .props, .kind = .put, .key = issuer.metadata_key, .value = &raw }, encoded.mutation() });
+        defer batch.abort();
+        try batch.commit();
+        self.metadata = candidate;
+        self.head = encoded.head;
+        return .{ .epoch = candidate.epoch, .counter = base + 1 };
+    }
+
     /// Call BEFORE an irreversible expiry projection. A failed or ambiguous
     /// commit cannot advance the in-memory floor. The caller controls cadence;
     /// this leaf does not write on every wall-clock read.
@@ -580,6 +601,33 @@ test "mesh presence authority atomically provisions reserves publishes and advan
     var restored = try image.stageRestore(std.testing.allocator, &cold.durable, context, .{});
     defer restored.deinit();
     try std.testing.expectEqualDeep(cold.head, restored.head);
+}
+
+test "mesh presence authority block reservation honours its floor, never reissues, and survives cold boot" {
+    var tmp = try testTmpDir();
+    defer tmp.cleanup();
+    var key = try sign.KeyPair.fromSeed(@splat(132));
+    defer key.deinit();
+    const context = contextFor(&key);
+    {
+        var owner = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "authority.wal", context, @splat(2), &key, 1000, .{});
+        defer owner.deinit();
+        const first = try owner.reserveSubjectBlock(&key, 8, 1 << 32);
+        try std.testing.expectEqualDeep(wire.Subject{ .epoch = 1, .counter = (1 << 32) + 1 }, first);
+        const second = try owner.reserveSubjectBlock(&key, 8, 1 << 32);
+        try std.testing.expectEqual(first.counter + 8, second.counter);
+        try std.testing.expectEqual(second.counter + 7, owner.metadata.issued_through);
+        const single = try owner.reserveSubject(&key);
+        try std.testing.expectEqual(second.counter + 8, single.counter);
+        try std.testing.expectError(error.InvalidState, owner.reserveSubjectBlock(&key, 0, 0));
+        var restored = try image.stageRestore(std.testing.allocator, &owner.durable, context, .{});
+        defer restored.deinit();
+        try std.testing.expectEqualDeep(owner.head, restored.head);
+    }
+    var cold = try Authority.openCold(std.testing.allocator, std.testing.io, tmp.dir, "authority.wal", context, &key, 500, .{});
+    defer cold.deinit();
+    const after = try cold.reserveSubjectBlock(&key, 4, 0);
+    try std.testing.expectEqualDeep(wire.Subject{ .epoch = 2, .counter = 1 }, after);
 }
 
 test "mesh presence authority Windows holds its private cold directory after caller close" {
