@@ -839,8 +839,8 @@ pub const Service = struct {
         }
         // Live path: in-daemon RSS-over-TLS fetch. crypto/tls_client verifies
         // both ECDSA and RSA leaf certs (the RSA leaf-key dangle that previously
-        // failed rsa_pss hosts like NPR/Guardian is fixed). It is TLS-1.3 only,
-        // so a TLS-1.2-only host would still fail — `news_cache_dir` +
+        // failed rsa_pss hosts like NPR/Guardian is fixed). http_fetch prefers
+        // TLS 1.3 and falls back to TLS 1.2; `news_cache_dir` +
         // tools/news_update.sh remain available for guaranteed full coverage.
         if (!self.tryFetchNews(k)) self.noteFetchFailure(.news, k);
     }

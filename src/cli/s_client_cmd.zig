@@ -294,6 +294,10 @@ const Step = enum { more, closed };
 /// Decrypt one record and act on it.
 fn onRecord(gpa: Allocator, io: std.Io, stream: net.Stream, client: *tls_client.Client, rec: []const u8, out: *Writer) !Step {
     const read = client.decryptApp(rec) catch |err| switch (err) {
+        error.EndOfStream => {
+            try out.writeAll("\nclosed by peer (close_notify)\n");
+            return .closed;
+        },
         error.TlsAlert => {
             const alert = client.last_alert;
             if (alert) |al| {

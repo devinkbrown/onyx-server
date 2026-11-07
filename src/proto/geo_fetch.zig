@@ -632,10 +632,12 @@ fn parseIso8601(s: []const u8) ?i64 {
 fn parseRfc822(s: []const u8) ?i64 {
     var rest = s;
     if (std.mem.indexOfScalar(u8, rest, ',')) |comma| rest = std.mem.trim(u8, rest[comma + 1 ..], " \t");
-    if (rest.len < 11 or rest[2] != ' ') return null;
-    const day = std.fmt.parseInt(u32, rest[0..2], 10) catch return null;
-    const month = monthNum(rest[3..]) orelse return null;
-    rest = std.mem.trim(u8, rest[6..], " ");
+    // RFC 5322 §3.3: day = ([FWS] 1*2DIGIT FWS), so "7 Nov 2026" is valid.
+    const day_len: usize = if (rest.len > 1 and rest[1] == ' ') 1 else 2;
+    if (rest.len < day_len + 9 or rest[day_len] != ' ') return null;
+    const day = std.fmt.parseInt(u32, rest[0..day_len], 10) catch return null;
+    const month = monthNum(rest[day_len + 1 ..]) orelse return null;
+    rest = std.mem.trim(u8, rest[day_len + 4 ..], " ");
     if (rest.len < 4) return null;
     const year = std.fmt.parseInt(i32, rest[0..4], 10) catch return null;
     rest = std.mem.trim(u8, rest[4..], " ");
@@ -1084,4 +1086,12 @@ test "packHeadline decodes markup, entities, and collapsed space" {
     const view = unpackHeadline(line);
     try std.testing.expectEqualStrings("Tom’s win", view.title);
     try std.testing.expectEqualStrings("Jane’s note… today", view.deck);
+}
+
+test "parseRfc822 accepts a one-digit day (RFC 5322 section 3.3)" {
+    const two = parseRfc822("Sat, 07 Nov 2026 10:00:00 GMT").?;
+    try std.testing.expectEqual(two, parseRfc822("Sat, 7 Nov 2026 10:00:00 GMT").?);
+    try std.testing.expectEqual(two - 3600, parseRfc822("7 Nov 2026 10:00:00 +0100").?);
+    try std.testing.expect(parseRfc822("Sat, 7Nov 2026 10:00:00 GMT") == null);
+    try std.testing.expect(parseRfc822("Sat, 7 Nov") == null);
 }

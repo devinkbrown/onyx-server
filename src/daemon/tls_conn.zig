@@ -537,6 +537,19 @@ pub const TlsConn = struct {
     pub fn enableKtlsTx(self: *TlsConn, fd: linux.fd_t) KtlsError!void {
         if (!self.outputBoundaryClean() or self.control_phase != .none or self.tx_ku_reply_pending or self.control_turn_active) return error.KtlsUnsupportedEngine;
         if (comptime builtin.os.tag == .freebsd) {
+            if (self.engine == .tls12) {
+                const p12 = self.engine.tls12.ktlsTxParams() orelse return error.KtlsUnsupportedEngine;
+                kernel_other.enableKernelTls12(
+                    @intCast(fd),
+                    .tx,
+                    freebsdKtlsCipher(p12.cipher),
+                    p12.key,
+                    p12.fixed_iv,
+                    ktls.seqToBytes(p12.seq),
+                ) catch return error.KtlsTxUnsupported;
+                self.markTxOffloaded();
+                return;
+            }
             const params = switch (self.engine) {
                 .tls13 => |*s| s.ktlsTxParams() orelse return error.KtlsUnsupportedEngine,
                 .undecided, .tls12 => return error.KtlsUnsupportedEngine,
@@ -582,6 +595,19 @@ pub const TlsConn = struct {
         if (!self.outputBoundaryClean() or self.control_phase != .none or self.tx_ku_reply_pending or self.control_turn_active) return error.KtlsUnsupportedEngine;
         if (self.hasBufferedInbound()) return error.KtlsDirtyInbound;
         if (comptime builtin.os.tag == .freebsd) {
+            if (self.engine == .tls12) {
+                const p12 = self.engine.tls12.ktlsRxParams() orelse return error.KtlsUnsupportedEngine;
+                kernel_other.enableKernelTls12(
+                    @intCast(fd),
+                    .rx,
+                    freebsdKtlsCipher(p12.cipher),
+                    p12.key,
+                    p12.fixed_iv,
+                    ktls.seqToBytes(p12.seq),
+                ) catch return error.KtlsRxUnsupported;
+                self.ktls_rx_offloaded = true;
+                return;
+            }
             const params = switch (self.engine) {
                 .tls13 => |*s| s.ktlsRxParams() orelse return error.KtlsUnsupportedEngine,
                 .undecided, .tls12 => return error.KtlsUnsupportedEngine,

@@ -213,9 +213,10 @@ pub fn httpsRequest(
         while (frameRecordLen(pending.items)) |rec_len| {
             const rec = pending.items[0..rec_len];
             const read = tc.decryptApp(rec) catch |err| switch (err) {
-                // A trailing alert (close_notify, sent with Connection: close)
-                // ends the stream; the HTTP response we already have is final.
-                error.TlsAlert => break :read_loop,
+                // close_notify (RFC 8446 §6.1) is a clean end of stream; the
+                // HTTP response we already have is final. Any other alert is
+                // an error, not an end of file.
+                error.EndOfStream => break :read_loop,
                 else => {
                     tls_client_failure.sendFatal(fd, &tc, err);
                     return err;

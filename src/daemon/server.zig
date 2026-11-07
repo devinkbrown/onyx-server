@@ -81886,6 +81886,12 @@ const PortableServer = struct {
             };
         }
     }
+    /// Cooperative stop (DIE/RESTART, console/service hooks): clear the run
+    /// flag. `runOnce` reaps with a 200 ms timeout, so the loop observes the
+    /// clear without a wake; symbol parity with `LinuxServer.requestStop`.
+    pub fn requestStop(_: *PortableServer, run: *std.atomic.Value(bool)) void {
+        run.store(false, .release);
+    }
     pub fn runtimeFailure(self: *const PortableServer) ?ServerError {
         return self.runtime_failure;
     }
