@@ -203,8 +203,7 @@ pub const Driver = struct {
         var total_len: usize = 0;
         for (manifested.pieces) |piece| {
             var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
-            var cap = capsule.make(piece.kind, &fields);
-            if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
+            const cap = live.pieceCapsule(piece, &fields);
             const encoded_len = try capsule.encodedLen(cap);
             if (encoded_len > live.max_arena_bytes - total_len) return error.ArenaTooLarge;
             total_len += encoded_len;
@@ -214,8 +213,7 @@ pub const Driver = struct {
         try plaintext.ensureTotalCapacityPrecise(self.allocator, total_len);
         for (manifested.pieces) |piece| {
             var fields = [_]capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
-            var cap = capsule.make(piece.kind, &fields);
-            if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
+            const cap = live.pieceCapsule(piece, &fields);
             const encoded = try capsule.encode(self.allocator, cap);
             defer {
                 std.crypto.secureZero(u8, encoded);

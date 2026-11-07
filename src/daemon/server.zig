@@ -40934,6 +40934,7 @@ pub const LinuxServer = struct {
             // refused before exec. A TLS socket must never reach the successor
             // without its crypto state.
             var tls_blob: ?[]u8 = null;
+            var tls_blob_version: u16 = tls_snapshot.schema_version;
             if (e.value.tls) |t| {
                 if (e.value.tls_ingress_active or e.value.tls_progress_active or e.value.tls_alert_pending or e.value.tls_discard_unsent) {
                     skip = "TLS record processing or alert in progress";
@@ -40955,7 +40956,12 @@ pub const LinuxServer = struct {
                     .kernel_tx_prefix_remaining = e.value.tls_kernel_prefix_remaining,
                 }) catch continue;
                 defer capture.deinit();
-                tls_blob = tls_snapshot.encode(self.allocator, tlsCaptureSnapshot(e.value, &capture)) catch continue;
+                // Helix rollback: write the lowest exact schema (v3 unless the
+                // row carries a TLS 1.2 binding/offload) so a v3-only
+                // successor (0.10.4) still adopts the common case.
+                const tls_row = tlsCaptureSnapshot(e.value, &capture);
+                tls_blob_version = tls_snapshot.minimalVersion(tls_row);
+                tls_blob = tls_snapshot.encodeVersion(self.allocator, tls_row, tls_blob_version) catch continue;
             }
             var snap = e.value.session.snapshot();
             snap.fd = e.value.fd; // re-attached by the successor
@@ -41092,7 +41098,7 @@ pub const LinuxServer = struct {
                     self.allocator.free(blob);
                     continue;
                 };
-                pieces.append(self.allocator, .{ .kind = .tls_session, .bytes = tb }) catch {
+                pieces.append(self.allocator, .{ .kind = .tls_session, .bytes = tb, .version = tls_blob_version }) catch {
                     self.allocator.free(blob);
                     continue;
                 };
@@ -93354,8 +93360,7 @@ fn encodeUpgradeStreamWithWidenedHeaderForTest(
     var accumulator = handoff_manifest.Accumulator.init();
     for (pieces) |piece| {
         var fields = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
-        var cap = helix_capsule.make(piece.kind, &fields);
-        if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
+        var cap = helix_live.pieceCapsule(piece, &fields);
         if (piece.kind == widened_kind) cap.header.max_supported +|= 1;
         try accumulator.add(.{
             .header = .{
@@ -93393,8 +93398,7 @@ fn encodeUpgradeStreamWithLegacyV3SessionsForTest(
     var accumulator = handoff_manifest.Accumulator.init();
     for (pieces) |piece| {
         var fields = [_]helix_capsule.Field{.{ .ordinal = 1, .bytes = piece.bytes }};
-        var cap = helix_capsule.make(piece.kind, &fields);
-        if (piece.min_supported) |minimum| cap.header.min_supported = minimum;
+        var cap = helix_live.pieceCapsule(piece, &fields);
         if (piece.kind == .sessions) {
             cap.header.version = 3;
             cap.header.min_supported = 1;
