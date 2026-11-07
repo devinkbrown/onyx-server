@@ -251,17 +251,36 @@ raw_public_key = false
 # The daemon only enables it when the kernel advertises the TLS ULP; otherwise
 # TLS stays userspace.
 ktls = "off"
+# ALPN ids the IRC listener may select, in preference order. Clients that send
+# no ALPN, or only other ids, still connect; [] turns ALPN off. The browser
+# WebSocket listener selects only "http/1.1".
+alpn = ["irc"]
+# RFC 8879 zlib certificate compression for clients that offer it.
+cert_compression = false
+# Refuse a chain whose certificate signatures the client did not advertise in
+# signature_algorithms_cert (self-signed and trust-anchor certs are exempt).
+enforce_cert_signature_algorithms = false
+# Session-ticket lifetime in seconds (or "12h"), 1..604800. Omit to keep the
+# engine defaults (TLS 1.3: 86400, TLS 1.2: 7200).
+# ticket_lifetime = 86400
+# Largest Mooring mesh password accepted in the mesh handshake (1..65535).
+# Must cover [mesh] mesh_pass. Applied at process start.
+# mooring_max_meshpass_len = 4096
+# Trace outbound TLS client handshakes (ACME, OCSP, Web Push, feeds) to stderr.
+debug_log = false
 # Additional SNI-selectable certificates. Each entry is loaded with the same
 # cert/key loader as the default certificate and is validated before the TLS
 # listener is wired. A bad entry disables TLS startup rather than running with a
-# partial certificate set.
+# partial certificate set. On Linux and OpenBSD, REHASH and ACME renewal reload
+# these together with the default certificate, all or nothing.
 # [[tls.sni]]
 # server_names = ["irc.example.net", "*.example.net"]
 # cert_path = "/etc/onyx-server/tls/example.pem"
 # key_path  = "/etc/onyx-server/tls/example.key"
 # Server-side Encrypted Client Hello acceptance. The ECHConfigList is published
 # out-of-band (for example DNS HTTPS RR); the daemon only consumes the local copy
-# and the matching X25519 HPKE private key. Omit to keep ECH off.
+# and the matching X25519 HPKE private key. Omit to keep ECH off. A client whose
+# ECH cannot be decrypted is sent every configured ECHConfig as retry_configs.
 # [[tls.ech_keys]]
 # config_path = "/etc/onyx-server/tls/echconfig.bin"
 # private_key = "0000000000000000000000000000000000000000000000000000000000000000"

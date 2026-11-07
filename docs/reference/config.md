@@ -57,6 +57,7 @@ other edited settings unchanged in the running process.
 | `[class.<name>]`, `[[opers]]` and their privilege-group resolution | REHASH rebuilds the corresponding registries. |
 | `[wasm]` directory, limits, capabilities, intents, pins and kill switches | REHASH repoints policy and rescans plugins. |
 | `tls.cert_path`, `tls.key_path`, `tls.dns_name` | Certificate reload for new handshakes; existing transports keep their negotiated state. ACME-enabled path changes are unsupported. |
+| `[[tls.sni]]`, `[[tls.ech_keys]]` (Linux and OpenBSD) | Reloaded in the same transaction as the default certificate, on REHASH and on ACME renewal. Every file is read and the complete set is checked before anything is published; one bad entry keeps the whole current set serving and the reload reports failure. Handshakes already in progress keep the material they started with. Native Windows binds these into its static Helix proof, so there they still need a restart. |
 | Listener address/ports and `tls.enabled` | REHASH does not rebuild listeners. Other supported edits can apply successfully while the existing sockets remain unchanged. Listener compatibility is enforced separately by UPGRADE/Helix preflight and `--check-config --against`; use cold maintenance for incompatible changes. |
 | `node.id`, `mesh.realm` and node-identity material | These are not ordinary live identity replacements. A retained boot policy that requires the identity capability causes REHASH to validate the prospective identity and refuse an incompatible change; a legacy/empty policy does not provide that universal refusal. Use the documented identity/cold-maintenance workflow and verify the actual active identity. |
 | Other fields, including service constructors, cloak policy, reactor count, recording, WebAuthn and OCG2 mode | Startup-only unless a specific live path proves otherwise. Validate the replacement and use the compatible process-replacement strategy; a startup-only classification alone does not prove Helix compatibility. |
@@ -846,10 +847,43 @@ Source: struct at `src/daemon/config_format.zig`, parsing at `src/daemon/config_
 | `early_data_max_size` | integer | `0` | `0..4294967295` | Maximum TLS 1.3 0-RTT bytes advertised in issued tickets. `0` disables early data while still allowing resumption (`src/daemon/config_format.zig`, `src/daemon/config_boot.zig`). |
 | `raw_public_key` | bool | `false` | `true` or `false` | Enables RFC 7250 raw-public-key negotiation. When true, a client that offers `server_certificate_type=RawPublicKey` may receive the active leaf's bare SubjectPublicKeyInfo instead of the X.509 chain. With `request_client_cert = true`, a client that offers `client_certificate_type=RawPublicKey` may present a bare SPKI for SASL EXTERNAL CertFP. Default off keeps X.509 handshakes byte-identical. |
 | `ktls` | string | `"off"` | `"off"`, `"tx"`, `"txrx"` | Requests Linux kTLS offload on the implicit TLS listener. `tx` offloads server-to-client TLS 1.3 encryption; `txrx` also offloads client-to-server decryption. The daemon only enables offload when the running kernel advertises the TLS ULP; otherwise TLS remains userspace. TLS 1.2 is not offloaded. |
-| `[[tls.sni]]` | array of tables | empty | `server_names`, `cert_path`, `key_path` | Adds SNI-selectable certificate material. Each entry is loaded with the same cert/key loader as the default leaf, validated before the listener is wired, and handed to the TLS engine as a `tls_server.SniCert`. A bad entry disables TLS startup rather than running a half-configured listener. |
-| `[[tls.ech_keys]]` | array of tables | empty | `config_path` plus 64-hex-character `private_key` (32 decoded bytes) | Opt-in server ECH acceptance. `config_path` is a single-entry ECHConfigList file; `private_key` is the matching X25519 HPKE recipient key. Bad files or key/config mismatches disable TLS at boot before the listener is wired. Empty keeps ECH off and preserves existing ClientHelloOuter behavior. |
+| `alpn` | array of strings | `["irc"]` | up to 8 distinct ids, each 1..255 bytes; `[]` turns ALPN off | ALPN ids the IRC TLS listener may select, in preference order. A client that sends no ALPN, or only ids not listed, still completes the handshake: the server leaves ALPN out of its reply and sends no alert. The browser WebSocket listener selects only `http/1.1` while ALPN is on. Applies to the TLS 1.3 and TLS 1.2 legs; on the 1.2 leg a malformed ALPN extension is a decode error. |
+| `cert_compression` | bool | `false` | `true` or `false` | RFC 8879 certificate compression (zlib) for clients that offer it. The compressed form is sent only when it is smaller. |
+| `enforce_cert_signature_algorithms` | bool | `false` | `true` or `false` | Refuse the handshake (`handshake_failure`) when the chain's non-self-signed certificate signatures use an algorithm the client did not list in `signature_algorithms_cert` (or `signature_algorithms` when that is absent). Self-signed and trust-anchor certificates are exempt. |
+| `ticket_lifetime` | integer seconds or duration string | engine default (TLS 1.3: 86400, TLS 1.2: 7200) | `1..604800` seconds; strings use `s`, `m`, `h` (`"12h"`) | Lifetime advertised in issued session tickets on both legs. Only matters with `enable_resumption = true`. RFC 8446 caps it at 7 days. |
+| `mooring_max_meshpass_len` | integer | `4096` | `1..65535` | Largest Mooring mesh password accepted in the mesh handshake, in both directions. Must be at least the length of `[mesh] mesh_pass`, or the config is refused. Applied once at process start; change it with a restart or Helix. |
+| `debug_log` | bool | `false` | `true` or `false` | Trace outbound TLS client handshakes (ACME, OCSP, Web Push, feeds) to stderr: states, message types, lengths and error names, never key material. Applied once at process start. |
+| `[[tls.sni]]` | array of tables | empty | `server_names`, `cert_path`, `key_path` | Adds SNI-selectable certificate material. Each entry is loaded with the same cert/key loader as the default leaf, validated before the listener is wired, and handed to the TLS engine as a `tls_server.SniCert`. A bad entry disables TLS startup rather than running a half-configured listener. Reloaded with the default certificate on REHASH and ACME renewal (not on native Windows). |
+| `[[tls.ech_keys]]` | array of tables | empty | `config_path` plus 64-hex-character `private_key` (32 decoded bytes) | Opt-in server ECH acceptance. `config_path` is a single-entry ECHConfigList file; `private_key` is the matching X25519 HPKE recipient key. Bad files or key/config mismatches disable TLS at boot before the listener is wired. Empty keeps ECH off and preserves existing ClientHelloOuter behavior. When keys are present, a client whose ECH the server cannot decrypt receives every configured ECHConfig as `retry_configs`. Reloaded with the default certificate on REHASH and ACME renewal (not on native Windows). |
+
+`tls.ratchet_max_skip` and `tls.treekem_max_members` were removed. They only
+ever tuned the double-ratchet and TreeKEM modules, which the daemon does not
+use, so they never had an effect; a config that still sets either is refused
+with a message naming the key.
 
 Onyx Server has no STARTTLS path. TLS is a separate implicit-TLS listener (`src/main.zig`, `src/daemon/dispatch.zig`).
+
+### TLS metrics
+
+When `[metrics] listen` is set, `/metrics` carries these series for the client
+TLS listeners (`src/daemon/server_stats.zig`, `src/daemon/server.zig`). Every
+label set is fixed, so unknown suites, groups and errors fold into `other`.
+Counters reset when the process image changes (restart or Helix).
+
+| Series | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `onyx_tls_handshake_failures_total` | counter | `reason`: `peer_alert`, `protocol_version`, `no_shared_group`, `no_shared_cipher`, `bad_record`, `certificate`, `bad_handshake`, `ech`, `resource`, `other` | Handshakes that ended in an error. Record faults after a completed handshake are not counted. |
+| `onyx_tls_handshakes_total` | counter | `version`: `tls13`, `tls12` | Completed handshakes. |
+| `onyx_tls_handshake_cipher_total` | counter | `suite`: IANA suite name or `other` | Completed handshakes by cipher suite. |
+| `onyx_tls_handshake_group_total` | counter | `group`: `x25519mlkem768`, `x25519`, `secp256r1`, `other` | Full (non-resumed) TLS 1.3 handshakes by key-exchange group. |
+| `onyx_tls_resumptions_total` | counter | `version` | Handshakes that resumed a session ticket. |
+| `onyx_tls_early_data_total` | counter | `result`: `accepted`, `rejected` | TLS 1.3 0-RTT offers by outcome. |
+| `onyx_tls_ktls_offloads_total` | counter | `direction`: `tx`, `rx` | Connections whose record crypto moved into the kernel. |
+| `onyx_tls_ktls_active` | gauge | none | Open client connections with kernel TLS in either direction. |
+| `onyx_tls_ocsp_staple_status` | gauge | `status`: `none`, `good`, `expired` | Exactly one is 1. `good` means a validated staple is being served. |
+| `onyx_tls_ocsp_staple_age_seconds` | gauge | none | Seconds since the staple's `thisUpdate`. Present only while a staple is held. |
+| `onyx_tls_ocsp_staple_expires_in_seconds` | gauge | none | Seconds until the staple stops being served. Present only while a staple is held. |
+| `onyx_tls_certificate_expiry_days` | gauge | `source`: `default`, `tls12`, `sni`; `server_name` (first `server_names` entry for SNI) | Whole days until the serving leaf's `notAfter`, negative once expired. Read from the live chains, so it works without `[acme]`. |
 
 ### `[[tls.sni]]` entry fields
 

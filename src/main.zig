@@ -616,7 +616,7 @@ fn validateWindowsCompanionInputs(allocator: std.mem.Allocator, io: std.Io, cfg:
         for (sni_certs) |cert| try validateTlsIdentity(cert.cert_chain, cert.signing_key, cert.ecdsa_p256_signing_key, cert.rsa_signing_key);
 
         if (cfg.tls.ech_keys.len != 0) {
-            var ech = try loadTlsEchKeys(allocator, io, cfg.tls.ech_keys);
+            var ech = try onyx_server.daemon.tls_ech_load.load(allocator, io, cfg.tls.ech_keys);
             defer ech.deinit(allocator);
             var probe = try onyx_server.crypto.tls_server.Server.init(allocator, .{
                 .cert_chain = loaded.cert_chain,
@@ -809,56 +809,6 @@ fn validateTlsIdentity(
             if (signing_key != null or ecdsa_key != null or !std.mem.eql(u8, public.modulus, private.n) or !std.mem.eql(u8, public.exponent, private.e)) return error.TlsKeyMismatch;
         },
     }
-}
-
-const LoadedEchKeys = struct {
-    configs: [][]u8 = &.{},
-    keys: []onyx_server.crypto.tls_server.EchKey = &.{},
-
-    fn deinit(self: *LoadedEchKeys, allocator: std.mem.Allocator) void {
-        for (self.keys) |*key| std.crypto.secureZero(u8, &key.private_key);
-        allocator.free(self.keys);
-        for (self.configs) |bytes| allocator.free(bytes);
-        allocator.free(self.configs);
-        self.* = .{};
-    }
-};
-
-fn loadTlsEchKeys(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    defs: []const onyx_server.daemon.config_format.Config.EchKeyDef,
-) !LoadedEchKeys {
-    var configs: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (configs.items) |bytes| allocator.free(bytes);
-        configs.deinit(allocator);
-    }
-    var keys: std.ArrayList(onyx_server.crypto.tls_server.EchKey) = .empty;
-    errdefer {
-        for (keys.items) |*key| std.crypto.secureZero(u8, &key.private_key);
-        keys.deinit(allocator);
-    }
-
-    for (defs) |def| {
-        const config = try std.Io.Dir.cwd().readFileAlloc(io, def.config_path, allocator, .limited(64 * 1024));
-        var config_unlisted = true;
-        errdefer if (config_unlisted) allocator.free(config);
-        try configs.append(allocator, config);
-        config_unlisted = false;
-        try keys.append(allocator, .{ .config = config, .private_key = def.private_key });
-    }
-
-    const key_slice = try keys.toOwnedSlice(allocator);
-    errdefer {
-        for (key_slice) |*key| std.crypto.secureZero(u8, &key.private_key);
-        allocator.free(key_slice);
-    }
-    const config_slice = try configs.toOwnedSlice(allocator);
-    return .{
-        .configs = config_slice,
-        .keys = key_slice,
-    };
 }
 
 /// Services → live-world bridge: a channel registration marks the live channel
@@ -2650,8 +2600,12 @@ pub fn main(init: std.process.Init) !void {
     }
     var tls_sni_certs: []onyx_server.crypto.tls_server.SniCert = &.{};
     defer if (tls_sni_certs.len != 0) allocator.free(tls_sni_certs);
-    var tls_ech_loaded: ?LoadedEchKeys = null;
+    var tls_ech_loaded: ?onyx_server.daemon.tls_ech_load.Loaded = null;
     defer if (tls_ech_loaded) |*e| e.deinit(allocator);
+    // Process-wide `[tls]` knobs (Mooring mesh-password cap, outbound TLS
+    // client tracing) apply before any mesh link or outbound client exists,
+    // whether or not the TLS listener itself is enabled.
+    if (held) |h| onyx_server.daemon.config_boot.applyTlsProcessKnobs(h.tls);
     if (held) |h| {
         if (h.tls.enabled) {
             const tls_options: onyx_server.daemon.tls_certs.Options = .{
@@ -2714,7 +2668,7 @@ pub fn main(init: std.process.Init) !void {
                     std.debug.print("onyx-server: {d} SNI certificate(s) loaded\n", .{tls_sni_certs.len});
                 }
                 if (h.tls.ech_keys.len != 0) {
-                    tls_ech_loaded = loadTlsEchKeys(allocator, init.io, h.tls.ech_keys) catch |err| {
+                    tls_ech_loaded = onyx_server.daemon.tls_ech_load.load(allocator, init.io, h.tls.ech_keys) catch |err| {
                         if (builtin.os.tag == .windows or managed_prelude != null or native_incoming != null) return err;
                         std.debug.print("onyx-server: [[tls.ech_keys]] load failed ({s}); TLS disabled\n", .{@errorName(err)});
                         break :tls_material;
@@ -2726,6 +2680,7 @@ pub fn main(init: std.process.Init) !void {
                         .rsa_signing_key = tls_loaded.?.rsa_signing_key,
                         .sni_certs = tls_sni_certs,
                         .ech_keys = tls_ech_loaded.?.keys,
+                        .ech_retry_config_list = tls_ech_loaded.?.retry_config_list,
                     }) catch |err| {
                         if (builtin.os.tag == .windows or managed_prelude != null or native_incoming != null) return err;
                         std.debug.print("onyx-server: [[tls.ech_keys]] validation failed ({s}); TLS disabled\n", .{@errorName(err)});
@@ -2740,7 +2695,14 @@ pub fn main(init: std.process.Init) !void {
                 srv_cfg.tls_rsa_signing_key = tls_loaded.?.rsa_signing_key;
                 srv_cfg.tls_ecdsa_signing_key = tls_loaded.?.ecdsa_p256_signing_key;
                 srv_cfg.tls_sni_certs = tls_sni_certs;
-                if (tls_ech_loaded) |e| srv_cfg.tls_ech_keys = e.keys;
+                if (tls_ech_loaded) |e| {
+                    srv_cfg.tls_ech_keys = e.keys;
+                    srv_cfg.tls_ech_retry_config_list = e.retry_config_list;
+                }
+                srv_cfg.tls_alpn_protocols = h.tls.alpn;
+                srv_cfg.tls_cert_compression = h.tls.cert_compression;
+                srv_cfg.tls_enforce_cert_signature_algorithms = h.tls.enforce_cert_signature_algorithms;
+                srv_cfg.tls_ticket_lifetime_seconds = h.tls.ticket_lifetime_seconds;
                 srv_cfg.tls_raw_public_key = h.tls.raw_public_key;
                 srv_cfg.tls_request_client_cert = h.tls.request_client_cert;
                 srv_cfg.tls_enable_resumption = h.tls.enable_resumption;

@@ -344,6 +344,176 @@ pub const Stats = struct {
     }
 };
 
+/// TLS listener counters. Every label set is a fixed enum, so a hostile peer
+/// cannot grow the exposition: unknown suites, groups and error names fold
+/// into `other`. All recording is an atomic add; rendering is a cold path.
+pub const TlsStats = struct {
+    const AtomicU64 = std.atomic.Value(u64);
+
+    /// Why a handshake failed, by the engine error that ended it.
+    pub const FailureClass = enum {
+        peer_alert,
+        protocol_version,
+        no_shared_group,
+        no_shared_cipher,
+        bad_record,
+        certificate,
+        bad_handshake,
+        ech,
+        resource,
+        other,
+    };
+
+    pub const Version = enum { tls13, tls12 };
+
+    pub const Group = enum { x25519mlkem768, x25519, secp256r1, other };
+
+    /// IANA names the engines report through `cipherName()`.
+    pub const suite_names = [_][]const u8{
+        "TLS_AES_128_GCM_SHA256",
+        "TLS_AES_256_GCM_SHA384",
+        "TLS_CHACHA20_POLY1305_SHA256",
+        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    };
+    const suite_slots = suite_names.len + 1; // + other
+
+    pub const Completed = struct {
+        version: Version,
+        suite_name: ?[]const u8,
+        /// Negotiated (EC)DHE group wire value; null when not applicable
+        /// (TLS 1.2 is not split by group).
+        group: ?u16 = null,
+        resumed: bool = false,
+        early_data_offered: bool = false,
+        early_data_accepted: bool = false,
+    };
+
+    pub const KtlsDirection = enum { tx, rx };
+
+    failures: [@typeInfo(FailureClass).@"enum".field_names.len]AtomicU64 = @splat(.init(0)),
+    versions: [@typeInfo(Version).@"enum".field_names.len]AtomicU64 = @splat(.init(0)),
+    suites: [suite_slots]AtomicU64 = @splat(.init(0)),
+    groups: [@typeInfo(Group).@"enum".field_names.len]AtomicU64 = @splat(.init(0)),
+    resumptions: [@typeInfo(Version).@"enum".field_names.len]AtomicU64 = @splat(.init(0)),
+    early_data_accepted: AtomicU64 = .init(0),
+    early_data_rejected: AtomicU64 = .init(0),
+    ktls_offloads: [@typeInfo(KtlsDirection).@"enum".field_names.len]AtomicU64 = @splat(.init(0)),
+
+    pub fn classifyFailure(err: anyerror) FailureClass {
+        if (err == error.TlsAlert) return .peer_alert;
+        if (err == error.ProtocolVersion or err == error.InappropriateFallback) return .protocol_version;
+        if (err == error.UnsupportedGroup) return .no_shared_group;
+        if (err == error.UnsupportedCipherSuite) return .no_shared_cipher;
+        if (err == error.BadRecord or err == error.RecordAuthenticationFailed or
+            err == error.RecordOverflow or err == error.AuthFailed) return .bad_record;
+        if (err == error.NoCertificate or err == error.NoCompatibleCertificate or
+            err == error.BadCertificate or err == error.CertificateVerifyFailed or
+            err == error.LeafKeyMismatch or err == error.NoSigningKey or
+            err == error.BadDelegatedCredential) return .certificate;
+        if (err == error.BadHandshake or err == error.MissingExtension or
+            err == error.FinishedMismatch or err == error.BadState or
+            err == error.UnexpectedMessage or err == error.DecodeError or
+            err == error.Truncated) return .bad_handshake;
+        if (err == error.EchHrrUnsupported or err == error.BadEchConfig) return .ech;
+        if (err == error.OutOfMemory) return .resource;
+        return .other;
+    }
+
+    pub fn onHandshakeFailure(self: *TlsStats, err: anyerror) void {
+        _ = self.failures[@backingInt(classifyFailure(err))].fetchAdd(1, .monotonic);
+    }
+
+    pub fn failureCount(self: *const TlsStats, class: FailureClass) u64 {
+        return self.failures[@backingInt(class)].load(.acquire);
+    }
+
+    fn suiteSlot(name: ?[]const u8) usize {
+        const n = name orelse return suite_names.len;
+        for (suite_names, 0..) |known, index| {
+            if (std.mem.eql(u8, known, n)) return index;
+        }
+        return suite_names.len;
+    }
+
+    fn groupOf(wire: u16) Group {
+        return switch (wire) {
+            0x11ec => .x25519mlkem768,
+            0x001d => .x25519,
+            0x0017 => .secp256r1,
+            else => .other,
+        };
+    }
+
+    pub fn onHandshakeComplete(self: *TlsStats, done: Completed) void {
+        _ = self.versions[@backingInt(done.version)].fetchAdd(1, .monotonic);
+        _ = self.suites[suiteSlot(done.suite_name)].fetchAdd(1, .monotonic);
+        if (done.group) |wire| _ = self.groups[@backingInt(groupOf(wire))].fetchAdd(1, .monotonic);
+        if (done.resumed) _ = self.resumptions[@backingInt(done.version)].fetchAdd(1, .monotonic);
+        if (done.early_data_accepted) {
+            _ = self.early_data_accepted.fetchAdd(1, .monotonic);
+        } else if (done.early_data_offered) {
+            _ = self.early_data_rejected.fetchAdd(1, .monotonic);
+        }
+    }
+
+    pub fn onKtlsOffload(self: *TlsStats, direction: KtlsDirection) void {
+        _ = self.ktls_offloads[@backingInt(direction)].fetchAdd(1, .monotonic);
+    }
+
+    fn header(allocator: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, help: []const u8) !void {
+        try out.print(allocator, "# HELP {s} {s}\n# TYPE {s} counter\n", .{ name, help, name });
+    }
+
+    /// Append the counters as Prometheus exposition text. Every series is
+    /// always present (zero until observed) so dashboards see a stable schema.
+    pub fn writePrometheus(self: *const TlsStats, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try header(allocator, out, "onyx_tls_handshake_failures_total", "TLS handshakes that ended in an error, by error class");
+        inline for (@typeInfo(FailureClass).@"enum".field_names, 0..) |name, index| {
+            try out.print(allocator, "onyx_tls_handshake_failures_total{{reason=\"{s}\"}} {d}\n", .{ name, self.failures[index].load(.acquire) });
+        }
+        try header(allocator, out, "onyx_tls_handshakes_total", "Completed TLS handshakes by negotiated protocol version");
+        inline for (@typeInfo(Version).@"enum".field_names, 0..) |name, index| {
+            try out.print(allocator, "onyx_tls_handshakes_total{{version=\"{s}\"}} {d}\n", .{ name, self.versions[index].load(.acquire) });
+        }
+        try header(allocator, out, "onyx_tls_handshake_cipher_total", "Completed TLS handshakes by negotiated cipher suite");
+        for (0..suite_slots) |index| {
+            const name = if (index < suite_names.len) suite_names[index] else "other";
+            try out.print(allocator, "onyx_tls_handshake_cipher_total{{suite=\"{s}\"}} {d}\n", .{ name, self.suites[index].load(.acquire) });
+        }
+        try header(allocator, out, "onyx_tls_handshake_group_total", "Completed TLS 1.3 full handshakes by key exchange group");
+        inline for (@typeInfo(Group).@"enum".field_names, 0..) |name, index| {
+            try out.print(allocator, "onyx_tls_handshake_group_total{{group=\"{s}\"}} {d}\n", .{ name, self.groups[index].load(.acquire) });
+        }
+        try header(allocator, out, "onyx_tls_resumptions_total", "TLS handshakes that resumed a session ticket");
+        inline for (@typeInfo(Version).@"enum".field_names, 0..) |name, index| {
+            try out.print(allocator, "onyx_tls_resumptions_total{{version=\"{s}\"}} {d}\n", .{ name, self.resumptions[index].load(.acquire) });
+        }
+        try header(allocator, out, "onyx_tls_early_data_total", "TLS 1.3 0-RTT offers by outcome");
+        try out.print(allocator, "onyx_tls_early_data_total{{result=\"accepted\"}} {d}\n", .{self.early_data_accepted.load(.acquire)});
+        try out.print(allocator, "onyx_tls_early_data_total{{result=\"rejected\"}} {d}\n", .{self.early_data_rejected.load(.acquire)});
+        try header(allocator, out, "onyx_tls_ktls_offloads_total", "TLS connections whose record crypto moved into the kernel, by direction");
+        inline for (@typeInfo(KtlsDirection).@"enum".field_names, 0..) |name, index| {
+            try out.print(allocator, "onyx_tls_ktls_offloads_total{{direction=\"{s}\"}} {d}\n", .{ name, self.ktls_offloads[index].load(.acquire) });
+        }
+    }
+};
+
+/// Write one Prometheus label value with the exposition-format escapes
+/// (backslash, double quote, newline). Other bytes pass through.
+pub fn writePromLabelValue(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    for (value) |byte| switch (byte) {
+        '\\' => try out.appendSlice(allocator, "\\\\"),
+        '"' => try out.appendSlice(allocator, "\\\""),
+        '\n' => try out.appendSlice(allocator, "\\n"),
+        else => try out.append(allocator, byte),
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -489,4 +659,62 @@ test "session publication counters expose accepted reasons separately from attem
     // A successor constructs Stats afresh; these totals never infer authority.
     const successor = Stats{};
     try testing.expectEqual(@as(u64, 0), successor.sessionPublicationCount(.retry_attempt));
+}
+
+test "TlsStats classifies handshake errors into a bounded reason set" {
+    try testing.expectEqual(TlsStats.FailureClass.peer_alert, TlsStats.classifyFailure(error.TlsAlert));
+    try testing.expectEqual(TlsStats.FailureClass.protocol_version, TlsStats.classifyFailure(error.ProtocolVersion));
+    try testing.expectEqual(TlsStats.FailureClass.no_shared_group, TlsStats.classifyFailure(error.UnsupportedGroup));
+    try testing.expectEqual(TlsStats.FailureClass.no_shared_cipher, TlsStats.classifyFailure(error.UnsupportedCipherSuite));
+    try testing.expectEqual(TlsStats.FailureClass.bad_record, TlsStats.classifyFailure(error.RecordAuthenticationFailed));
+    try testing.expectEqual(TlsStats.FailureClass.certificate, TlsStats.classifyFailure(error.NoCompatibleCertificate));
+    try testing.expectEqual(TlsStats.FailureClass.bad_handshake, TlsStats.classifyFailure(error.FinishedMismatch));
+    try testing.expectEqual(TlsStats.FailureClass.ech, TlsStats.classifyFailure(error.EchHrrUnsupported));
+    try testing.expectEqual(TlsStats.FailureClass.resource, TlsStats.classifyFailure(error.OutOfMemory));
+    try testing.expectEqual(TlsStats.FailureClass.other, TlsStats.classifyFailure(error.SomethingNobodyNamed));
+}
+
+test "TlsStats renders version, suite, group, resumption, 0-RTT and kTLS series" {
+    const allocator = testing.allocator;
+    var s = TlsStats{};
+    s.onHandshakeComplete(.{ .version = .tls13, .suite_name = "TLS_AES_128_GCM_SHA256", .group = 0x11ec });
+    s.onHandshakeComplete(.{ .version = .tls13, .suite_name = "TLS_AES_256_GCM_SHA384", .resumed = true, .early_data_offered = true, .early_data_accepted = true });
+    s.onHandshakeComplete(.{ .version = .tls13, .suite_name = "TLS_AES_256_GCM_SHA384", .resumed = true, .early_data_offered = true });
+    s.onHandshakeComplete(.{ .version = .tls12, .suite_name = "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" });
+    s.onHandshakeComplete(.{ .version = .tls13, .suite_name = "TLS_FUTURE_SUITE", .group = 0x9999 });
+    s.onHandshakeFailure(error.UnsupportedGroup);
+    s.onHandshakeFailure(error.UnsupportedGroup);
+    s.onKtlsOffload(.tx);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try s.writePrometheus(allocator, &out);
+    for ([_][]const u8{
+        "# TYPE onyx_tls_handshake_failures_total counter\n",
+        "onyx_tls_handshake_failures_total{reason=\"no_shared_group\"} 2\n",
+        "onyx_tls_handshake_failures_total{reason=\"peer_alert\"} 0\n",
+        "onyx_tls_handshakes_total{version=\"tls13\"} 4\n",
+        "onyx_tls_handshakes_total{version=\"tls12\"} 1\n",
+        "onyx_tls_handshake_cipher_total{suite=\"TLS_AES_256_GCM_SHA384\"} 2\n",
+        "onyx_tls_handshake_cipher_total{suite=\"other\"} 1\n",
+        "onyx_tls_handshake_group_total{group=\"x25519mlkem768\"} 1\n",
+        "onyx_tls_handshake_group_total{group=\"other\"} 1\n",
+        "onyx_tls_resumptions_total{version=\"tls13\"} 2\n",
+        "onyx_tls_early_data_total{result=\"accepted\"} 1\n",
+        "onyx_tls_early_data_total{result=\"rejected\"} 1\n",
+        "onyx_tls_ktls_offloads_total{direction=\"tx\"} 1\n",
+        "onyx_tls_ktls_offloads_total{direction=\"rx\"} 0\n",
+    }) |needle| {
+        if (std.mem.indexOf(u8, out.items, needle) == null) {
+            std.debug.print("missing: {s}", .{needle});
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+test "writePromLabelValue escapes exposition metacharacters" {
+    const allocator = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try writePromLabelValue(allocator, &out, "a\"b\\c\nd");
+    try testing.expectEqualStrings("a\\\"b\\\\c\\nd", out.items);
 }
