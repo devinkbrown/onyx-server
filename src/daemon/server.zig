@@ -73042,17 +73042,27 @@ pub const LinuxServer = struct {
         // route authority (not carried). Restarting at revision 1 with a fresh
         // claim would be obsolete at a peer holding a higher revision, or
         // quarantined forever at one holding revision 1 with another body.
-        // Continue the carried history instead: next revision, same claim.
+        // Continue the carried history with a fresh claim two revisions on:
+        // the carried claim may name an older nick (NICK publishes only at the
+        // next burst, and the Helix snapshot does not carry the published
+        // nick), and consistentProgress requires a same-claim successor to keep
+        // the exact nick. A new claim with claim_revision = revision >= carried
+        // + 2 and a strictly newer claim_hlc is admitted whether or not the
+        // nick changed, and whether the peer holds the carried revision or an
+        // older undelivered one (mesh_presence_v2.consistentProgress).
         if (prior == null and conn.guest_revision != 0 and conn.guest_claim_revision != 0 and conn.guest_claim_hlc != 0) {
-            revision = mesh_presence_v2.nextRevision(conn.guest_revision) catch return;
-            claim_hlc = conn.guest_claim_hlc;
-            claim_revision = conn.guest_claim_revision;
+            const next = mesh_presence_v2.nextRevision(conn.guest_revision) catch return;
+            revision = mesh_presence_v2.nextRevision(next) catch return;
+            claim_revision = revision;
+            claim_hlc = @max(self.nextMeshHlc(), conn.guest_claim_hlc +| 1);
         }
         if (prior) |kept| {
             revision = kept.revision;
             claim_hlc = kept.claim_hlc;
             claim_revision = kept.claim_revision;
-            const nick_changed = !std.ascii.eqlIgnoreCase(kept.nick, nick);
+            // Exact compare: consistentProgress keeps a claim only for the
+            // byte-identical nick, so a case-only rename needs a new claim.
+            const nick_changed = !std.mem.eql(u8, kept.nick, nick);
             const host_changed = !std.mem.eql(u8, kept.host, identity.host);
             const remaining = if (kept.expires_ms > now) kept.expires_ms - now else 0;
             if (nick_changed or host_changed or remaining < guest_presence_renew_margin_ms) {
@@ -188068,13 +188078,25 @@ test "Helix adopt: a carried published durable guest continues its revision hist
     server.guest_presence = null;
     const carried_claim_hlc = conn.guest_claim_hlc;
     server.publishOrdinaryGuest(conn, false);
-    try std.testing.expectEqual(@as(u64, 2), conn.guest_revision);
-    try std.testing.expectEqual(carried_claim_hlc, conn.guest_claim_hlc);
+    try std.testing.expectEqual(@as(u64, 3), conn.guest_revision);
+    try std.testing.expectEqual(@as(u64, 3), conn.guest_claim_revision);
+    try std.testing.expect(conn.guest_claim_hlc > carried_claim_hlc);
     const continued = server.guest_presence.?.retainedByGuest(origin, conn.guest_id) orelse return error.TestUnexpectedResult;
     // Before the fix this was revision 1 with a fresh claim: quarantined.
     try std.testing.expectEqual(guest_presence_route.Disposition.updated, try peer.admit(continued.wire, &roots, now, 7, false));
     const seen = peer.liveByGuest(origin, conn.guest_id, now) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("Ariadne", seen.nick);
+
+    // A NICK that was never published before the next Helix (the carried
+    // claim names "Ariadne") must not be quarantined at the peer either.
+    server.guest_presence.?.destroy();
+    server.guest_presence = null;
+    try conn.session.setNick("Theseus");
+    server.publishOrdinaryGuest(conn, false);
+    const renamed = server.guest_presence.?.retainedByGuest(origin, conn.guest_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(guest_presence_route.Disposition.updated, try peer.admit(renamed.wire, &roots, now, 7, false));
+    const seen2 = peer.liveByGuest(origin, conn.guest_id, now) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Theseus", seen2.nick);
 }
 
 test "Helix adopt: a password OPER's TLS backlog over the successor user cap is admitted, not refused" {
