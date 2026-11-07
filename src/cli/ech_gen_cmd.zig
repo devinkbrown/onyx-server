@@ -162,7 +162,8 @@ pub fn run(gpa: Allocator, io: std.Io, opts: Options, out: *Writer) !void {
 
     var hex_buf: [hpke.secret_key_len * 2 + 1]u8 = undefined;
     defer std.crypto.secureZero(u8, &hex_buf);
-    const hex = std.fmt.bytesToHex(kp.secret_key, .lower);
+    var hex = std.fmt.bytesToHex(kp.secret_key, .lower);
+    defer std.crypto.secureZero(u8, &hex);
     @memcpy(hex_buf[0..hex.len], &hex);
     hex_buf[hex.len] = '\n';
 

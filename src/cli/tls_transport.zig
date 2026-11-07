@@ -99,6 +99,29 @@ pub fn readRecord(gpa: Allocator, io: std.Io, stream: net.Stream, rr: *RecordRea
     }
 }
 
+/// `readRecord` with a deadline: fails with `error.HandshakeTimeout` when no
+/// full record has arrived by `deadline_ms` (`std.Io.Clock.awake`
+/// milliseconds). Waits with poll(2) rather than SO_RCVTIMEO, which std.Io
+/// treats as an impossible EAGAIN. Windows falls back to `readRecord`.
+pub fn readRecordBy(gpa: Allocator, io: std.Io, stream: net.Stream, rr: *RecordReader, deadline_ms: i64) !?[]const u8 {
+    if (comptime @import("builtin").os.tag == .windows) return readRecord(gpa, io, stream, rr);
+    const posix = std.posix;
+    var scratch: [16 * 1024]u8 = undefined;
+    while (true) {
+        if (try rr.next()) |rec| return rec;
+        const left = deadline_ms - std.Io.Clock.awake.now(io).toMilliseconds();
+        if (left <= 0) return error.HandshakeTimeout;
+        var fds = [_]posix.pollfd{.{ .fd = stream.socket.handle, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&fds, @intCast(@min(left, std.math.maxInt(i32)))) == 0) return error.HandshakeTimeout;
+        const n = try readSome(io, stream, &scratch);
+        if (n == 0) {
+            if (rr.hasPartial()) return error.TruncatedRecord;
+            return null;
+        }
+        try rr.push(gpa, scratch[0..n]);
+    }
+}
+
 /// Write every byte of `bytes` to `stream`.
 pub fn sendAll(io: std.Io, stream: net.Stream, bytes: []const u8) !void {
     var w = stream.writer(io, &.{});

@@ -66,7 +66,8 @@ pub fn usage(w: *Writer) Writer.Error!void {
         \\  -name <dns>         hostname to verify (default: SNI)
         \\  -CAfile <bundle>    PEM trust anchors (required)
         \\  -alpn p1,p2         offer ALPN protocols, in preference order
-        \\  -ech <file>         ECHConfigList (binary or base64) to encrypt the ClientHello
+        \\  -ech <file>         ECHConfigList (binary or base64) to encrypt the ClientHello;
+        \\                      fails if no config is usable or the server rejects ECH
         \\  -dc                 offer delegated credentials (RFC 9345)
         \\  -ign_eof            on stdin EOF, wait for the server to close (no half-close)
         \\  -brief             print the session and exit (no stdin relay)
@@ -154,7 +155,15 @@ pub fn run(gpa: Allocator, io: std.Io, opts: Options, out: *Writer) !void {
     // TCP segment with the handshake flight and must not be dropped.
     var rr: transport.RecordReader = .{};
     defer rr.deinit(gpa);
-    try handshake(gpa, io, stream, &client, &rr);
+    handshake(gpa, io, stream, &client, &rr, .{ .require_ech = ech_list != null }) catch |err| {
+        switch (err) {
+            error.EchNotUsable => try out.writeAll("ECH       : no usable ECHConfig in -ech file; ClientHello not sent\n"),
+            error.EchRejected => try writeEchRejection(&client, out),
+            else => {},
+        }
+        try out.flush();
+        return err;
+    };
     try writeSession(&client, out);
     try out.flush();
 
@@ -165,13 +174,28 @@ pub fn run(gpa: Allocator, io: std.Io, opts: Options, out: *Writer) !void {
     }
 }
 
+pub const HandshakeOptions = struct {
+    /// The caller supplied an ECHConfigList, so ECH is mandatory: a list with
+    /// no usable config must not fall back to a cleartext inner SNI, and a
+    /// server rejection must abort (RFC 9849 §6.1.6).
+    require_ech: bool = false,
+};
+
 /// Drive the handshake over `stream`, one record at a time. On an engine
 /// failure the matching fatal alert is sent before the error returns. Records
 /// after the server Finished stay in `rr` for the caller.
-pub fn handshake(gpa: Allocator, io: std.Io, stream: net.Stream, client: *tls_client.Client, rr: *transport.RecordReader) !void {
+///
+/// With `require_ech`, fails with `error.EchNotUsable` before anything is
+/// written when `tls_client` found no usable ECHConfig (it would otherwise
+/// send an ordinary ClientHello carrying the real SNI), and with
+/// `error.EchRejected` after sending an `ech_required` alert when the server
+/// rejected ECH: then only the ECHConfig `public_name` was authenticated, so
+/// the connection must not be used for the requested name (RFC 9849 §6.1.6).
+pub fn handshake(gpa: Allocator, io: std.Io, stream: net.Stream, client: *tls_client.Client, rr: *transport.RecordReader, hs: HandshakeOptions) !void {
     {
         const hello = try client.start();
         defer gpa.free(hello);
+        if (hs.require_ech and !client.echOffered()) return error.EchNotUsable;
         try transport.sendAll(io, stream, hello);
     }
     while (!client.handshakeDone()) {
@@ -193,6 +217,76 @@ pub fn handshake(gpa: Allocator, io: std.Io, stream: net.Stream, client: *tls_cl
     }
     // Whole records were fed one at a time, so the engine holds nothing back.
     if (client.pendingBytes().len != 0) return error.UnexpectedRecord;
+    // RFC 9849 §6.1.6: after a rejection the handshake authenticated only the
+    // outer public_name; the client MUST abort with ech_required.
+    if (client.echOffered() and client.echAccepted() != true) {
+        if (sealEchRequiredAlert(gpa, client)) |alert| {
+            defer gpa.free(alert);
+            transport.sendAll(io, stream, alert) catch {};
+        } else |_| {}
+        return error.EchRejected;
+    }
+}
+
+/// RFC 9849 §11.2 AlertDescription ech_required.
+pub const alert_ech_required: u8 = 121;
+
+/// Seal a fatal `ech_required` alert under the client application traffic
+/// keys (the client Finished has already been sent, RFC 8446 §7.1 / §5.2).
+/// `tls_client.takeAlert` has no ech_required mapping, so this seals the one
+/// record locally with the engine's current write keys and sequence number;
+/// the connection is torn down right after, so the engine's own sequence
+/// counter is advanced only for consistency.
+pub fn sealEchRequiredAlert(gpa: Allocator, client: *tls_client.Client) ![]u8 {
+    const tls_record = onyx_server.crypto.tls_record;
+    const suite = client.selected_suite orelse return error.BadState;
+    if (!client.handshakeDone()) return error.BadState;
+    const seq = client.app_write_seq;
+    if (seq == std.math.maxInt(u64)) return error.BadState;
+    const body = [_]u8{ 2, alert_ech_required }; // fatal(2), RFC 8446 §6
+    // TLSInnerPlaintext: content || ContentType.alert(21), no padding (§5.2).
+    const inner = body ++ [_]u8{21};
+    const keys = &client.client_app_keys;
+    const tag_len: usize = 16;
+    const out = try gpa.alloc(u8, tls_record.record_header_len + inner.len + tag_len);
+    errdefer gpa.free(out);
+    const aad = tls_record.makeAdditionalData(@intCast(inner.len + tag_len));
+    @memcpy(out[0..tls_record.record_header_len], &aad);
+    const nonce = tls_record.deriveNonce(keys.iv, seq);
+    const ct = out[tls_record.record_header_len..][0..inner.len];
+    var tag: [16]u8 = undefined;
+    switch (suite) {
+        .tls_aes_128_gcm_sha256 => {
+            const A = std.crypto.aead.aes_gcm.Aes128Gcm;
+            A.encrypt(ct, &tag, &inner, &aad, nonce, keys.key[0..A.key_length].*);
+        },
+        .tls_aes_256_gcm_sha384 => {
+            const A = std.crypto.aead.aes_gcm.Aes256Gcm;
+            A.encrypt(ct, &tag, &inner, &aad, nonce, keys.key[0..A.key_length].*);
+        },
+        .tls_chacha20_poly1305_sha256 => {
+            const A = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+            A.encrypt(ct, &tag, &inner, &aad, nonce, keys.key[0..A.key_length].*);
+        },
+    }
+    @memcpy(out[tls_record.record_header_len + inner.len ..], &tag);
+    client.app_write_seq = seq + 1;
+    return out;
+}
+
+/// Report an ECH rejection: the inner name was never authenticated, and the
+/// server's retry_configs (authenticated by the public_name certificate,
+/// RFC 9849 §6.1.6) are printed in the DNS HTTPS `ech=` base64 form for a
+/// retry with `-ech`.
+fn writeEchRejection(client: *const tls_client.Client, out: *Writer) !void {
+    try out.writeAll("ECH       : rejected by server; aborted with ech_required (inner name not verified)\n");
+    if (client.echRetryConfigs()) |rc| {
+        try out.writeAll("retry_configs: ");
+        try std.base64.standard.Encoder.encodeWriter(out, rc);
+        try out.writeByte('\n');
+    } else {
+        try out.writeAll("retry_configs: (none)\n");
+    }
 }
 
 const Step = enum { more, closed };
@@ -619,6 +713,10 @@ const Fixture = struct {
 };
 
 fn writeFixture(gpa: Allocator, tmp: *std.testing.TmpDir, buf: *[1024]u8, seed: u8) !Fixture {
+    return writeFixtureNames(gpa, tmp, buf, seed, &.{ "localhost", "cover.example" });
+}
+
+fn writeFixtureNames(gpa: Allocator, tmp: *std.testing.TmpDir, buf: *[1024]u8, seed: u8, dns_names: []const []const u8) !Fixture {
     const io = testing.io;
     const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(seed)));
     const now = common.wallClockSeconds();
@@ -628,7 +726,7 @@ fn writeFixture(gpa: Allocator, tmp: *std.testing.TmpDir, buf: *[1024]u8, seed: 
         .not_after = now + 30 * 86400,
         .serial = &.{seed},
         .key_pair = kp,
-        .dns_names = &.{ "localhost", "cover.example" },
+        .dns_names = dns_names,
         .is_ca = true,
         .delegation_usage = true,
         .key_usage_digital_signature = true,
@@ -651,9 +749,10 @@ const ServerThread = struct {
     cfg: tls_server.Config,
     log: Writer.Allocating,
     err: ?anyerror = null,
+    handshake_timeout_ms: u32 = s_server_cmd.default_handshake_timeout_ms,
 
     fn main(self: *ServerThread) void {
-        s_server_cmd.serveListener(self.gpa, testing.io, &self.listener, self.cfg, 1, &self.log.writer) catch |e| {
+        s_server_cmd.serveListener(self.gpa, testing.io, &self.listener, self.cfg, .{ .naccept = 1, .handshake_timeout_ms = self.handshake_timeout_ms }, &self.log.writer) catch |e| {
             self.err = e;
         };
     }
@@ -792,6 +891,103 @@ test "armorcli s_client -ech against s_server with ech-gen keys is accepted" {
     try testing.expect(std.mem.indexOf(u8, st.log.written(), "ECH       : accepted") != null);
 }
 
+test "armorcli s_client -ech aborts with ech_required when the server rejects ECH" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [1024]u8 = undefined;
+    // The server holds only the cover certificate: a rejected handshake can
+    // authenticate public_name, never the requested inner name.
+    var fx = try writeFixtureNames(gpa, &tmp, &buf, 0x46, &.{"cover.example"});
+    defer fx.deinit(gpa);
+
+    var paths: [4][]u8 = undefined;
+    for ([_][]const u8{ "client.bin", "client.key", "server.bin", "server.key" }, 0..) |n, i| {
+        paths[i] = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, n });
+    }
+    defer for (paths) |p| gpa.free(p);
+    var gen_out = Writer.Allocating.init(gpa);
+    defer gen_out.deinit();
+    // Client config and server key come from two different ech-gen runs.
+    try ech_gen_cmd.run(gpa, io, try ech_gen_cmd.parseArgs(&.{ "-public-name", "cover.example", "-config-out", paths[0], "-key-out", paths[1], "-config-id", "1" }), &gen_out.writer);
+    try ech_gen_cmd.run(gpa, io, try ech_gen_cmd.parseArgs(&.{ "-public-name", "cover.example", "-config-out", paths[2], "-key-out", paths[3], "-config-id", "2" }), &gen_out.writer);
+
+    var key = try ech_gen_cmd.readKeyFile(gpa, io, paths[3]);
+    defer std.crypto.secureZero(u8, &key);
+    var loaded = try onyx_server.daemon.tls_ech_load.load(gpa, io, &.{.{ .config_path = paths[2], .private_key = key }});
+    defer loaded.deinit(gpa);
+
+    var st: ServerThread = undefined;
+    const thread = try startServer(gpa, &st, .{
+        .cert_chain = &.{fx.der},
+        .signing_key = fx.kp,
+        .ech_keys = loaded.keys,
+        .ech_retry_config_list = loaded.retry_config_list,
+    });
+    defer {
+        st.listener.deinit(io);
+        st.log.deinit();
+    }
+    var connect_buf: [32]u8 = undefined;
+    const connect = try std.fmt.bufPrint(&connect_buf, "127.0.0.1:{d}", .{st.listener.socket.address.getPort()});
+    var aw = Writer.Allocating.init(gpa);
+    defer aw.deinit();
+    var opts = try parseArgs(&.{ "-connect", connect, "-servername", "secret.example", "-CAfile", fx.cert_path, "-ech", paths[0] });
+    opts.input = .{ .bytes = "PASSWORD hunter2" };
+    const result = run(gpa, io, opts, &aw.writer);
+    thread.join();
+    if (st.err) |e| return e;
+
+    try testing.expectError(error.EchRejected, result);
+    const w = aw.written();
+    try testing.expect(std.mem.indexOf(u8, w, "rejected by server; aborted with ech_required") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "Verify return code") == null);
+    try testing.expect(std.mem.indexOf(u8, w, "SNI       :") == null);
+    try testing.expect(std.mem.indexOf(u8, w, "hunter2") == null);
+    // The server's retry_configs are reported for a retry.
+    var b64_buf: [512]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&b64_buf, loaded.retry_config_list);
+    try testing.expect(std.mem.indexOf(u8, w, b64) != null);
+    // The server decrypted our alert (an alert ends the echo loop cleanly) and
+    // received no application data.
+    const log = st.log.written();
+    try testing.expect(std.mem.indexOf(u8, log, "ECH       : not accepted") != null);
+    try testing.expect(std.mem.indexOf(u8, log, "DONE echoed 0 bytes") != null);
+}
+
+test "armorcli s_client -ech with no usable config sends nothing" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [1024]u8 = undefined;
+    var fx = try writeFixture(gpa, &tmp, &buf, 0x47);
+    defer fx.deinit(gpa);
+    // Passes the 2-byte length check but holds no parseable ECHConfig.
+    try tmp.dir.writeFile(io, .{ .sub_path = "junk.bin", .data = &[_]u8{ 0x00, 0x03, 0xaa, 0xbb, 0xcc } });
+    const junk_path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/junk.bin", .{tmp.sub_path});
+    defer gpa.free(junk_path);
+
+    var st: ServerThread = undefined;
+    const thread = try startServer(gpa, &st, .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp });
+    defer {
+        st.listener.deinit(io);
+        st.log.deinit();
+    }
+    var connect_buf: [32]u8 = undefined;
+    const connect = try std.fmt.bufPrint(&connect_buf, "127.0.0.1:{d}", .{st.listener.socket.address.getPort()});
+    var aw = Writer.Allocating.init(gpa);
+    defer aw.deinit();
+    const result = run(gpa, io, try parseArgs(&.{ "-connect", connect, "-servername", "localhost", "-CAfile", fx.cert_path, "-ech", junk_path, "-brief" }), &aw.writer);
+    thread.join();
+    if (st.err) |e| return e;
+    try testing.expectError(error.EchNotUsable, result);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "ClientHello not sent") != null);
+    // The server saw EOF before any record: no cleartext SNI left the client.
+    try testing.expect(std.mem.indexOf(u8, st.log.written(), "connection error: ConnectionClosed") != null);
+}
+
 test "armorcli s_client -dc verifies a dc_mint credential served by s_server" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -827,6 +1023,78 @@ test "armorcli s_client -dc verifies a dc_mint credential served by s_server" {
     thread.join();
     if (st.err) |e| return e;
     try testing.expect(std.mem.indexOf(u8, aw.written(), "Delegated : used") != null);
+}
+
+test "armorcli s_server refuses a -key or -dc-key of the right type that does not match" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp_a = testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    var tmp_b = testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    var buf_a: [1024]u8 = undefined;
+    var fx = try writeFixture(gpa, &tmp_a, &buf_a, 0x48);
+    defer fx.deinit(gpa);
+    var buf_b: [1024]u8 = undefined;
+    var wrong = try writeFixture(gpa, &tmp_b, &buf_b, 0x49); // another Ed25519 key
+    defer wrong.deinit(gpa);
+    var aw = Writer.Allocating.init(gpa);
+    defer aw.deinit();
+
+    try testing.expectError(error.LeafKeyMismatch, s_server_cmd.run(gpa, io, try s_server_cmd.parseArgs(&.{
+        "-accept", "127.0.0.1:0", "-cert", fx.cert_path, "-key", wrong.key_path, "-naccept", "1",
+    }), &aw.writer));
+
+    // An Ed25519 DC served with a different Ed25519 -dc-key.
+    const dc_mint = onyx_server.daemon.delegated_credential_cli.dc_mint;
+    var minted = try dc_mint.mint(gpa, io, .{
+        .leaf_der = fx.der,
+        .leaf_key = .{ .ed25519 = fx.kp },
+        .dc_algorithm = .ed25519,
+        .now_unix = common.wallClockSeconds(),
+        .lifetime_seconds = 3600,
+    });
+    defer minted.deinit(gpa);
+    try tmp_a.dir.writeFile(io, .{ .sub_path = "dc.bin", .data = minted.wire });
+    const dc_path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/dc.bin", .{tmp_a.sub_path});
+    defer gpa.free(dc_path);
+    try testing.expectError(error.DcKeyMismatch, s_server_cmd.run(gpa, io, try s_server_cmd.parseArgs(&.{
+        "-accept", "127.0.0.1:0", "-cert",   fx.cert_path,   "-key", fx.key_path,
+        "-dc",     dc_path,       "-dc-key", wrong.key_path,
+    }), &aw.writer));
+    // Nothing was ever listening.
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "ACCEPT") == null);
+}
+
+test "armorcli s_server drops a client that never finishes the handshake" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [1024]u8 = undefined;
+    var fx = try writeFixture(gpa, &tmp, &buf, 0x4a);
+    defer fx.deinit(gpa);
+
+    var st: ServerThread = undefined;
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    st = .{
+        .gpa = gpa,
+        .listener = try addr.listen(io, .{ .reuse_address = true }),
+        .cfg = .{ .cert_chain = &.{fx.der}, .signing_key = fx.kp },
+        .log = .init(gpa),
+        .handshake_timeout_ms = 200,
+    };
+    defer {
+        st.listener.deinit(io);
+        st.log.deinit();
+    }
+    const thread = try std.Thread.spawn(.{}, ServerThread.main, .{&st});
+    // Connect and stay silent; the server must give up on its own.
+    const idle = try transport.connect(io, "127.0.0.1", st.listener.socket.address.getPort());
+    defer idle.close(io);
+    thread.join();
+    if (st.err) |e| return e;
+    try testing.expect(std.mem.indexOf(u8, st.log.written(), "connection error: HandshakeTimeout") != null);
 }
 
 test "armorcli s_client reads ECHConfigList files as binary or base64 and rejects garbage" {

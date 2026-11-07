@@ -68,6 +68,8 @@ pub const Error = error{
     ValidTimeOverflow,
     /// The certificate key type cannot sign a TLS 1.3 DC.
     UnsupportedLeafKey,
+    /// The supplied delegated private key does not match the DC's SPKI.
+    DcKeyMismatch,
 } || std.mem.Allocator.Error ||
     delegated_credential.Error ||
     x509.Error ||
@@ -165,11 +167,51 @@ pub fn mint(allocator: std.mem.Allocator, io: std.Io, opts: MintOptions) Error!M
             break :blk .{ .ed25519 = try Ed25519.KeyPair.generateDeterministic(seed) };
         },
     };
-    errdefer switch (dc_key) {
+    // On success `mintWithKey` returns its own copy inside `Minted`, so this
+    // stack copy is wiped on every path, not only on failure.
+    defer wipeDcKey(&dc_key);
+    return mintWithKey(allocator, opts, dc_key);
+}
+
+fn wipeDcKey(key: *DcPrivateKey) void {
+    switch (key.*) {
         .ecdsa_p256 => |*kp| ecdsa_p256.wipeKeyPair(kp),
         .ed25519 => |*kp| std.crypto.secureZero(u8, std.mem.asBytes(&kp.secret_key)),
-    };
-    return mintWithKey(allocator, opts, dc_key);
+    }
+}
+
+/// Fail with `error.LeafKeyMismatch` unless `key` is the private half of the
+/// SubjectPublicKeyInfo in `leaf_der` (full public-key comparison, not only
+/// the key type). Servers call this at startup so a wrong `-key` fails there
+/// instead of in every handshake's CertificateVerify (RFC 8446 §4.4.3).
+pub fn checkLeafKey(leaf_der: []const u8, key: LeafKey) Error!void {
+    const leaf = try x509.parse(leaf_der);
+    _ = try leafScheme(key, try x509.extractPublicKey(leaf.spki_der));
+}
+
+/// Fail with `error.DcKeyMismatch` unless `key` is the private half of the
+/// delegated SubjectPublicKeyInfo carried in the DC `wire` (RFC 9345 §4:
+/// the server signs CertificateVerify with the DC's private key, and the
+/// client verifies it against `Credential.ASN1_subjectPublicKeyInfo`).
+pub fn checkDcKey(wire: []const u8, key: DcPrivateKey) Error!void {
+    const parsed = try delegated_credential.parse(wire);
+    const dc_pub = try x509.extractPublicKey(parsed.spki);
+    switch (key) {
+        .ed25519 => |kp| {
+            const raw = switch (dc_pub) {
+                .ed25519 => |pk| pk,
+                else => return error.DcKeyMismatch,
+            };
+            if (!std.mem.eql(u8, raw, &kp.public_key.toBytes())) return error.DcKeyMismatch;
+        },
+        .ecdsa_p256 => |kp| {
+            const sec1 = switch (dc_pub) {
+                .ecdsa_p256 => |pk| pk,
+                else => return error.DcKeyMismatch,
+            };
+            if (!std.mem.eql(u8, sec1, &kp.public_key.toUncompressedSec1())) return error.DcKeyMismatch;
+        },
+    }
 }
 
 /// Mint with a caller-chosen delegated key (deterministic tests, HSM-held
@@ -466,6 +508,30 @@ test "dc_mint fails closed without DelegationUsage, digitalSignature, or a match
         .now_unix = now,
         .lifetime_seconds = 3600,
     }));
+}
+
+test "dc_mint checkLeafKey and checkDcKey compare whole public keys, not only key types" {
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x58)));
+    const other = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x59)));
+    var buf: [1024]u8 = undefined;
+    const leaf = try delegationLeaf(&buf, kp, true, true);
+
+    try checkLeafKey(leaf, .{ .ed25519 = kp });
+    // Same type (Ed25519), different key.
+    try testing.expectError(error.LeafKeyMismatch, checkLeafKey(leaf, .{ .ed25519 = other }));
+    try testing.expectError(error.LeafKeyMismatch, checkLeafKey(leaf, .{ .ecdsa_p256 = ecdsa_p256.KeyPair.generate(testing.io) }));
+
+    var minted = try mint(testing.allocator, testing.io, .{
+        .leaf_der = leaf,
+        .leaf_key = .{ .ed25519 = kp },
+        .now_unix = t_not_before + 60,
+        .lifetime_seconds = 3600,
+    });
+    defer minted.deinit(testing.allocator);
+    try checkDcKey(minted.wire, minted.private_key);
+    // Same type (P-256), different key.
+    try testing.expectError(error.DcKeyMismatch, checkDcKey(minted.wire, .{ .ecdsa_p256 = ecdsa_p256.KeyPair.generate(testing.io) }));
+    try testing.expectError(error.DcKeyMismatch, checkDcKey(minted.wire, .{ .ed25519 = other }));
 }
 
 test "dc_mint enforces the seven-day cap and the certificate window" {

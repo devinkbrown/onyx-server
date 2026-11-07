@@ -21,6 +21,7 @@ const tls_server = onyx_server.crypto.tls_server;
 const tls_certs = onyx_server.daemon.tls_certs;
 const tls_ech_load = onyx_server.daemon.tls_ech_load;
 const delegated_credential_cli = onyx_server.daemon.delegated_credential_cli;
+const dc_mint = delegated_credential_cli.dc_mint;
 
 const Allocator = std.mem.Allocator;
 const Writer = common.Writer;
@@ -38,6 +39,19 @@ pub const Options = struct {
     ech_key: ?[]const u8 = null,
     dc: ?[]const u8 = null,
     dc_key: ?[]const u8 = null,
+    /// A client that has not finished the handshake within this many
+    /// milliseconds is dropped, so one idle peer cannot stall this
+    /// one-connection-at-a-time server.
+    handshake_timeout_ms: u32 = default_handshake_timeout_ms,
+};
+
+pub const default_handshake_timeout_ms: u32 = 10_000;
+
+/// Per-listener serving limits.
+pub const Limits = struct {
+    /// Stop after this many connections; 0 = serve forever.
+    naccept: u32 = 0,
+    handshake_timeout_ms: u32 = default_handshake_timeout_ms,
 };
 
 pub fn usage(w: *Writer) Writer.Error!void {
@@ -143,6 +157,9 @@ pub fn run(gpa: Allocator, io: std.Io, opts: Options, out: *Writer) !void {
         // tls_certs only reads the key half here; the chain is reused.
         m.dc_key = try tls_certs.loadOrBootstrap(gpa, io, .{ .cert_path = opts.cert.?, .key_path = opts.dc_key.? });
     }
+    // tls_server.Server.init only compares key types; compare the actual
+    // public keys so a wrong -key / -dc-key fails here, not per handshake.
+    try checkKeys(&m);
 
     var alpn_storage: [transport.max_alpn][]const u8 = undefined;
     const alpn: []const []const u8 = if (opts.alpn) |text| try transport.splitAlpn(text, &alpn_storage) else &.{};
@@ -181,17 +198,60 @@ pub fn run(gpa: Allocator, io: std.Io, opts: Options, out: *Writer) !void {
     defer server.deinit(io);
     try out.print("ACCEPT {f}\n", .{server.socket.address});
     try out.flush();
-    try serveListener(gpa, io, &server, cfg, opts.naccept, out);
+    try serveListener(gpa, io, &server, cfg, .{ .naccept = opts.naccept, .handshake_timeout_ms = opts.handshake_timeout_ms }, out);
 }
 
-/// Accept and serve connections sequentially. A failed connection is logged
-/// and does not stop the server; `naccept == 0` serves forever.
-pub fn serveListener(gpa: Allocator, io: std.Io, server: *net.Server, cfg: tls_server.Config, naccept: u32, out: *Writer) !void {
+/// Prove the loaded private keys are the private halves of the certificate
+/// SPKI and of the delegated credential's SPKI (same comparison `dc mint`
+/// uses), not merely keys of the right type.
+fn checkKeys(m: *const Material) !void {
+    const leaf_key: dc_mint.LeafKey = if (m.loaded.ecdsa_p256_signing_key) |kp|
+        .{ .ecdsa_p256 = kp }
+    else if (m.loaded.signing_key) |kp|
+        .{ .ed25519 = kp }
+    else if (m.loaded.rsa_signing_key) |k|
+        .{ .rsa = k }
+    else
+        return error.UnsupportedAlgorithm;
+    try dc_mint.checkLeafKey(m.loaded.cert_chain[0], leaf_key);
+    if (m.dc_key) |k| {
+        const dc_key: dc_mint.DcPrivateKey = if (k.ecdsa_p256_signing_key) |kp|
+            .{ .ecdsa_p256 = kp }
+        else if (k.signing_key) |kp|
+            .{ .ed25519 = kp }
+        else
+            return error.UnsupportedAlgorithm;
+        try dc_mint.checkDcKey(m.dc_wire, dc_key);
+    }
+}
+
+/// Accept and serve connections sequentially. A failed connection, and a
+/// transient accept failure (fd exhaustion, a connection aborted before
+/// accept), is logged and does not stop the server; `naccept == 0` serves
+/// forever.
+pub fn serveListener(gpa: Allocator, io: std.Io, server: *net.Server, cfg: tls_server.Config, limits: Limits, out: *Writer) !void {
     var served: u32 = 0;
-    while (naccept == 0 or served < naccept) : (served += 1) {
-        const stream = try server.accept(io);
+    while (limits.naccept == 0 or served < limits.naccept) {
+        const stream = server.accept(io) catch |err| switch (err) {
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
+            error.SystemResources,
+            error.ConnectionAborted,
+            error.BlockedByFirewall,
+            error.ProtocolFailure,
+            error.WouldBlock,
+            => {
+                try out.print("accept error: {s}\n", .{@errorName(err)});
+                try out.flush();
+                // Back off so fd exhaustion does not spin the CPU.
+                try io.sleep(.fromMilliseconds(100), .awake);
+                continue;
+            },
+            else => return err,
+        };
         defer stream.close(io);
-        serveConnection(gpa, io, stream, cfg, out) catch |err| {
+        served += 1;
+        serveConnection(gpa, io, stream, cfg, limits.handshake_timeout_ms, out) catch |err| {
             try out.print("connection error: {s}\n", .{@errorName(err)});
         };
         try out.flush();
@@ -199,15 +259,17 @@ pub fn serveListener(gpa: Allocator, io: std.Io, server: *net.Server, cfg: tls_s
 }
 
 /// Handshake one accepted stream and echo application data until EOF or an
-/// alert (close_notify included).
-pub fn serveConnection(gpa: Allocator, io: std.Io, stream: net.Stream, cfg: tls_server.Config, out: *Writer) !void {
+/// alert (close_notify included). The handshake must complete within
+/// `handshake_timeout_ms`; the echo phase has no idle limit.
+pub fn serveConnection(gpa: Allocator, io: std.Io, stream: net.Stream, cfg: tls_server.Config, handshake_timeout_ms: u32, out: *Writer) !void {
     var engine = try tls_server.Server.init(gpa, cfg);
     defer engine.deinit();
     var rr: transport.RecordReader = .{};
     defer rr.deinit(gpa);
 
+    const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + @as(i64, handshake_timeout_ms);
     while (!engine.handshakeDone()) {
-        const rec = try transport.readRecord(gpa, io, stream, &rr) orelse return error.ConnectionClosed;
+        const rec = try transport.readRecordBy(gpa, io, stream, &rr, deadline) orelse return error.ConnectionClosed;
         const result = engine.feed(rec) catch |err| {
             if (engine.takeAlert(err)) |alert| {
                 defer gpa.free(alert);

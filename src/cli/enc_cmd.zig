@@ -64,10 +64,16 @@ pub const max_passphrase_bytes: usize = 4096;
 pub const default_kdf: argon2_kdf.Params = .{ .t = 3, .m = 64 * 1024, .p = 4 };
 
 /// Decrypt-side KDF bounds: a hostile header must not be able to demand
-/// unbounded memory or time.
-const max_kdf_t: u32 = 64;
-const max_kdf_m: u32 = 4 * 1024 * 1024; // 4 GiB
-const max_kdf_p: u32 = 64;
+/// excessive memory or time before authentication. `enc` itself only ever
+/// writes `default_kdf` (64 MiB, t=3, p=4); the caps leave 16x headroom on
+/// memory while bounding an attacker-supplied file to one 1 GiB allocation.
+pub const max_kdf_t: u32 = 16;
+pub const max_kdf_m: u32 = 1024 * 1024; // KiB = 1 GiB
+pub const max_kdf_p: u32 = 16;
+comptime {
+    // Files `enc` writes must always decrypt.
+    std.debug.assert(default_kdf.t <= max_kdf_t and default_kdf.m <= max_kdf_m and default_kdf.p <= max_kdf_p);
+}
 
 pub const Cipher = enum(u8) {
     chacha20_poly1305 = 1,
@@ -440,6 +446,19 @@ test "armorcli enc rejects tamper, truncation, extension, reorder, and wrong pas
     // Hostile KDF cost and unknown versions are refused before any KDF work.
     @memcpy(copy, sealed);
     std.mem.writeInt(u32, copy[16..20], 0xffff_ffff, .big);
+    try testing.expectError(error.BadKdfParams, decrypt(gpa, copy, "pw"));
+    // Just over each cap: m > 1 GiB, t > 16, p > 16.
+    @memcpy(copy, sealed);
+    std.mem.writeInt(u32, copy[16..20], max_kdf_m + 1, .big);
+    try testing.expectError(error.BadKdfParams, decrypt(gpa, copy, "pw"));
+    @memcpy(copy, sealed);
+    std.mem.writeInt(u32, copy[16..20], 4 * 1024 * 1024, .big); // 4 GiB, accepted before
+    try testing.expectError(error.BadKdfParams, decrypt(gpa, copy, "pw"));
+    @memcpy(copy, sealed);
+    std.mem.writeInt(u32, copy[12..16], max_kdf_t + 1, .big);
+    try testing.expectError(error.BadKdfParams, decrypt(gpa, copy, "pw"));
+    @memcpy(copy, sealed);
+    std.mem.writeInt(u32, copy[20..24], max_kdf_p + 1, .big);
     try testing.expectError(error.BadKdfParams, decrypt(gpa, copy, "pw"));
     @memcpy(copy, sealed);
     copy[8] = 2;
