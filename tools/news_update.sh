@@ -15,92 +15,132 @@
 # `${#var}` counts characters on busybox and GNU bash alike.
 #
 # Usage:  news_update.sh <output_dir> [max_headlines]
+#         news_update.sh --check [path/to/news_sources.zig]
 # Cron:   */5 * * * * /path/to/news_update.sh /var/lib/onyx-server/news 5
+#
+# The tables below are a copy of the catalogue so the script runs on a host
+# without the source tree. `--check` compares them, entry by entry and in
+# order, with news_sources.zig (default: ../src/proto/news_sources.zig next to
+# this script) and exits 1 on any drift.
 #
 # No API keys. Requires: bash, curl, awk, date. Optional: a feed is simply
 # skipped if it is unreachable, leaving any previously written file intact.
 set -uo pipefail
 
-OUT_DIR="${1:?usage: news_update.sh <output_dir> [max_headlines]}"
-MAX="${2:-5}"
-UA="OnyxServer-news/1 (+https://onyx.local)"
-mkdir -p "$OUT_DIR"
-
 # General sources: key|url  (mirrors news_sources.sources)
 SOURCES=(
-  "abc|https://feeds.abcnews.com/abcnews/topstories"
+  "abc|https://abcnews.com/abcnews/topstories"
   "bbc|https://feeds.bbci.co.uk/news/rss.xml"
   "aljazeera|https://www.aljazeera.com/xml/rss/all.xml"
   "euronews|https://www.euronews.com/rss?level=theme&name=news"
   "guardian|https://www.theguardian.com/world/rss"
   "nyt|https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
   "npr|https://feeds.npr.org/1001/rss.xml"
-  "hill|https://thehill.com/rss/syndicator/19110/"
+  "hill|https://thehill.com/news/feed/"
   "fox|https://moxie.foxnews.com/google-publisher/latest.xml"
   "ars|https://feeds.arstechnica.com/arstechnica/index"
   "verge|https://www.theverge.com/rss/index.xml"
   "wired|https://www.wired.com/feed/rss"
   "techcrunch|https://techcrunch.com/feed/"
   "sciam|https://www.scientificamerican.com/platform/syndication/rss/"
-  "wsj|https://feeds.a.dj.com/rss/RSSWorldNews.xml"
+  "wsj|https://feeds.content.dowjones.io/public/rss/RSSWorldNews"
   "cnbc|https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"
-  "espn|https://www.espn.com/espn/rss/news"
+  "bbcsport|https://feeds.bbci.co.uk/sport/rss.xml"
   "cbssports|https://www.cbssports.com/rss/headlines/"
   "cbs|https://www.cbsnews.com/latest/rss/world"
   "sky|https://feeds.skynews.com/feeds/rss/world.xml"
   "wapo|https://feeds.washingtonpost.com/rss/world"
   "dw|https://rss.dw.com/rdf/rss-en-all"
-  "cnn|https://rss.cnn.com/rss/edition.rss"
 )
 
 # Country feeds: cc|url  (mirrors news_sources.country_feeds)
 COUNTRY_FEEDS=(
   "US|https://feeds.npr.org/1001/rss.xml"
   "GB|https://feeds.bbci.co.uk/news/rss.xml"
-  "CA|https://www.cbc.ca/cmlink/rss-topstories"
-  "AU|https://www.sbs.com.au/news/feed"
-  "NZ|https://www.rnz.co.nz/rss/news.xml"
-  "IE|https://www.rte.ie/news/rss/news-headlines.xml"
+  "CA|https://www.cbc.ca/webfeed/rss/rss-topstories"
+  "AU|https://www.abc.net.au/news/feed/51120/rss.xml"
+  "NZ|https://www.nzherald.co.nz/arc/outboundfeeds/rss/curated/78/?outputType=xml"
+  "IE|https://www.rte.ie/feeds/rss/?index=/news/&limit=20"
   "IN|https://timesofindia.indiatimes.com/rssfeedstopstories.cms"
   "DE|https://www.spiegel.de/international/index.rss"
   "FR|https://www.france24.com/en/rss"
-  "JP|https://www3.nhk.or.jp/nhkworld/en/news/feeds/rss.xml"
-  "BR|https://feeds.bbci.co.uk/portuguese/brasil/rss.xml"
-  "ZA|https://feeds.24.com/articles/news24/TopStories/rss"
-  "KR|https://www.koreaherald.com/rss/01.xml"
+  "JP|https://www.japantimes.co.jp/feed/"
+  "BR|https://feeds.bbci.co.uk/portuguese/rss.xml"
+  "ZA|https://www.dailymaverick.co.za/dmrss/"
+  "KR|https://www.koreaherald.com/rss/newsAll"
   "SG|https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml"
   "PH|https://www.philstar.com/rss/headlines"
-  "PK|https://www.dawn.com/feeds/home"
+  "PK|https://www.geo.tv/rss/1/1"
   "NG|https://www.vanguardngr.com/feed/"
-  "EG|https://egyptindependent.com/feed/"
+  "EG|https://www.egyptindependent.com/feed/"
   "AR|https://buenosairesherald.com/feed"
-  "SE|https://www.thelocal.se/feeds/rss.php"
-  "NO|https://www.thelocal.no/feeds/rss.php"
-  "DK|https://www.thelocal.dk/feeds/rss.php"
-  "FI|https://feeds.yle.fi/uutiset/v1/majorHeadlines/YLE_UUTISET.rss"
+  "SE|https://feeds.thelocal.com/rss/se"
+  "NO|https://feeds.thelocal.com/rss/no"
+  "DK|https://feeds.thelocal.com/rss/dk"
+  "FI|https://yle.fi/rss/t/18-34837/en"
   "NL|https://www.dutchnews.nl/feed/"
-  "CH|https://www.swissinfo.ch/eng/rss/headline_news"
-  "AT|https://www.thelocal.at/feeds/rss.php"
+  "CH|https://www.srf.ch/news/bnf/rss/1646"
+  "AT|https://feeds.thelocal.com/rss/at"
   "RU|https://www.themoscowtimes.com/rss/news"
-  "IL|https://www.jpost.com/rss/rssfeedsheadlines.aspx"
-  "SA|https://www.arabnews.com/rss.xml"
-  "AE|https://www.thenationalnews.com/rss"
-  "GR|https://www.ekathimerini.com/rss"
-  "IT|https://www.thelocal.it/feeds/rss.php"
-  "ES|https://www.thelocal.es/feeds/rss.php"
+  "IL|https://www.jpost.com/rss/rssfeedsfrontpage.aspx"
+  "SA|https://saudigazette.com.sa/rssFeed/74"
+  "AE|https://www.thenationalnews.com/arc/outboundfeeds/rss/?outputType=xml&size=20"
+  "GR|https://www.tovima.com/feed/"
+  "IT|https://feeds.thelocal.com/rss/it"
+  "ES|https://feeds.thelocal.com/rss/es"
   "PT|https://www.theportugalnews.com/rss"
-  "MY|https://www.malaymail.com/feed"
-  "ID|https://www.thejakartapost.com/rss/dailyheadline.xml"
+  "MY|https://www.malaymail.com/feed/rss/malaysia"
+  "ID|https://www.antaranews.com/rss/terkini.xml"
   "TH|https://www.bangkokpost.com/rss/data/topstories.xml"
-  "VN|https://vietnamnews.vn/rss/20.rss"
-  "HK|https://www.scmp.com/rss/91/feed"
-  "TW|https://www.taiwannews.com.tw/ch/rss.php"
+  "VN|https://e.vnexpress.net/rss/news.rss"
+  "HK|https://www.scmp.com/rss/91/feed/"
+  "TW|https://www.taipeitimes.com/xml/index.rss"
   "KE|https://nation.africa/kenya/rss.xml"
-  "MA|https://www.moroccoworldnews.com/feed/"
-  "CL|https://santiagotimes.cl/feed/"
-  "BE|https://www.brusselstimes.com/feed"
-  "CN|https://www.chinadaily.com.cn/rss/cndy_rss.xml"
+  "MA|https://northafricapost.com/feed"
+  "CL|https://www.latercera.com/arc/outboundfeeds/rss/?outputType=xml&size=20"
+  "BE|https://www.vrt.be/vrtnws/en.rss.articles.xml"
+  "CN|https://www.cgtn.com/subscribe/rss/section/china.xml"
 )
+
+# Print `<id>|<url>` for every entry of one table in news_sources.zig.
+# $1 = file, $2 = table name (sources | country_feeds), $3 = id field (key | cc).
+catalogue_table() {
+  sed -n "/^pub const $2 = /,/^};/p" "$1" |
+    sed -n -E "s/.*\\.$3 = \"([^\"]+)\", \\.name = \"[^\"]*\", \\.url = \"([^\"]+)\".*/\\1|\\2/p"
+}
+
+check_catalogue() {
+  local zig="$1" rc=0
+  if [[ ! -r "$zig" ]]; then
+    echo "news_update.sh: cannot read $zig" >&2
+    return 2
+  fi
+  if ! diff -u --label "news_sources.zig sources" --label "news_update.sh SOURCES" \
+    <(catalogue_table "$zig" sources key) <(printf '%s\n' "${SOURCES[@]}"); then
+    rc=1
+  fi
+  if ! diff -u --label "news_sources.zig country_feeds" --label "news_update.sh COUNTRY_FEEDS" \
+    <(catalogue_table "$zig" country_feeds cc) <(printf '%s\n' "${COUNTRY_FEEDS[@]}"); then
+    rc=1
+  fi
+  if [[ $rc -eq 0 ]]; then
+    echo "ok   ${#SOURCES[@]} sources and ${#COUNTRY_FEEDS[@]} country feeds match $zig"
+  fi
+  return $rc
+}
+
+if [[ "${1:-}" == "--check" ]]; then
+  check_catalogue "${2:-$(dirname "$0")/../src/proto/news_sources.zig}"
+  exit $?
+fi
+
+OUT_DIR="${1:?usage: news_update.sh <output_dir> [max_headlines] | --check [news_sources.zig]}"
+MAX="${2:-5}"
+# Same User-Agent and Accept as the daemon (geo_fetch.buildNewsRequest). Some
+# feeds (philstar.com, cbc.ca) stall a request whose UA carries a URL comment.
+UA="onyx-server-news/1"
+ACCEPT="application/rss+xml, application/xml, text/xml"
+mkdir -p "$OUT_DIR"
 
 # Extract up to $MAX items as title<RS>when<RS>deck. RS is ASCII 0x1e and never
 # reaches the cache file. Channel and <image> titles are not items.
@@ -185,7 +225,7 @@ fetch_one() {
   local stem="$1" url="$2"
   local tmp body
   tmp="$(mktemp)"
-  body="$(curl -fsSL --max-time 15 -A "$UA" "$url" 2>/dev/null | extract_items | pack_lines)"
+  body="$(curl -fsSL --max-time 15 -A "$UA" -H "Accept: $ACCEPT" "$url" 2>/dev/null | extract_items | pack_lines)"
   if [[ -n "$body" ]]; then
     printf '# %s — updated %s\n%s\n' "$stem" "$(date -u +%FT%TZ)" "$body" > "$tmp"
     mv -f "$tmp" "$OUT_DIR/$stem.txt"
