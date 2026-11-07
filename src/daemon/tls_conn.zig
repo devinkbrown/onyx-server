@@ -180,6 +180,8 @@ pub const TlsConn = struct {
     /// the same bytes the kernel will encrypt.
     ktls_tx_offloaded: bool = false,
     ktls_rx_offloaded: bool = false,
+    /// One graceful close_notify attempt per connection (`sendCloseNotify`).
+    close_notify_attempted: bool = false,
     rx_open_control_type: u8 = 0,
     alert_prefix_len: u1 = 0,
     alert_prefix_byte: u8 = 0,
@@ -359,6 +361,94 @@ pub const TlsConn = struct {
         self.acme_validation = validation;
     }
 
+    /// Outcome of `sendCloseNotify`.
+    pub const CloseNotifyOutcome = enum {
+        /// Not eligible: handshake incomplete, a fatal alert/terminal failure
+        /// already ended this TLS stream, an output/control turn is open, or a
+        /// close_notify was already attempted.
+        not_applicable,
+        /// The whole alert record was accepted by the socket.
+        sent,
+        /// Eligible, but the socket refused or only partially accepted it.
+        /// Best-effort: the caller closes the transport regardless.
+        dropped,
+    };
+
+    /// True when no fatal alert, terminal failure, open control obligation or
+    /// unpublished/prepared output precludes a graceful closure alert. Callers
+    /// must additionally guarantee that every earlier TX byte reached the
+    /// socket (no queued ciphertext or kernel plaintext tail).
+    pub fn closeNotifyEligible(self: *const TlsConn) bool {
+        // The only terminal input that still permits our alert is the peer's
+        // own close_notify, which RFC 5246 §7.2.1 requires us to answer and
+        // RFC 8446 §6.1 permits (each side closes its own write direction).
+        if (self.terminal_error) |failure| {
+            if (failure != error.TlsAlert or !self.peerSentCloseNotify()) return false;
+        }
+        // The engines report `read_failed` after any terminal input (including
+        // that close_notify); the write direction remains connected.
+        const connected = switch (self.engine) {
+            .undecided => false,
+            .tls13 => |*s| s.state == .connected,
+            .tls12 => |*s| s.state == .connected,
+        };
+        return !self.close_notify_attempted and connected and
+            !self.terminal_alert_attempted and !self.terminal_output_taken and
+            self.unpublished.items.len == 0 and self.control_phase == .none and
+            !self.tx_ku_reply_pending and !self.control_turn_active and !self.hasPreparedWrite();
+    }
+
+    /// Graceful closure (RFC 8446 §6.1, RFC 5246 §7.2.1): emit one
+    /// close_notify warning alert on `fd` before the caller closes it.
+    /// Best-effort and non-blocking (MSG_DONTWAIT): it never waits for socket
+    /// space and never retries, so shutdown is never delayed. At most one
+    /// attempt is made per connection and never after a fatal alert.
+    ///
+    ///   * userspace TX: the engine seals the alert at the next write sequence
+    ///     (`closeNotify`) and the record is written directly;
+    ///   * kTLS TX: the kernel owns the write sequence, so the alert is sent as
+    ///     a kernel control record (`sendmsg` + `SOL_TLS`/`TLS_SET_RECORD_TYPE`
+    ///     = 21, payload {warning(1), close_notify(0)}).
+    ///
+    /// The caller must have drained every earlier TX byte to the socket and
+    /// must own the only send path at this moment (no armed SEND).
+    pub fn sendCloseNotify(self: *TlsConn, fd: linux.fd_t) CloseNotifyOutcome {
+        if (!self.closeNotifyEligible()) return .not_applicable;
+        self.close_notify_attempted = true;
+        if (comptime builtin.os.tag != .linux) return .dropped;
+        const body = [_]u8{ 1, 0 }; // warning(1), close_notify(0)
+        if (self.ktls_tx_offloaded) {
+            const accepted = ktls.sendControl(fd, .alert, &body) catch return .dropped;
+            return if (accepted == body.len) .sent else .dropped;
+        }
+        const record = switch (self.engine) {
+            .tls13 => |*s| s.closeNotify(),
+            .tls12 => |*s| s.closeNotify(),
+            .undecided => return .dropped,
+        } catch return .dropped;
+        defer self.allocator.free(record);
+        while (true) {
+            const rc = linux.sendto(fd, record.ptr, record.len, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL, null, 0);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return if (rc == record.len) .sent else .dropped,
+                .INTR => continue,
+                else => return .dropped,
+            }
+        }
+    }
+
+    /// True when the TLS stream ended because the peer sent close_notify
+    /// (RFC 8446 §6.1 / RFC 5246 §7.2.1): a graceful end of input, not a fault.
+    /// Valid after the engine reported `error.TlsAlert`.
+    pub fn peerSentCloseNotify(self: *const TlsConn) bool {
+        const alert = switch (self.engine) {
+            .undecided => return false,
+            .tls13 => |*s| s.peer_alert,
+            .tls12 => |*s| s.peer_alert,
+        } orelse return false;
+        return alert.description == .close_notify;
+    }
+
     /// True once the chosen engine's handshake has completed.
     pub fn handshakeDone(self: *const TlsConn) bool {
         if (self.terminal_error != null) return false;
@@ -459,7 +549,7 @@ pub const TlsConn = struct {
                 &params.iv,
                 ktls.seqToBytes(params.seq),
             ) catch return error.KtlsTxUnsupported;
-            self.ktls_tx_offloaded = true;
+            self.markTxOffloaded();
             return;
         }
         var buf: [ktls.max_crypto_info_len]u8 = undefined;
@@ -467,7 +557,20 @@ pub const TlsConn = struct {
         const encoded = try self.buildKtlsTxCryptoInfo(&buf);
         try ktls.attachUlp(fd);
         try ktls.attachTx(fd, encoded);
+        self.markTxOffloaded();
+    }
+
+    /// The kernel now owns the server->client write sequence. Tell the engine
+    /// too, so its userspace sealing entry points (`closeNotify`,
+    /// `prepareAppWrite`, `encrypt`) fail closed (BadState) instead of reusing
+    /// a (key, nonce) pair the kernel already consumed.
+    fn markTxOffloaded(self: *TlsConn) void {
         self.ktls_tx_offloaded = true;
+        switch (self.engine) {
+            .tls13 => |*s| s.markTxOffloaded(),
+            .tls12 => |*s| s.markTxOffloaded(),
+            .undecided => {},
+        }
     }
 
     /// Attach Linux kTLS RX offload to `fd`, so the kernel decrypts inbound
@@ -633,7 +736,9 @@ pub const TlsConn = struct {
                     self.alert_prefix_byte = if (total != 0) bytes[0] else 0;
                     return .progress;
                 }
-                _ = @import("../proto/tls_alert.zig").parse(&bytes) catch return error.BadRecord;
+                // Record the kernel-delivered alert like the userspace path, so
+                // a peer close_notify is classified as a clean end of input.
+                engine.peer_alert = @import("../proto/tls_alert.zig").parse(&bytes) catch return error.BadRecord;
                 self.terminal_error = error.TlsAlert;
                 engine.read_failed = true;
                 self.discardTerminalOutput();
@@ -710,7 +815,9 @@ pub const TlsConn = struct {
                     self.alert_prefix_byte = if (total != 0) bytes[0] else 0;
                     return .progress;
                 }
-                _ = @import("../proto/tls_alert.zig").parse(&bytes) catch return error.BadRecord;
+                // Record the kernel-delivered alert like the userspace path, so
+                // a peer close_notify is classified as a clean end of input.
+                engine.peer_alert = @import("../proto/tls_alert.zig").parse(&bytes) catch return error.BadRecord;
                 self.terminal_error = error.TlsAlert;
                 engine.read_failed = true;
                 self.discardTerminalOutput();
@@ -1349,7 +1456,7 @@ pub const TlsConn = struct {
         if (!rx and (self.rx_open_control_type != 0 or self.alert_prefix_len != 0)) return error.BadState;
         if (rx and self.recv_buf.items.len != 0) return error.KtlsDirtyInbound;
         if (!tx and self.tx_ku_reply_pending) return error.BadState;
-        self.ktls_tx_offloaded = tx;
+        if (tx) self.markTxOffloaded() else self.ktls_tx_offloaded = false;
         self.ktls_rx_offloaded = rx;
     }
 
@@ -2065,6 +2172,158 @@ test "kTLS TX offload: the kernel encrypts server writes and tls_client decrypts
     const got = try client.decrypt(rec[0..n]);
     defer alloc.free(got);
     try std.testing.expectEqualStrings(msg, got);
+}
+
+/// In-memory TLS 1.3 handshake between a fresh `TlsConn` and `tls_client`
+/// (session tickets off, so `app_write_seq` is 0 when it returns).
+fn closeNotifyHandshake(alloc: Allocator, conn: *TlsConn, client: *tls_client.Client) !void {
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sh_out = try conn.onInbound(ch);
+    const cfin = switch (try client.feed(sh_out.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cfin);
+    _ = try conn.onInbound(cfin);
+    try std.testing.expect(conn.handshakeDone());
+}
+
+fn expectClientSeesCloseNotify(alloc: Allocator, client: *tls_client.Client, fd: i32) !void {
+    const record = try Tls3TcpPair.record(fd, alloc);
+    defer alloc.free(record);
+    // TLS 1.3 protects the alert inside an application_data outer record.
+    try std.testing.expectEqual(@as(u8, 23), record[0]);
+    try std.testing.expectError(error.TlsAlert, client.decrypt(record));
+    try std.testing.expectEqual(tls_alert_mod.AlertDescription.close_notify, client.last_alert.?.description);
+}
+
+const tls_alert_mod = @import("../proto/tls_alert.zig");
+
+test "close_notify: userspace TX sends exactly one authenticated close_notify" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x38)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    try closeNotifyHandshake(alloc, &conn, &client);
+    const sockets = Tls3TcpPair.open() catch return error.SkipZigTest;
+    defer sockets.deinit();
+    try std.testing.expect(conn.closeNotifyEligible());
+    try std.testing.expectEqual(TlsConn.CloseNotifyOutcome.sent, conn.sendCloseNotify(sockets.server));
+    try expectClientSeesCloseNotify(alloc, &client, sockets.peer);
+    // RFC 8446 §6.1: nothing (including a second alert) follows close_notify.
+    try std.testing.expectEqual(TlsConn.CloseNotifyOutcome.not_applicable, conn.sendCloseNotify(sockets.server));
+    try std.testing.expectError(error.BadState, conn.engine.tls13.encrypt("after close"));
+}
+
+test "close_notify: never sent before the handshake or after a fatal alert" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x39)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    const sockets = Tls3TcpPair.open() catch return error.SkipZigTest;
+    defer sockets.deinit();
+    {
+        var fresh = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+        defer fresh.deinit();
+        try std.testing.expectEqual(TlsConn.CloseNotifyOutcome.not_applicable, fresh.sendCloseNotify(sockets.server));
+    }
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    try closeNotifyHandshake(alloc, &conn, &client);
+    // A tampered client record is a fatal record failure: the stream ends with
+    // bad_record_mac, and no close_notify may follow (RFC 8446 §6.2).
+    const app = try client.encrypt("tampered");
+    defer alloc.free(app);
+    app[app.len - 1] ^= 1;
+    const failure = if (conn.onInbound(app)) |_| return error.TestUnexpectedResult else |err| err;
+    const fatal = conn.takeAlert(failure) orelse return error.TestUnexpectedResult;
+    alloc.free(fatal);
+    try std.testing.expect(!conn.closeNotifyEligible());
+    try std.testing.expectEqual(TlsConn.CloseNotifyOutcome.not_applicable, conn.sendCloseNotify(sockets.server));
+}
+
+test "close_notify: a peer close_notify is classified as a clean end of input" {
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x3a)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    try closeNotifyHandshake(alloc, &conn, &client);
+    try std.testing.expect(!conn.peerSentCloseNotify());
+    const bye = try client.closeNotify();
+    defer alloc.free(bye);
+    try std.testing.expectError(error.TlsAlert, conn.onInbound(bye));
+    try std.testing.expect(conn.peerSentCloseNotify());
+    // RFC 5246 §7.2.1 / RFC 8446 §6.1: answer with our own close_notify.
+    if (comptime builtin.os.tag != .linux) return;
+    const sockets = Tls3TcpPair.open() catch return error.SkipZigTest;
+    defer sockets.deinit();
+    try std.testing.expect(conn.closeNotifyEligible());
+    try std.testing.expectEqual(TlsConn.CloseNotifyOutcome.sent, conn.sendCloseNotify(sockets.server));
+    try expectClientSeesCloseNotify(alloc, &client, sockets.peer);
+}
+
+test "close_notify: a peer fatal alert is not a clean end and gets no close_notify" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x3c)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    try closeNotifyHandshake(alloc, &conn, &client);
+    const fatal = client.takeAlert(error.BadHandshake) orelse return error.TestUnexpectedResult;
+    defer alloc.free(fatal);
+    try std.testing.expectError(error.TlsAlert, conn.onInbound(fatal));
+    try std.testing.expect(!conn.peerSentCloseNotify());
+    try std.testing.expect(!conn.closeNotifyEligible());
+    const sockets = Tls3TcpPair.open() catch return error.SkipZigTest;
+    defer sockets.deinit();
+    try std.testing.expectEqual(TlsConn.CloseNotifyOutcome.not_applicable, conn.sendCloseNotify(sockets.server));
+}
+
+test "close_notify: kTLS TX marks the engine offloaded and sends a kernel control alert" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x3b)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    var conn = try TlsConn.init(alloc, .{ .cert_chain = &.{der}, .signing_key = kp });
+    defer conn.deinit();
+    var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{der} });
+    defer client.deinit();
+    try closeNotifyHandshake(alloc, &conn, &client);
+    const sockets = Tls3TcpPair.open() catch return error.SkipZigTest;
+    defer sockets.deinit();
+    conn.enableKtlsTx(sockets.server) catch return error.SkipZigTest;
+    // The engine must refuse every userspace seal under the kernel's sequence.
+    try std.testing.expect(conn.engine.tls13.tx_offloaded);
+    try std.testing.expectError(error.BadState, conn.engine.tls13.closeNotify());
+    try std.testing.expectError(error.BadState, conn.engine.tls13.encrypt("userspace after offload"));
+    // One kernel-encrypted application record precedes the alert so the
+    // client proves the kernel sequence continues across the control record.
+    try Tls3TcpPair.send(sockets.server, "last line");
+    const first = try Tls3TcpPair.record(sockets.peer, alloc);
+    defer alloc.free(first);
+    const line = try client.decrypt(first);
+    defer alloc.free(line);
+    try std.testing.expectEqualStrings("last line", line);
+    try std.testing.expectEqual(TlsConn.CloseNotifyOutcome.sent, conn.sendCloseNotify(sockets.server));
+    try expectClientSeesCloseNotify(alloc, &client, sockets.peer);
 }
 
 test "enableKtlsRx fails closed when inbound is not at a record boundary" {

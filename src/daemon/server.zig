@@ -3410,6 +3410,10 @@ pub const ConnState = struct {
     /// Explicit abort disposition; a healthy close-after delivery still drains
     /// its admitted control and application FIFO before ordinary final teardown.
     tls_terminal_failure: bool = false,
+    /// The TLS input ended with the peer's close_notify (RFC 8446 §6.1 /
+    /// RFC 5246 §7.2.1): a graceful end of input, answered with our own
+    /// close_notify, never a fatal alert.
+    tls_peer_close_notify: bool = false,
     /// The TLS handshake on this connection completed (or it was adopted
     /// already connected). Later record faults are not handshake failures.
     tls_handshake_finished: bool = false,
@@ -10475,6 +10479,11 @@ pub const LinuxServer = struct {
                     self.releaseUnpublishedLocalGuestBinding(&slot.value, null) catch
                         @panic("unpublished guest binding custody must settle before Server destruction");
                     self.abortMultiline(&slot.value);
+                    // Terminal shutdown closes the client: best-effort
+                    // close_notify first (RFC 8446 §6.1). Never reached after a
+                    // committed Helix handoff (that predecessor _exits without
+                    // deinit), so this never writes into an adopted stream.
+                    _ = sendTlsCloseNotify(&slot.value);
                     if (slot.value.tls) |t| {
                         t.deinit();
                         self.allocator.destroy(t);
@@ -16948,6 +16957,26 @@ pub const LinuxServer = struct {
 
     fn failTls(self: *LinuxServer, conn: *ConnState, failure: anyerror) void {
         const t = conn.tls orelse return;
+        if (failure == error.TlsAlert and !conn.tls_terminal_failure and conn.tls_handshake_finished and t.peerSentCloseNotify()) {
+            // RFC 8446 §6.1 / RFC 5246 §7.2.1: close_notify is the peer's
+            // graceful end of input, classified like a TCP EOF (no tls_error
+            // diagnostic, no "TLS peer alert" reason). Input after it is
+            // ignored; pending writes are discarded (RFC 5246 §7.2.1) and the
+            // final teardown answers with our own close_notify.
+            logConnectionDiagnostic(conn, .recv_eof, 0, null, .none);
+            conn.tls_peer_close_notify = true;
+            conn.tls_terminal_failure = true;
+            conn.closing = true;
+            discardTlsUnsealedTail(conn);
+            conn.tls_discard_unsent = true;
+            if (!conn.send_armed) {
+                discardPoisonedSendTail(conn);
+                conn.tls_discard_unsent = false;
+            }
+            conn.io_activation_pending = true;
+            conn.activation_recv_required = false;
+            return;
+        }
         if (!conn.tls_terminal_failure and !conn.tls_handshake_finished) self.tls_stats.onHandshakeFailure(failure);
         if (!conn.tls_terminal_failure) logConnectionDiagnostic(conn, .tls_error, 0, failure, .none);
         conn.tls_terminal_failure = true;
@@ -22059,6 +22088,22 @@ pub const LinuxServer = struct {
         return false;
     }
 
+    /// Graceful TLS closure (RFC 8446 §6.1, RFC 5246 §7.2.1) immediately before
+    /// the transport is shut down: one close_notify, userspace-sealed or as a
+    /// kTLS control record. Best-effort and non-blocking. Only for a client
+    /// (never a mesh link) whose every accepted TX byte already reached the
+    /// socket with no armed SEND, so the alert is the exact next record; never
+    /// after a fatal alert, a TLS/record failure, a send failure or a delivery
+    /// gap. The single answerable terminal input is the peer's close_notify.
+    fn sendTlsCloseNotify(conn: *ConnState) tls_conn.TlsConn.CloseNotifyOutcome {
+        const t = conn.tls orelse return .not_applicable;
+        if (conn.fd < 0 or conn.s2s != null or conn.s2s_secured != null) return .not_applicable;
+        if (conn.tls_terminal_failure and !conn.tls_peer_close_notify) return .not_applicable;
+        if (conn.send_terminal_failure or conn.tls_discard_unsent or conn.delivery_gap.load(.acquire)) return .not_applicable;
+        if (hasUnsentOutput(conn)) return .not_applicable;
+        return t.sendCloseNotify(conn.fd);
+    }
+
     inline fn kernelOwnsConnStorage(conn: *const ConnState) bool {
         return conn.recv_armed or conn.send_armed or conn.connect_armed;
     }
@@ -22354,6 +22399,8 @@ pub const LinuxServer = struct {
             // quiet recv/connect to complete, and recycle only after every exact
             // ownership latch has been cleared by its matching handler.
             if (kernelOwnsConnStorage(conn)) {
+                // The shutdown below is the end of this TLS write direction.
+                _ = sendTlsCloseNotify(conn);
                 if (conn.tls != null) {
                     conn.tls_terminal_failure = true;
                     conn.tls_discard_unsent = true;
@@ -22413,6 +22460,7 @@ pub const LinuxServer = struct {
             if (ordinary_media_owner) {
                 conn.closing = true;
                 if (conn.fd >= 0) {
+                    _ = sendTlsCloseNotify(conn);
                     if (comptime builtin.os.tag == .linux)
                         _ = linux.shutdown(conn.fd, linux.SHUT.RDWR)
                     else
@@ -131062,6 +131110,30 @@ const DaemonOutputTestPair = struct {
         }
         return decoded.toOwnedSlice(a);
     }
+
+    /// Decode a gracefully closed stream: application records followed by
+    /// exactly one authenticated close_notify as the final record (RFC 8446
+    /// §6.1). Anything after it, or a missing alert, fails.
+    fn decodeClosed(self: *DaemonOutputTestPair, bytes: []const u8) ![]u8 {
+        var at: usize = 0;
+        while (true) {
+            if (bytes.len - at < 5) return error.MissingCloseNotify;
+            const len = 5 + @as(usize, std.mem.readInt(u16, bytes[at..][3..5], .big));
+            if (len > bytes.len - at) return error.TestUnexpectedResult;
+            if (at + len == bytes.len) break;
+            at += len;
+        }
+        const plain = try self.decode(bytes[0..at]);
+        errdefer std.testing.allocator.free(plain);
+        switch (self.client) {
+            .tls13 => |*client| {
+                try std.testing.expectError(error.TlsAlert, client.decrypt(bytes[at..]));
+                try std.testing.expectEqual(@import("../proto/tls_alert.zig").AlertDescription.close_notify, client.last_alert.?.description);
+            },
+            .tls12 => |*client| try std.testing.expectError(error.TlsAlert, client.decrypt(bytes[at..])),
+        }
+        return plain;
+    }
 };
 
 fn daemonOutputQueued(a: std.mem.Allocator, conn: *const ConnState) ![]u8 {
@@ -131644,6 +131716,7 @@ fn tls3ServerKernelPrefix(suite: u16, kernel_rx: bool, armed: bool, overflow: bo
     var complete = false;
     var peer_eof = false;
     var read_after_retirement = false;
+    var close_notify_seen = false;
     for (0..2000) |_| {
         _ = try fixture.server.rx().ring.submit();
         _ = try fixture.server.rx().ring.reapCompletions(&completions, 0, &handler);
@@ -131668,7 +131741,18 @@ fn tls3ServerKernelPrefix(suite: u16, kernel_rx: bool, armed: bool, overflow: bo
         while (cipher.items.len >= 5) {
             const len = 5 + @as(usize, std.mem.readInt(u16, cipher.items[3..5], .big));
             if (cipher.items.len < len) break;
-            switch (try fixture.pair.client.tls13.decryptApp(cipher.items[0..len])) {
+            // A clean close ends with one kernel control close_notify
+            // (RFC 8446 §6.1); nothing may follow it.
+            try std.testing.expect(!close_notify_seen);
+            const read = fixture.pair.client.tls13.decryptApp(cipher.items[0..len]) catch |err| {
+                if (err != error.TlsAlert or !clean_close) return err;
+                try std.testing.expectEqual(@import("../proto/tls_alert.zig").AlertDescription.close_notify, fixture.pair.client.tls13.last_alert.?.description);
+                close_notify_seen = true;
+                std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - len], cipher.items[len..]);
+                cipher.shrinkRetainingCapacity(cipher.items.len - len);
+                continue;
+            };
+            switch (read) {
                 .application_data => |bytes| {
                     defer a.free(bytes);
                     if (replies == 0) try plain.appendSlice(a, bytes) else {
@@ -131693,7 +131777,7 @@ fn tls3ServerKernelPrefix(suite: u16, kernel_rx: bool, armed: bool, overflow: bo
             // peer owns this observation now; EOF, not server-row removal,
             // establishes that all accepted ciphertext has been observed.
             if (peer_eof) {
-                complete = plain.items.len == prefix.len and replies == 1 and
+                complete = plain.items.len == prefix.len and replies == 1 and close_notify_seen and
                     suffix.items.len == "new suffix held behind kernel prefix".len and cipher.items.len == 0;
                 break;
             }
@@ -132230,7 +132314,10 @@ fn tls3ServerBufferedRetirement(suite: u16, closing_before: bool) !void {
     try std.testing.expectEqual(@as(u64, 0), usage.joins);
     try std.testing.expectEqual(@as(u64, if (closing_before) 0 else 1), usage.pings);
     try std.testing.expect(!fixture.server.world.channelExists("#after-close"));
-    const plain = try fixture.pair.decode(wire.items);
+    // A healthy close ends with exactly one close_notify (RFC 8446 §6.1); the
+    // terminal-failure variant never sends one after a failure. (Before
+    // graceful closure existed, both ended in a bare FIN.)
+    const plain = if (closing_before) try fixture.pair.decodeClosed(wire.items) else try fixture.pair.decode(wire.items);
     defer a.free(plain);
     // Healthy close completes every accepted output. Terminal IRC policy
     // disposes unsent output rather than publishing a response after failure.
@@ -132245,6 +132332,88 @@ test "TLS3: buffered overlong input terminally disposes a second held KU and its
 test "TLS3: drain-close completes requested KU without dispatching buffered application commands" {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
     for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| try tls3ServerBufferedRetirement(suite, true);
+}
+
+fn tls3PeerReadAll(fd: i32, out: *std.ArrayList(u8)) !void {
+    var scratch: [2048]u8 = undefined;
+    while (true) {
+        var ready = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&ready, 2_000) == 0) return error.TestTimeout;
+        const n = try readFd(fd, &scratch);
+        if (n == 0) return;
+        try out.appendSlice(std.testing.allocator, scratch[0..n]);
+    }
+}
+
+test "TLS close_notify: a peer close_notify is a clean EOF answered with our close_notify" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    conn.tls_handshake_finished = true;
+    const failures_before = fixture.server.tls_stats.failureCount(server_stats.TlsStats.classifyFailure(error.TlsAlert));
+    const bye = try fixture.pair.client.tls13.closeNotify();
+    defer a.free(bye);
+    try fixture.server.driveTls(fixture.id, conn, bye);
+    // RFC 8446 §6.1: graceful end of input, not the "TLS peer alert" error
+    // path and not a handshake failure.
+    try std.testing.expect(conn.closing and conn.tls_peer_close_notify);
+    try std.testing.expect(!std.mem.eql(u8, conn.close_reason, "TLS peer alert"));
+    try std.testing.expectEqual(failures_before, fixture.server.tls_stats.failureCount(server_stats.TlsStats.classifyFailure(error.TlsAlert)));
+    try fixture.server.closeConn(conn.token, conn.close_reason);
+    try std.testing.expect(fixture.server.connFor(fixture.id) == null);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    try tls3PeerReadAll(fixture.peer_fd, &wire);
+    const plain = try fixture.pair.decodeClosed(wire.items);
+    defer a.free(plain);
+    try std.testing.expectEqual(@as(usize, 0), plain.len);
+}
+
+test "TLS close_notify: a peer fatal alert keeps the error path and gets no close_notify" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.create(0x1301);
+    defer fixture.deinit();
+    current_reactor = &fixture.server.reactors[0];
+    const conn = fixture.connection();
+    conn.tls_handshake_finished = true;
+    const fatal = fixture.pair.client.tls13.takeAlert(error.BadHandshake) orelse return error.TestUnexpectedResult;
+    defer a.free(fatal);
+    try fixture.server.driveTls(fixture.id, conn, fatal);
+    try std.testing.expect(conn.closing and conn.tls_terminal_failure and !conn.tls_peer_close_notify);
+    try std.testing.expectEqualStrings("TLS peer alert", conn.close_reason);
+    try fixture.server.closeConn(conn.token, conn.close_reason);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    try tls3PeerReadAll(fixture.peer_fd, &wire);
+    try std.testing.expectEqual(@as(usize, 0), wire.items.len);
+}
+
+test "TLS close_notify: terminal Server shutdown sends close_notify to a drained TLS client" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var fixture = try Tls3ServerFixture.create(0x1302);
+    current_reactor = &fixture.server.reactors[0];
+    // Tear the Server down by hand so the peer can be read after deinit.
+    fixture.server.deinit();
+    a.destroy(fixture.server);
+    current_reactor = null;
+    defer {
+        closeFd(fixture.peer_fd);
+        fixture.pair.destroy();
+    }
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(a);
+    try tls3PeerReadAll(fixture.peer_fd, &wire);
+    const plain = try fixture.pair.decodeClosed(wire.items);
+    defer a.free(plain);
+    try std.testing.expectEqual(@as(usize, 0), plain.len);
 }
 
 const Tls3DrainFault = enum { metadata, tls, sendq };
@@ -132361,7 +132530,10 @@ fn tls3ServerSoftwareCloseRetry(suite: u16, point: Tls3DrainFault, kernel_rx: bo
     try std.testing.expect(eof);
     try std.testing.expect(fixture.server.connFor(fixture.id) == null);
     try std.testing.expectError(error.ClientNotFound, fixture.server.connForToken(token));
-    const plain = try fixture.pair.decode(wire.items);
+    // A clean drain-close now ends with one close_notify after the complete
+    // accepted plaintext (RFC 8446 §6.1); previously the stream ended in a
+    // bare TCP FIN, which this assertion encoded.
+    const plain = try fixture.pair.decodeClosed(wire.items);
     defer a.free(plain);
     try std.testing.expectEqual(prefix.len + suffix.len, plain.len);
     try std.testing.expectEqualStrings(prefix, plain[0..prefix.len]);
