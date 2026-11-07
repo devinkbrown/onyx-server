@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! `[[tls.ech_keys]]` material loader, shared by boot (`main.zig`) and the
-//! transactional TLS reload on REHASH and ACME renewal (`server.zig`).
+//! transactional TLS reload on REHASH (`server.zig`).
 //!
 //! Each entry names a file holding a single-entry ECHConfigList plus the
 //! matching X25519 HPKE recipient key. Besides the per-key material the TLS

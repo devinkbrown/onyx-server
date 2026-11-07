@@ -2313,9 +2313,33 @@ fn parseTlsPolicy(allocator: std.mem.Allocator, resolver: Resolver, doc: toml.Do
     }
     // The cap applies to our own outbound M1 too: a node whose own mesh
     // password exceeds it could never complete a Mooring handshake.
+    // With `[mesh] admission_token` set, outbound M1 carries the decoded
+    // token instead of the password, so the cap must admit it too.
     if (cfg.tls.mooring_max_meshpass_len) |cap| {
         if (cfg.mesh.mesh_pass) |pass| if (pass.len > cap) return error.@"tls.mooring_max_meshpass_len";
+        if (cfg.mesh.admission_token) |token| {
+            if (admissionTokenDecodedLenBound(token) > cap) return error.@"tls.mooring_max_meshpass_len";
+        }
     }
+}
+
+/// Largest admission token M1 can carry.
+const max_admission_token_len: usize = @import("../proto/meshpass.zig").max_token_len;
+
+/// Decoded byte length of `[mesh] admission_token`, following the daemon's
+/// decoder (hex first, then standard base64). Text that decodes as neither
+/// returns the largest token length, so the bound never under-counts.
+fn admissionTokenDecodedLenBound(text: []const u8) usize {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len != 0 and trimmed.len % 2 == 0 and trimmed.len / 2 <= max_admission_token_len) {
+        const all_hex = for (trimmed) |c| {
+            if (!std.ascii.isHex(c)) break false;
+        } else true;
+        if (all_hex) return trimmed.len / 2;
+    }
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(trimmed) catch return max_admission_token_len;
+    if (decoded_len == 0 or decoded_len > max_admission_token_len) return max_admission_token_len;
+    return decoded_len;
 }
 
 fn parseRelayV2Authoring(s: []const u8) ?relay_v2_activation.Mode {
@@ -4988,6 +5012,11 @@ test "parseToml: [tls] policy keys project onto Config" {
     defer off.deinit(allocator);
     try testing.expectEqual(@as(usize, 0), off.tlsAlpnProtocols().len);
     try testing.expectEqual(@as(?u32, 604_800), off.tls.ticket_lifetime_seconds);
+
+    // A cap that admits the decoded admission token (10 bytes) is accepted.
+    var token_fits = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n[mesh]\nadmission_token = \"AAECAwQFBgcICQ==\"\n[tls]\nmooring_max_meshpass_len = 10\n", .{});
+    defer token_fits.deinit(allocator);
+    try testing.expectEqual(@as(?u16, 10), token_fits.tls.mooring_max_meshpass_len);
 }
 
 test "parseToml: [tls] policy keys fail closed on bad values" {
@@ -5009,6 +5038,11 @@ test "parseToml: [tls] policy keys fail closed on bad values" {
         .{ .text = "[tls]\nmooring_max_meshpass_len = 0\n", .err = error.@"tls.mooring_max_meshpass_len" },
         .{ .text = "[tls]\nmooring_max_meshpass_len = 65536\n", .err = error.@"tls.mooring_max_meshpass_len" },
         .{ .text = "[mesh]\nmesh_pass = \"0123456789\"\n[tls]\nmooring_max_meshpass_len = 9\n", .err = error.@"tls.mooring_max_meshpass_len" },
+        // M1 carries the decoded admission token instead: 10 bytes as hex, as
+        // base64, and an undecodable token bounded at the 448-byte maximum.
+        .{ .text = "[mesh]\nadmission_token = \"00112233445566778899\"\n[tls]\nmooring_max_meshpass_len = 9\n", .err = error.@"tls.mooring_max_meshpass_len" },
+        .{ .text = "[mesh]\nadmission_token = \"AAECAwQFBgcICQ==\"\n[tls]\nmooring_max_meshpass_len = 9\n", .err = error.@"tls.mooring_max_meshpass_len" },
+        .{ .text = "[mesh]\nadmission_token = \"!!\"\n[tls]\nmooring_max_meshpass_len = 447\n", .err = error.@"tls.mooring_max_meshpass_len" },
         .{ .text = "[tls]\nratchet_max_skip = 64\n", .err = error.@"tls.ratchet_max_skip was removed: it never applied to the daemon" },
         .{ .text = "[tls]\ntreekem_max_members = 2\n", .err = error.@"tls.treekem_max_members was removed: it never applied to the daemon" },
     };

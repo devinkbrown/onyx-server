@@ -5194,8 +5194,9 @@ const RuntimePhase = enum(u8) { idle, resources, workers, published, joined };
 const ws_alpn_protocols = [_][]const u8{"http/1.1"};
 
 /// `[[tls.sni]]` and `[[tls.ech_keys]]` reload with the default certificate on
-/// REHASH and ACME renewal. Native Windows binds them into its static Helix
-/// proof instead, so there they change only with a restart.
+/// REHASH (ACME renewal reloads only the default certificate). Native Windows
+/// binds them into its static Helix proof instead, so there they change only
+/// with a restart.
 const tls_sni_ech_hot_reload = builtin.os.tag != .windows;
 
 const RetiredTlsGeneration = struct {
@@ -5214,14 +5215,51 @@ const RetiredTlsGeneration = struct {
 };
 
 /// One server-owned `[[tls.sni]]` reload generation: the loaded certificate
-/// material and the selection list whose entries borrow it. A TLS engine
-/// borrows `certs` until its handshake finishes.
+/// material, its own copy of every server name, and the selection list whose
+/// entries borrow both. Nothing here borrows the parsed config, which REHASH
+/// frees on its next commit. A TLS engine borrows `certs` until its handshake
+/// finishes.
 const TlsSniGeneration = struct {
     loaded: std.ArrayList(tls_certs.Loaded) = .empty,
     certs: []tls_server.SniCert = &.{},
+    /// Every entry's server names, concatenated; `names` slices into it.
+    name_bytes: []u8 = &.{},
+    /// Every entry's name list, flattened; `certs[i].server_names` slices it.
+    names: [][]const u8 = &.{},
+
+    /// Replace each `certs[i].server_names` (borrowed from the parsed config)
+    /// with copies owned by this generation.
+    fn ownServerNames(self: *TlsSniGeneration, allocator: std.mem.Allocator) !void {
+        std.debug.assert(self.names.len == 0 and self.name_bytes.len == 0);
+        var name_count: usize = 0;
+        var byte_count: usize = 0;
+        for (self.certs) |cert| {
+            name_count += cert.server_names.len;
+            for (cert.server_names) |name| byte_count += name.len;
+        }
+        const name_bytes = try allocator.alloc(u8, byte_count);
+        errdefer allocator.free(name_bytes);
+        const names = try allocator.alloc([]const u8, name_count);
+        var name_at: usize = 0;
+        var byte_at: usize = 0;
+        for (self.certs) |*cert| {
+            const first = name_at;
+            for (cert.server_names) |name| {
+                @memcpy(name_bytes[byte_at..][0..name.len], name);
+                names[name_at] = name_bytes[byte_at..][0..name.len];
+                byte_at += name.len;
+                name_at += 1;
+            }
+            cert.server_names = names[first..name_at];
+        }
+        self.name_bytes = name_bytes;
+        self.names = names;
+    }
 
     fn deinit(self: *TlsSniGeneration, allocator: std.mem.Allocator) void {
         if (self.certs.len != 0) allocator.free(self.certs);
+        allocator.free(self.names);
+        allocator.free(self.name_bytes);
         for (self.loaded.items) |*entry| entry.deinit(allocator);
         self.loaded.deinit(allocator);
         self.* = .{};
@@ -73358,17 +73396,34 @@ pub const LinuxServer = struct {
     /// current certs and NOTICEs). `tls` borrows caller-owned config that must
     /// outlive the reload call; REHASH uses `self.reload_parsed`, while ACME uses
     /// main's held boot config on reactor 0.
+    ///
+    /// This path reloads only the default certificate (and its TLS 1.2 leg):
+    /// the current `[[tls.sni]]` and `[[tls.ech_keys]]` generations keep
+    /// serving unchanged. ACME holds the boot config, which a later REHASH
+    /// does not update, so reloading SNI/ECH from it would silently revert
+    /// operator changes; and one expired manually managed SNI certificate must
+    /// never block renewal of the ACME-managed default certificate.
     pub fn reloadTlsCerts(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls) !TlsReloadOutcome {
-        return self.reloadTlsCertsLocked(io, tls, false);
+        return self.reloadTlsCertsLocked(io, tls, false, .default_only);
     }
 
     /// REHASH may keep a pathless WebTransport bootstrap certificate when an
     /// active QUIC connection makes replacement impossible, but only after
     /// the caller proved the parsed TLS settings are unchanged. Explicit ACME
     /// reload requests and normal reload callers retain strict rotation.
+    ///
+    /// REHASH also reloads `[[tls.sni]]` and `[[tls.ech_keys]]` from `tls` in
+    /// the same all-or-nothing transaction as the default certificate.
     pub fn reloadTlsCertsForRehash(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls, unchanged_tls_proven: bool) !TlsReloadOutcome {
-        return self.reloadTlsCertsLocked(io, tls, unchanged_tls_proven);
+        return self.reloadTlsCertsLocked(io, tls, unchanged_tls_proven, .with_sni_ech);
     }
+
+    const TlsReloadScope = enum {
+        /// ACME renewal: the default certificate only.
+        default_only,
+        /// Operator REHASH: the default certificate plus SNI and ECH.
+        with_sni_ech,
+    };
 
     /// The caller holds the accepted-event boundary. A TLS engine keeps its
     /// certificate config until its handshake finishes, so reload cadence is
@@ -73439,6 +73494,7 @@ pub const LinuxServer = struct {
         for (generation.loaded.items) |*entry| {
             try native_windows_tls_proof.validateIdentity(native_windows_tls_proof.fromLoaded(entry));
         }
+        try generation.ownServerNames(self.allocator);
         return generation;
     }
 
@@ -73454,7 +73510,7 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn reloadTlsCertsLocked(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls, unchanged_tls_proven: bool) !TlsReloadOutcome {
+    fn reloadTlsCertsLocked(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls, unchanged_tls_proven: bool, scope: TlsReloadScope) !TlsReloadOutcome {
         // Mirror the boot gate in main.zig: only [tls] enabled nodes load certs.
         if (!tls.enabled or self.config.tls_cert_chain.len == 0) return .not_configured;
 
@@ -73524,21 +73580,32 @@ pub const LinuxServer = struct {
         // proven by constructing a TLS engine from it before anything is
         // published, so one bad file keeps the whole current set serving.
         // Native Windows keeps them as static Helix-proof inputs (restart).
+        // A default-only (ACME) reload keeps the serving SNI/ECH generations
+        // and proves the new default certificate against them.
+        const swap_sni_ech = tls_sni_ech_hot_reload and scope == .with_sni_ech;
         var new_sni: ?TlsSniGeneration = null;
         errdefer if (new_sni) |*g| g.deinit(self.allocator);
         var new_ech: ?tls_ech_load.Loaded = null;
         errdefer if (new_ech) |*e| e.deinit(self.allocator);
+        if (swap_sni_ech) {
+            new_sni = self.loadTlsSniGeneration(io, tls) catch |err| {
+                srvLog("onyx-server: TLS reload: [[tls.sni]] failed to load ({s}); keeping current certificates\n", .{@errorName(err)});
+                return err;
+            };
+            new_ech = tls_ech_load.load(self.allocator, io, tls.ech_keys) catch |err| {
+                srvLog("onyx-server: TLS reload: [[tls.ech_keys]] failed to load ({s}); keeping current certificates\n", .{@errorName(err)});
+                return err;
+            };
+        }
         if (comptime tls_sni_ech_hot_reload) {
-            new_sni = try self.loadTlsSniGeneration(io, tls);
-            new_ech = try tls_ech_load.load(self.allocator, io, tls.ech_keys);
             var probe = try tls_server.Server.init(self.allocator, .{
                 .cert_chain = loaded.cert_chain,
                 .signing_key = loaded.signing_key,
                 .ecdsa_p256_signing_key = loaded.ecdsa_p256_signing_key,
                 .rsa_signing_key = loaded.rsa_signing_key,
-                .sni_certs = new_sni.?.certs,
-                .ech_keys = new_ech.?.keys,
-                .ech_retry_config_list = new_ech.?.retry_config_list,
+                .sni_certs = if (new_sni) |g| g.certs else self.config.tls_sni_certs,
+                .ech_keys = if (new_ech) |e| e.keys else self.config.tls_ech_keys,
+                .ech_retry_config_list = if (new_ech) |e| e.retry_config_list else self.config.tls_ech_retry_config_list,
             });
             probe.deinit();
         }
@@ -73558,8 +73625,8 @@ pub const LinuxServer = struct {
         const retiring = RetiredTlsGeneration{
             .primary = self.reload_tls_prev,
             .side = self.reload_tls12_prev,
-            .sni = if (comptime tls_sni_ech_hot_reload) self.reload_sni_prev else null,
-            .ech = if (comptime tls_sni_ech_hot_reload) self.reload_ech_prev else null,
+            .sni = if (swap_sni_ech) self.reload_sni_prev else null,
+            .ech = if (swap_sni_ech) self.reload_ech_prev else null,
         };
         const retain_retiring = self.tlsGenerationBorrowed(&retiring);
         if (retain_retiring) try self.reload_tls_retired.ensureUnusedCapacity(self.allocator, 1);
@@ -73619,7 +73686,7 @@ pub const LinuxServer = struct {
             self.config.tls12_cert_chain = tls12_chain;
             self.config.tls12_signing_key = tls12_key;
         }
-        if (comptime tls_sni_ech_hot_reload) {
+        if (swap_sni_ech) {
             self.config.tls_sni_certs = new_sni.?.certs;
             self.config.tls_ech_keys = new_ech.?.keys;
             self.config.tls_ech_retry_config_list = new_ech.?.retry_config_list;
@@ -159628,7 +159695,7 @@ test "REHASH reloads SNI certificates and ECH keys transactionally with the defa
     var ech_bad = [_]config_format.Config.EchKeyDef{.{ .config_path = ech_path, .private_key = @splat(0x42) }};
 
     const tls_full = config_format.Config.Tls{ .enabled = true, .cert_path = b_paths.cert, .key_path = b_paths.key, .dns_name = "b.test", .sni = &sni_good, .ech_keys = &ech_good };
-    try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.reloaded, try server.reloadTlsCerts(std.testing.io, &tls_full));
+    try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.reloaded, try server.reloadTlsCertsForRehash(std.testing.io, &tls_full, false));
     try std.testing.expectEqual(@as(usize, 1), server.config.tls_sni_certs.len);
     try std.testing.expectEqualSlices(u8, s.der, server.config.tls_sni_certs[0].cert_chain[0]);
     try std.testing.expectEqualStrings("sni.test", server.config.tls_sni_certs[0].server_names[0]);
@@ -159656,9 +159723,9 @@ test "REHASH reloads SNI certificates and ECH keys transactionally with the defa
     const live_ech = server.config.tls_ech_keys.ptr;
     const live_retry = server.config.tls_ech_retry_config_list.ptr;
     const tls_bad_sni = config_format.Config.Tls{ .enabled = true, .cert_path = b_paths.cert, .key_path = b_paths.key, .dns_name = "b.test", .sni = &sni_bad, .ech_keys = &ech_good };
-    try std.testing.expectError(error.TlsKeyMismatch, server.reloadTlsCerts(std.testing.io, &tls_bad_sni));
+    try std.testing.expectError(error.TlsKeyMismatch, server.reloadTlsCertsForRehash(std.testing.io, &tls_bad_sni, false));
     const tls_bad_ech = config_format.Config.Tls{ .enabled = true, .cert_path = b_paths.cert, .key_path = b_paths.key, .dns_name = "b.test", .sni = &sni_good, .ech_keys = &ech_bad };
-    try std.testing.expectError(error.BadEchConfig, server.reloadTlsCerts(std.testing.io, &tls_bad_ech));
+    try std.testing.expectError(error.BadEchConfig, server.reloadTlsCertsForRehash(std.testing.io, &tls_bad_ech, false));
     try std.testing.expectEqual(live_chain, server.config.tls_cert_chain.ptr);
     try std.testing.expectEqual(live_sni, server.config.tls_sni_certs.ptr);
     try std.testing.expectEqual(live_ech, server.config.tls_ech_keys.ptr);
@@ -159667,12 +159734,12 @@ test "REHASH reloads SNI certificates and ECH keys transactionally with the defa
     // Removing both lists takes effect on the next good reload; the borrowed
     // generation stays alive until its handshake ends, then is released.
     const tls_none = config_format.Config.Tls{ .enabled = true, .cert_path = b_paths.cert, .key_path = b_paths.key, .dns_name = "b.test" };
-    _ = try server.reloadTlsCerts(std.testing.io, &tls_none);
+    _ = try server.reloadTlsCertsForRehash(std.testing.io, &tls_none, false);
     try std.testing.expectEqual(@as(usize, 0), server.config.tls_sni_certs.len);
     try std.testing.expectEqual(@as(usize, 0), server.config.tls_ech_keys.len);
     try std.testing.expectEqual(@as(usize, 0), server.tls13Config(false).ech_retry_config_list.len);
     try std.testing.expectEqual(live_sni, server.reload_sni_prev.?.certs.ptr);
-    _ = try server.reloadTlsCerts(std.testing.io, &tls_none);
+    _ = try server.reloadTlsCertsForRehash(std.testing.io, &tls_none, false);
     try std.testing.expectEqual(@as(usize, 1), server.reload_tls_retired.items.len);
     try std.testing.expectEqual(live_sni, server.reload_tls_retired.items[0].sni.?.certs.ptr);
     try std.testing.expectEqual(live_ech, server.reload_tls_retired.items[0].ech.?.keys.ptr);
@@ -159683,6 +159750,153 @@ test "REHASH reloads SNI certificates and ECH keys transactionally with the defa
     pending_live = false;
     server.pruneRetiredTlsGenerations();
     try std.testing.expectEqual(@as(usize, 0), server.reload_tls_retired.items.len);
+}
+
+test "REHASH SNI generation owns its server names after the parsed config is freed" {
+    if (comptime !tls_sni_ech_hot_reload or !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const tls_client = @import("../crypto/tls_client.zig");
+    const allocator = std.testing.allocator;
+
+    var a_buf: [1024]u8 = undefined;
+    const a = try mintRehashTlsLeaf(&a_buf, 0xc1, "a.test");
+    const boot_chain = [_][]const u8{a.der};
+    const server = initTlsPolicyTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &boot_chain, .tls_signing_key = a.kp, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b_buf: [1024]u8 = undefined;
+    const b = try mintRehashTlsLeaf(&b_buf, 0xc2, "b.test");
+    const b_paths = try writeRehashTlsPair(allocator, tmp, b.der, 0xc2, "b.pem", "b.key");
+    defer allocator.free(b_paths.cert);
+    defer allocator.free(b_paths.key);
+    var s_buf: [1024]u8 = undefined;
+    const s = try mintRehashTlsLeaf(&s_buf, 0xc3, "sni.test");
+    const s_paths = try writeRehashTlsPair(allocator, tmp, s.der, 0xc3, "s.pem", "s.key");
+    defer allocator.free(s_paths.cert);
+    defer allocator.free(s_paths.key);
+    const missing = try rehashTmpPath(allocator, tmp, "missing.pem");
+    defer allocator.free(missing);
+
+    // REHASH #1 loads from a heap config, as oper_cmd loads from
+    // `reload_parsed`, which the next REHASH commit frees.
+    {
+        const name = try allocator.dupe(u8, "sni.test");
+        defer {
+            @memset(name, 'X');
+            allocator.free(name);
+        }
+        const names = [_][]const u8{name};
+        var sni = [_]config_format.Config.SniCertDef{.{ .server_names = &names, .cert_path = s_paths.cert, .key_path = s_paths.key }};
+        const tls = config_format.Config.Tls{ .enabled = true, .cert_path = b_paths.cert, .key_path = b_paths.key, .dns_name = "b.test", .sni = &sni };
+        try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.reloaded, try server.reloadTlsCertsForRehash(std.testing.io, &tls, false));
+    }
+
+    // REHASH #2 freed that config and its TLS reload fails; the first
+    // generation keeps serving and must not read the freed names.
+    const tls_bad = config_format.Config.Tls{ .enabled = true, .cert_path = missing, .key_path = b_paths.key, .dns_name = "b.test" };
+    try std.testing.expectError(error.FileNotFound, server.reloadTlsCertsForRehash(std.testing.io, &tls_bad, false));
+    try std.testing.expectEqual(@as(usize, 1), server.config.tls_sni_certs.len);
+    try std.testing.expectEqualStrings("sni.test", server.config.tls_sni_certs[0].server_names[0]);
+
+    // An SNI handshake still selects the SNI certificate.
+    var conn = try tls_conn.TlsConn.init(allocator, server.tls13Config(false));
+    defer conn.deinit();
+    {
+        var client = try tls_client.Client.init(allocator, .{ .server_name = "sni.test", .trust_anchors = &.{s.der} });
+        defer client.deinit();
+        const ch = try client.start();
+        defer allocator.free(ch);
+        const flight = try conn.onInbound(ch);
+        const fin = switch (try client.feed(flight.handshake_bytes)) {
+            .bytes_to_send => |bytes| bytes,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer allocator.free(fin);
+        _ = try conn.onInbound(fin);
+    }
+    try std.testing.expect(conn.handshakeDone());
+
+    // The metrics render labels the SNI certificate by its owned name.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try server.writeTlsPrometheus(allocator, &out, 1_800_000_000);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "source=\"sni\",server_name=\"sni.test\"") != null);
+}
+
+test "ACME TLS reload renews only the default certificate and keeps REHASH SNI and ECH generations" {
+    if (comptime !tls_sni_ech_hot_reload or !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const hpke = @import("../crypto/hpke.zig");
+    const allocator = std.testing.allocator;
+
+    var a_buf: [1024]u8 = undefined;
+    const a = try mintRehashTlsLeaf(&a_buf, 0xd1, "a.test");
+    const boot_chain = [_][]const u8{a.der};
+    const server = initTlsPolicyTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &boot_chain, .tls_signing_key = a.kp, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b_buf: [1024]u8 = undefined;
+    const b = try mintRehashTlsLeaf(&b_buf, 0xd2, "b.test");
+    const b_paths = try writeRehashTlsPair(allocator, tmp, b.der, 0xd2, "b.pem", "b.key");
+    defer allocator.free(b_paths.cert);
+    defer allocator.free(b_paths.key);
+    var c_buf: [1024]u8 = undefined;
+    const c = try mintRehashTlsLeaf(&c_buf, 0xd3, "b.test");
+    const c_paths = try writeRehashTlsPair(allocator, tmp, c.der, 0xd3, "c.pem", "c.key");
+    defer allocator.free(c_paths.cert);
+    defer allocator.free(c_paths.key);
+    var s_buf: [1024]u8 = undefined;
+    const s = try mintRehashTlsLeaf(&s_buf, 0xd4, "sni.test");
+    const s_paths = try writeRehashTlsPair(allocator, tmp, s.der, 0xd4, "s.pem", "s.key");
+    defer allocator.free(s_paths.cert);
+    defer allocator.free(s_paths.key);
+    const missing = try rehashTmpPath(allocator, tmp, "gone.pem");
+    defer allocator.free(missing);
+
+    const ech_kp = try hpke.KeyPair.generateDeterministic(@splat(0xd5));
+    var ech_buf: [256]u8 = undefined;
+    const ech_list = testEchConfigList(&ech_buf, 6, &ech_kp.public_key, "b.test");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ech.bin", .data = ech_list });
+    const ech_path = try rehashTmpPath(allocator, tmp, "ech.bin");
+    defer allocator.free(ech_path);
+
+    const names = [_][]const u8{"sni.test"};
+    var sni_rehash = [_]config_format.Config.SniCertDef{.{ .server_names = &names, .cert_path = s_paths.cert, .key_path = s_paths.key }};
+    var ech_rehash = [_]config_format.Config.EchKeyDef{.{ .config_path = ech_path, .private_key = ech_kp.secret_key }};
+    const tls_rehash = config_format.Config.Tls{ .enabled = true, .cert_path = b_paths.cert, .key_path = b_paths.key, .dns_name = "b.test", .sni = &sni_rehash, .ech_keys = &ech_rehash };
+    _ = try server.reloadTlsCertsForRehash(std.testing.io, &tls_rehash, false);
+    const live_sni = server.config.tls_sni_certs.ptr;
+    const live_ech = server.config.tls_ech_keys.ptr;
+    const live_retry = server.config.tls_ech_retry_config_list.ptr;
+
+    // ACME reloads from the boot config, which still names an SNI file that
+    // has since been deleted. The default certificate renews regardless and
+    // the REHASH SNI/ECH generations keep serving untouched.
+    const boot_names = [_][]const u8{"old.test"};
+    var sni_boot = [_]config_format.Config.SniCertDef{.{ .server_names = &boot_names, .cert_path = missing, .key_path = s_paths.key }};
+    const tls_acme = config_format.Config.Tls{ .enabled = true, .cert_path = c_paths.cert, .key_path = c_paths.key, .dns_name = "b.test", .sni = &sni_boot };
+    try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.reloaded, try server.reloadTlsCerts(std.testing.io, &tls_acme));
+    try std.testing.expectEqualSlices(u8, c.der, server.config.tls_cert_chain[0]);
+    try std.testing.expectEqual(live_sni, server.config.tls_sni_certs.ptr);
+    try std.testing.expectEqual(live_ech, server.config.tls_ech_keys.ptr);
+    try std.testing.expectEqual(live_retry, server.config.tls_ech_retry_config_list.ptr);
+    try std.testing.expectEqualStrings("sni.test", server.config.tls_sni_certs[0].server_names[0]);
+    try std.testing.expectEqualSlices(u8, ech_list, server.tls13Config(false).ech_retry_config_list);
+    try std.testing.expectEqual(live_sni, server.reload_sni.?.certs.ptr);
 }
 
 test "TLS metrics count handshakes, failures and kTLS, and report OCSP state and certificate expiry without ACME" {
