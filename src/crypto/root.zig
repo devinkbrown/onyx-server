@@ -14,6 +14,7 @@ pub const crl = @import("crl.zig");
 pub const ecdh_p256 = @import("ecdh_p256.zig");
 pub const ecdsa_kat = @import("ecdsa_kat.zig");
 pub const ecdsa_p256 = @import("ecdsa_p256.zig");
+pub const ech_kat = @import("ech_kat.zig");
 pub const ech_seal = @import("ech_seal.zig");
 pub const ed25519_batch = @import("ed25519_batch.zig");
 pub const hash_kat = @import("hash_kat.zig");
@@ -65,9 +66,11 @@ pub const webauthn = @import("webauthn.zig");
 pub const webpush = @import("webpush.zig");
 pub const windows_chain_policy = @import("windows_chain_policy.zig");
 pub const wycheproof_kat = @import("wycheproof_kat.zig");
+pub const x25519mlkem768_kat = @import("x25519mlkem768_kat.zig");
 pub const x509_props = @import("x509_props.zig");
 pub const x509_verify = @import("x509_verify.zig");
 pub const x509 = @import("x509.zig");
+pub const xwing_kat = @import("xwing_kat.zig");
 pub const xwing = @import("xwing.zig");
 pub const zig_compat = @import("zig_compat.zig");
 // gen:mods:end
@@ -86,6 +89,7 @@ test {
     _ = ecdh_p256;
     _ = ecdsa_kat;
     _ = ecdsa_p256;
+    _ = ech_kat;
     _ = ech_seal;
     _ = ed25519_batch;
     _ = hash_kat;
@@ -137,9 +141,11 @@ test {
     _ = webpush;
     _ = windows_chain_policy;
     _ = wycheproof_kat;
+    _ = x25519mlkem768_kat;
     _ = x509_props;
     _ = x509_verify;
     _ = x509;
+    _ = xwing_kat;
     _ = xwing;
     _ = zig_compat;
     // gen:tests:end
