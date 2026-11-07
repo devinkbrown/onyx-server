@@ -23439,7 +23439,6 @@ pub const LinuxServer = struct {
     /// checked by `challenge_mod.admit`. A pass clears the hold and may emit 001.
     /// It does not log the client into an account.
     pub fn handleChallenge(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, parsed: *const irc_line.LineView) !void {
-        _ = id;
         const p = parsed.paramSlice();
         if (conn.session.registered()) {
             if (!conn.session.isOper()) {
@@ -23501,6 +23500,7 @@ pub const LinuxServer = struct {
         var replies = dispatch.ReplyCtx.init(&storage);
         try dispatch.releaseChallengeHold(&conn.session, &replies);
         if (try self.rejectUnauthenticatedRegistrationNick(conn)) return;
+        if (try self.rejectInUseRegistrationNick(id, conn, false)) return;
         if (replies.written().len != 0) try appendToConn(conn, replies.written());
     }
 
@@ -23801,6 +23801,7 @@ pub const LinuxServer = struct {
                 else => return err,
             };
             if (try self.rejectUnauthenticatedRegistrationNick(conn)) return;
+            if (try self.rejectInUseRegistrationNick(id, conn, was_registered)) return;
             if (sink.written().len != 0) try appendToConn(conn, sink.written());
             if (std.ascii.eqlIgnoreCase(parsed.command, "AUTHENTICATE"))
                 conn.sasl_external_authenticated = external_exchange and
@@ -24319,6 +24320,38 @@ pub const LinuxServer = struct {
                 logConnectionDiagnostic(conn, .nick_denial_output, 0, err, .registered_nick);
                 conn.closing = true;
             },
+            else => return err,
+        };
+        return true;
+    }
+
+    /// Pre-welcome nick collision check. The preregistration dispatch stages
+    /// NICK and emits the 001 burst before `registerConnNick` claims the World
+    /// nickname, so a nick already held anywhere on the mesh was only found
+    /// after the welcome and the connection was closed. Roll the registration
+    /// back before any welcome byte is written, answer 433, and keep the
+    /// transport so the client can retry NICK (RFC 2812 §3.1.2). The
+    /// same-account shared-nick attach keeps its existing admission.
+    fn rejectInUseRegistrationNick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, was_registered: bool) !bool {
+        if (was_registered or !conn.session.registered()) return false;
+        if (conn.s2s != null or conn.s2s_secured != null) return false;
+        const nick = conn.session.displayName();
+        if (std.mem.eql(u8, nick, "*")) return false;
+        const holder = self.world.findNick(nick) orelse return false;
+        if (holder.eql(worldIdFromClient(id))) return false;
+        if (conn.session.account()) |acct| {
+            if (self.nickHeldBySameAccount(nick, acct, worldIdFromClient(id))) return false;
+        }
+        conn.session.registration.registered = false;
+        conn.session.registration.nick_seen = false;
+        conn.session.client.registration.prereg = .user_seen;
+        queueNumeric(conn, .ERR_NICKNAMEINUSE, &.{nick}, "Nickname is already in use") catch |err| switch (err) {
+            error.OutputTooSmall,
+            error.TextTooLong,
+            error.NoSpaceLeft,
+            error.OversizeLine,
+            error.LineTooLong,
+            => conn.closing = true,
             else => return err,
         };
         return true;
@@ -126029,6 +126062,47 @@ test "threaded server: pre-registration REGISTER fails and CAP LS 302 advertises
     try writeAllFd(fd, "REGISTER newacct * pw\r\n");
     try recvUntil(&client, "FAIL REGISTER COMPLETE_CONNECTION_REQUIRED", 200);
     try std.testing.expect(std.mem.indexOf(u8, client.written(), " 421 ") == null);
+}
+
+test "threaded server: a nick already in use answers 433 before 001 and keeps the connection for a retry" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thr = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wfd| closeFd(wfd) else |_| {}
+        thr.join();
+    }
+
+    const fd_first = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_first);
+    var first = LiveClient{ .fd = fd_first };
+    try writeAllFd(fd_first, "NICK guest\r\nUSER webchat 0 * :guest\r\n");
+    try recvUntil(&first, " 001 guest ", 200);
+
+    // The Onyx web client always registers as "guest". A second "guest" used
+    // to get the 001 burst and then a closed socket; now it gets 433 before
+    // any welcome and the transport stays usable for a NICK retry.
+    const fd_second = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd_second);
+    var second = LiveClient{ .fd = fd_second };
+    try writeAllFd(fd_second, "NICK guest\r\nUSER webchat 0 * :guest\r\n");
+    try recvUntil(&second, " 433 ", 200);
+    try std.testing.expect(std.mem.indexOf(u8, second.written(), " 001 ") == null);
+    second.reset();
+    try writeAllFd(fd_second, "NICK guest2\r\nPING :in-use-retry-alive\r\n");
+    try recvUntil(&second, " :in-use-retry-alive\r\n", 200);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(second.written(), " 001 guest2 "));
+
+    // The first holder is untouched.
+    first.reset();
+    try writeAllFd(fd_first, "PING :first-still-alive\r\n");
+    try recvUntil(&first, " :first-still-alive\r\n", 200);
 }
 
 test "threaded server: registered nick requires owner authentication before use" {
