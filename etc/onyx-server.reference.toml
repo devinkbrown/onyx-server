@@ -271,8 +271,9 @@ debug_log = false
 # Additional SNI-selectable certificates. Each entry is loaded with the same
 # cert/key loader as the default certificate and is validated before the TLS
 # listener is wired. A bad entry disables TLS startup rather than running with a
-# partial certificate set. On Linux and OpenBSD, REHASH and ACME renewal reload
-# these together with the default certificate, all or nothing.
+# partial certificate set. On Linux and OpenBSD, REHASH reloads these together
+# with the default certificate, all or nothing; ACME renewal reloads only the
+# default certificate.
 # [[tls.sni]]
 # server_names = ["irc.example.net", "*.example.net"]
 # cert_path = "/etc/onyx-server/tls/example.pem"

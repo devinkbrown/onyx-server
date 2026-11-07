@@ -2798,7 +2798,8 @@ const reloadable_config_fields = [_][]const u8{
 } ++ tls_sni_ech_reloadable_fields;
 
 /// SNI certificates and ECH keys are re-read and swapped transactionally with
-/// the default certificate on REHASH and ACME reload. Native Windows keeps them
+/// the default certificate on REHASH (ACME renewal reloads only the default
+/// certificate). Native Windows keeps them
 /// as static Helix-proof inputs, so there they still need a restart.
 const tls_sni_ech_reloadable_fields: [if (builtin.os.tag == .windows) 0 else 2][]const u8 =
     if (builtin.os.tag == .windows) .{} else .{ "tls.sni", "tls.ech_keys" };

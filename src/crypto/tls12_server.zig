@@ -852,11 +852,11 @@ pub const Server = struct {
                     // records honor it and echo our own limit in the ServerHello.
                     if (body.len != 2) return error.InvalidRecordSizeLimit;
                     const limit = std.mem.readInt(u16, body[0..2], .big);
-                    // RFC 8449 section 4: a server MAY enforce the upper bound.
-                    // 2^14+1 is the largest value any TLS version defines (TLS
-                    // 1.3; dual-version clients send it on a 1.2 fallback), so
-                    // anything above it is refused rather than silently clamped.
-                    if (limit < tls_record.record_size_limit_min or limit > tls_record.record_size_limit_max) return error.InvalidRecordSizeLimit;
+                    // RFC 8449 section 4: a server MUST NOT enforce the upper
+                    // bound (a client may advertise a limit enabled by an
+                    // extension or version this server does not understand);
+                    // the value is clamped where used (recordContentLimit12).
+                    if (limit < tls_record.record_size_limit_min) return error.InvalidRecordSizeLimit;
                     self.peer_record_size_limit = limit;
                     self.client_offered_record_size_limit = true;
                 },
@@ -2412,22 +2412,12 @@ test "TLS 1.2 server rejects an out-of-range record_size_limit (RFC 8449)" {
     const too_small = [_]u8{ 0x00, 0x1c, 0x00, 0x02, 0x00, 0x3f };
     try std.testing.expectError(error.InvalidRecordSizeLimit, server.parseClientExtensions(&too_small));
 
-    // A9: 16386 is one above the largest value any TLS version defines
-    // (2^14+1); it is refused as illegal_parameter instead of being clamped.
-    var above = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
-    defer above.deinit();
-    const too_large = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 23, 0x00, 0x1c, 0x00, 0x02, 0x40, 0x02 };
-    try std.testing.expectError(error.InvalidRecordSizeLimit, above.parseClientExtensions(&too_large));
-    try std.testing.expect(!above.client_offered_record_size_limit);
-    try std.testing.expectEqual(tls_server.AlertDescription.illegal_parameter, tls_server.alertDescriptionForError(error.InvalidRecordSizeLimit).?);
-
-    // 2^14+1 (what dual-version TLS 1.3 clients advertise on a 1.2 fallback)
-    // is the accepted maximum; effective outbound content stays capped at 16384.
-    var at_max = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
-    defer at_max.deinit();
-    const max_limit = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 23, 0x00, 0x1c, 0x00, 0x02, 0x40, 0x01 };
-    try at_max.parseClientExtensions(&max_limit);
-    try std.testing.expectEqual(@as(usize, 16385), at_max.peer_record_size_limit);
+    // Future raw advertisements above the current protocol maximum are valid
+    // (RFC 8449 section 4: a server MUST NOT enforce the upper bound);
+    // effective outbound content is still capped at 16384.
+    const future_limit = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 23, 0x00, 0x1c, 0x00, 0x02, 0x40, 0x02 };
+    try server.parseClientExtensions(&future_limit);
+    try std.testing.expectEqual(@as(usize, 16386), server.peer_record_size_limit);
 
     // A wrong-length body (1 byte instead of 2) is also rejected.
     var malformed = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
@@ -3706,21 +3696,15 @@ test "TLS record limit: TLS12 negotiated64 full and resumed flights use version-
     }
 }
 
-test "TLS record limit: TLS12 rejects above-maximum advertisement and caps output at the maximum" {
+test "TLS record limit: TLS12 accepts future peer advertisement with protocol-capped output" {
     const a = std.testing.allocator;
     const fixture = try makeFixture(a);
     defer fixture.deinit(a);
-    // A9 (RFC 8449 section 4): values above 2^14+1 are illegal_parameter.
-    var rejecting = try Server.init(a, .{ .cert_chain = &.{fixture.cert}, .ecdsa_p256_signing_key = fixture.key });
-    defer rejecting.deinit();
-    const future = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 23, 0, 28, 0, 2, 255, 255 };
-    try std.testing.expectError(error.InvalidRecordSizeLimit, rejecting.parseClientExtensions(&future));
-
     var server = try Server.init(a, .{ .cert_chain = &.{fixture.cert}, .ecdsa_p256_signing_key = fixture.key });
     defer server.deinit();
-    const at_max = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 23, 0, 28, 0, 2, 0x40, 0x01 };
-    try server.parseClientExtensions(&at_max);
-    try std.testing.expectEqual(@as(usize, 16385), server.peer_record_size_limit);
+    const future = [_]u8{ 0, 10, 0, 4, 0, 2, 0, 23, 0, 28, 0, 2, 255, 255 };
+    try server.parseClientExtensions(&future);
+    try std.testing.expectEqual(@as(usize, 65535), server.peer_record_size_limit);
     server.state = .connected;
     server.selected_suite = .tls_ecdhe_ecdsa_with_aes_128_gcm_sha256;
     const payload: [17000]u8 = @splat(0x77);
