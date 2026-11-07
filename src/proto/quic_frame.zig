@@ -103,6 +103,32 @@ pub const OtherFrame = struct {
     ack_eliciting: bool,
 };
 
+/// Whether `frame` may appear in a 0-RTT packet (RFC 9000 §12.4 Table 3 and
+/// §17.2.3). ACK, CRYPTO, HANDSHAKE_DONE, NEW_TOKEN, PATH_RESPONSE and
+/// RETIRE_CONNECTION_ID are forbidden; a receiver MUST treat any of them in
+/// 0-RTT as a connection error of type PROTOCOL_VIOLATION.
+pub fn permittedInZeroRtt(frame: Frame) bool {
+    return switch (frame) {
+        .ACK, .CRYPTO, .HANDSHAKE_DONE, .PATH_RESPONSE => false,
+        .OTHER => |o| o.frame_type != 0x07 and o.frame_type != 0x19,
+        else => true,
+    };
+}
+
+test "permittedInZeroRtt follows RFC 9000 §12.4 Table 3" {
+    try std.testing.expect(permittedInZeroRtt(.{ .PING = {} }));
+    try std.testing.expect(permittedInZeroRtt(.{ .STREAM = .{ .stream_id = 0, .offset = 0, .fin = false, .len = 0, .data = "" } }));
+    try std.testing.expect(permittedInZeroRtt(.{ .MAX_DATA = 1 }));
+    try std.testing.expect(permittedInZeroRtt(.{ .PATH_CHALLENGE = @splat(0) }));
+    try std.testing.expect(permittedInZeroRtt(.{ .OTHER = .{ .frame_type = 0x04, .ack_eliciting = true } })); // RESET_STREAM
+    try std.testing.expect(!permittedInZeroRtt(.{ .ACK = .{ .largest = 0, .delay = 0, .first_range = 0, .ranges = &.{} } }));
+    try std.testing.expect(!permittedInZeroRtt(.{ .CRYPTO = .{ .offset = 0, .len = 0, .data = "" } }));
+    try std.testing.expect(!permittedInZeroRtt(.{ .HANDSHAKE_DONE = {} }));
+    try std.testing.expect(!permittedInZeroRtt(.{ .PATH_RESPONSE = @splat(0) }));
+    try std.testing.expect(!permittedInZeroRtt(.{ .OTHER = .{ .frame_type = 0x07, .ack_eliciting = true } })); // NEW_TOKEN
+    try std.testing.expect(!permittedInZeroRtt(.{ .OTHER = .{ .frame_type = 0x19, .ack_eliciting = true } })); // RETIRE_CONNECTION_ID
+}
+
 pub const DecodedFrame = struct {
     frame: Frame,
     len: usize,

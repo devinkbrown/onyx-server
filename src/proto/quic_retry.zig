@@ -32,21 +32,18 @@
 //!     server replies with a VN packet listing the versions it supports (just
 //!     v1). It is never larger than the triggering packet's wire length, so it
 //!     cannot be used as an amplifier.
-//!   * `statelessResetToken` — the 16-byte stateless-reset token (RFC 9000 §10.3)
-//!     derived as HMAC-SHA256(reset_key, connection_id)[0..16]. See the module
-//!     note on what of the stateless-reset *send path* is deferred.
-//!
-//! Stateless reset (RFC 9000 §10.3) — partial, documented
-//! ------------------------------------------------------
-//! We implement the **token derivation** (the security-critical, must-be-exact
-//! part: a per-process key + HMAC so a token cannot be forged or correlated) and
-//! `encodeStatelessReset`, which formats a stateless-reset packet (a short header
-//! with random bytes followed by the 16-byte token). What is **deferred** (a
-//! typed gap, not silent): the listener does not yet *emit* a stateless reset on
-//! receipt of a short-header packet whose DCID matches no live connection — that
-//! requires the listener to remember recently-retired CIDs (or derive the token
-//! from the unknown DCID and reply) and is wired as a follow-up. The pieces here
-//! are everything needed to add that send path without new crypto.
+//!   * `statelessResetToken` / `statelessResetTokenWithKey` — the 16-byte
+//!     stateless-reset token (RFC 9000 §10.3) derived as
+//!     HMAC-SHA256(reset_key, connection_id)[0..16]. RFC 9000 §10.3.2
+//!     recommends a *static* key so tokens survive a restart (the case a reset
+//!     exists for); `deriveStaticResetKey` turns long-lived operator material
+//!     into such a key with domain separation.
+//!   * `encodeStatelessReset`, `statelessResetLen`, `RecentResets` — the send
+//!     path's packet format and its loop/amplification guards: a reset is
+//!     always strictly shorter than its trigger (§10.3.3, so two endpoints can
+//!     never reset each other forever) and is never sent in response to a
+//!     packet that ends in a token we derive or recently emitted (it could be
+//!     one of our own resets reflected back). The listener adds rate limiting.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -507,11 +504,78 @@ pub const ReplayCache = struct {
 /// per-process `reset_key` makes the token unforgeable and uncorrelatable across
 /// connection ids without the key.
 pub fn statelessResetToken(secret: *const Secret, connection_id: []const u8) [stateless_reset_token_len]u8 {
+    return statelessResetTokenWithKey(&secret.reset_key, connection_id);
+}
+
+/// `statelessResetToken` under an explicit 32-byte key (e.g. a static key from
+/// `deriveStaticResetKey`).
+pub fn statelessResetTokenWithKey(key: *const [32]u8, connection_id: []const u8) [stateless_reset_token_len]u8 {
     var mac: [HmacSha256.mac_length]u8 = undefined;
-    HmacSha256.create(&mac, connection_id, &secret.reset_key);
+    HmacSha256.create(&mac, connection_id, key);
+    defer std.crypto.secureZero(u8, &mac);
     var token: [stateless_reset_token_len]u8 = undefined;
     @memcpy(&token, mac[0..stateless_reset_token_len]);
     return token;
+}
+
+/// Derive a static stateless-reset key (RFC 9000 §10.3.2: "a single static
+/// key ... used to generate stateless reset tokens for all connections") from
+/// long-lived secret input key material, e.g. an operator-configured secret or
+/// the TLS private key. HKDF-SHA256 with a fixed, versioned label so the
+/// output is unrelated to any other use of the same material.
+pub fn deriveStaticResetKey(ikm: []const u8) [32]u8 {
+    const Hkdf = crypto.kdf.hkdf.HkdfSha256;
+    var prk = Hkdf.extract("onyx quic stateless reset key v1", ikm);
+    defer std.crypto.secureZero(u8, &prk);
+    var out: [32]u8 = undefined;
+    Hkdf.expand(&out, "stateless-reset", prk);
+    return out;
+}
+
+/// RFC 9000 §10.3.3 sizing: a reset MUST be smaller than the packet that
+/// triggered it (strictly shorter, so a reset can never trigger an equally
+/// sized reset and two endpoints cannot loop), no larger than `cap`, and at
+/// least `min_stateless_reset_len`. Null means "send nothing".
+pub fn statelessResetLen(trigger_len: usize, cap: usize) ?usize {
+    if (trigger_len == 0) return null;
+    const len = @min(trigger_len - 1, cap);
+    if (len < min_stateless_reset_len) return null;
+    return len;
+}
+
+/// A bounded ring of the stateless-reset tokens this endpoint recently put on
+/// the wire. A trigger whose trailing 16 bytes match one of them is very likely
+/// one of our own resets reflected back (or bounced by a peer sharing our static
+/// key) and must not be answered. Comparisons are constant-time.
+pub const RecentResets = struct {
+    pub const capacity: usize = 32;
+    tokens: [capacity][stateless_reset_token_len]u8 = @splat(@splat(0)),
+    len: usize = 0,
+    next: usize = 0,
+
+    pub fn record(self: *RecentResets, token: [stateless_reset_token_len]u8) void {
+        self.tokens[self.next] = token;
+        self.next = (self.next + 1) % capacity;
+        if (self.len < capacity) self.len += 1;
+    }
+
+    pub fn contains(self: *const RecentResets, tail: []const u8) bool {
+        if (tail.len != stateless_reset_token_len) return false;
+        var hit = false;
+        for (self.tokens[0..self.len]) |*t| hit = secure_fns.ctEq(t, tail) or hit;
+        return hit;
+    }
+};
+
+/// Whether a short-header datagram addressed to `dcid` could itself be a
+/// stateless reset of ours: it ends in the token we would emit for `dcid`
+/// (e.g. a reset bounced between two nodes sharing the static key) or in one
+/// we recently emitted. Such a packet MUST NOT be answered with a reset.
+pub fn mightBeOwnReset(key: *const [32]u8, recent: *const RecentResets, dcid: []const u8, datagram: []const u8) bool {
+    if (datagram.len < stateless_reset_token_len) return false;
+    const tail = datagram[datagram.len - stateless_reset_token_len ..];
+    const own = statelessResetTokenWithKey(key, dcid);
+    return secure_fns.ctEq(&own, tail) or recent.contains(tail);
 }
 
 /// Minimum length of a packet that may carry a stateless reset (RFC 9000
@@ -526,10 +590,6 @@ pub const min_stateless_reset_len: usize = 21;
 /// is shaped like a short-header 1-RTT packet). `out.len` MUST be at least
 /// `min_stateless_reset_len`; the caller sizes it to mimic a plausible 1-RTT
 /// packet (and never larger than the triggering packet, to avoid amplification).
-///
-/// Deferred send path: the listener does not yet invoke this on an
-/// unknown short-header DCID — see the module doc. This function + the token
-/// derivation are the complete, tested building blocks for that follow-up.
 pub fn encodeStatelessReset(
     out: []u8,
     token: [stateless_reset_token_len]u8,
@@ -777,4 +837,59 @@ test "encodeStatelessReset embeds the token in the trailing 16 bytes and looks 1
     // Too-small output is rejected.
     var tiny: [8]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, encodeStatelessReset(&tiny, token));
+}
+
+test "static stateless-reset key is deterministic, domain-separated, and keys the token" {
+    const a = deriveStaticResetKey("operator secret");
+    try testing.expectEqualSlices(u8, &a, &deriveStaticResetKey("operator secret"));
+    try testing.expect(!std.mem.eql(u8, &a, &deriveStaticResetKey("operator secreT")));
+    const cid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const t1 = statelessResetTokenWithKey(&a, &cid);
+    // Same key across a "restart": the same CID yields the same token.
+    const b = deriveStaticResetKey("operator secret");
+    try testing.expectEqualSlices(u8, &t1, &statelessResetTokenWithKey(&b, &cid));
+    // A forged token under another key does not match.
+    const other = deriveStaticResetKey("attacker");
+    try testing.expect(!std.mem.eql(u8, &t1, &statelessResetTokenWithKey(&other, &cid)));
+    // The Secret-based API is the same HMAC.
+    var seed: [64]u8 = @splat(0);
+    @memcpy(seed[32..], &a);
+    const secret = Secret.fromSeed(seed);
+    try testing.expectEqualSlices(u8, &t1, &statelessResetToken(&secret, &cid));
+}
+
+test "stateless reset is always strictly shorter than its trigger and bounded (RFC 9000 §10.3.3)" {
+    try testing.expectEqual(@as(?usize, null), statelessResetLen(0, 64));
+    try testing.expectEqual(@as(?usize, null), statelessResetLen(21, 64)); // would need 21 < 21
+    try testing.expectEqual(@as(?usize, 21), statelessResetLen(22, 64));
+    try testing.expectEqual(@as(?usize, 42), statelessResetLen(43, 64));
+    try testing.expectEqual(@as(?usize, 64), statelessResetLen(1200, 64));
+    // A reset answering a reset shrinks every round, so a loop terminates.
+    var len: usize = 64;
+    var rounds: usize = 0;
+    while (statelessResetLen(len, 64)) |next| : (rounds += 1) {
+        try testing.expect(next < len);
+        len = next;
+    }
+    try testing.expect(rounds < 64);
+}
+
+test "a datagram ending in our own (or a recently sent) reset token is recognised as possibly ours" {
+    const key = deriveStaticResetKey("k");
+    var recent: RecentResets = .{};
+    const dcid = [_]u8{ 9, 9, 9, 9, 9, 9, 9, 9 };
+    var dg: [40]u8 = @splat(0x41);
+    try testing.expect(!mightBeOwnReset(&key, &recent, &dcid, &dg));
+    // Ends in the token we would emit for this very DCID.
+    dg[24..40].* = statelessResetTokenWithKey(&key, &dcid);
+    try testing.expect(mightBeOwnReset(&key, &recent, &dcid, &dg));
+    // Ends in a token we recently emitted for some other DCID.
+    const other_tok = statelessResetTokenWithKey(&key, "other-cid");
+    dg[24..40].* = other_tok;
+    try testing.expect(!mightBeOwnReset(&key, &recent, &dcid, &dg));
+    recent.record(other_tok);
+    try testing.expect(mightBeOwnReset(&key, &recent, &dcid, &dg));
+    // The ring is bounded.
+    for (0..RecentResets.capacity) |i| recent.record(@splat(@intCast(i + 1)));
+    try testing.expect(!recent.contains(&other_tok));
 }

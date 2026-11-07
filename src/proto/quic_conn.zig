@@ -61,8 +61,11 @@
 //!     persistent-congestion collapse (§7.6); ECN and pacing are deferred (typed
 //!     gaps).
 //!   * One connection id per side; no Retry (handled by the listener layer), no
-//!     stateless-reset *emit* (also the listener's job — this layer derives no
-//!     reset tokens), no 0-RTT. Connection migration + path validation (RFC 9000
+//!     stateless-reset *emit* (also the listener's job; the server only
+//!     advertises the token it is configured with, and the client detects a
+//!     reset per RFC 9000 §10.3.1). 0-RTT is accepted server-side when the
+//!     handshake accepted early data (RFC 9001 §4.6; frames restricted per RFC
+//!     9000 §12.4); this driver never *sends* 0-RTT. Connection migration + path validation (RFC 9000
 //!     §8.2/§9) ARE implemented here: a 1-RTT packet from a new source address on
 //!     an established server connection starts a PATH_CHALLENGE probe to the new
 //!     path (with its own 3× anti-amplification budget), and only a matching
@@ -72,8 +75,8 @@
 //!     and self-initiated updates, previous-generation key retention for
 //!     reordering, peer-update rate limiting, and the confidentiality-limit
 //!     counters. It is a 1-RTT-only mechanism (never the Initial/Handshake
-//!     spaces) and is unavailable for the SHA-384 suite (documented in
-//!     `initKeyUpdate`).
+//!     spaces) and covers every suite, including TLS_AES_256_GCM_SHA384 with
+//!     48-byte "quic ku" secrets (see `initKeyUpdate`).
 //!   * The receive side enforces frame-level bounds via the Engine; this driver
 //!     additionally bounds-checks every byte of packet parsing so a malicious or
 //!     truncated datagram errors (never panics / reads out of bounds).
@@ -91,6 +94,11 @@ const quic_transport_params = @import("quic_transport_params.zig");
 const quic_recovery = @import("quic_recovery.zig");
 const secure_fns = @import("secure_fns.zig");
 const kx = @import("../crypto/kx.zig");
+
+/// Width of the handshake's stored traffic secrets (SHA-384).
+const quic_handshake_max_hash: usize = 48;
+/// RFC 9000 §20.1 PROTOCOL_VIOLATION.
+pub const transport_error_protocol_violation: u64 = 0x0a;
 
 pub const EncryptionLevel = quic_protect.EncryptionLevel;
 pub const KeySet = quic_protect.KeySet;
@@ -310,6 +318,18 @@ pub const ServerConfig = struct {
     /// Deterministic handshake material (tests only).
     x25519_seed: ?[32]u8 = null,
     server_random: ?[32]u8 = null,
+    /// Handshake policy passed through to `quic_handshake.Config` (see there):
+    /// group order / HRR, session tickets, 0-RTT (off by default) and the
+    /// stateless-reset token advertised for `local_cid`.
+    group_order: []const quic_handshake.KeyExchangeGroup = &quic_handshake.default_group_order,
+    ticket_key: ?[32]u8 = null,
+    previous_ticket_key: ?[32]u8 = null,
+    ticket_lifetime_seconds: u32 = 86_400,
+    now_unix_seconds: ?i64 = null,
+    enable_early_data: bool = false,
+    replay_guard: ?*quic_handshake.EarlyDataReplayGuard = null,
+    early_data_age_skew_ms: u32 = 10_000,
+    stateless_reset_token: ?[16]u8 = null,
 };
 
 /// Client-role connection configuration.
@@ -325,6 +345,14 @@ pub const ClientConfig = struct {
     engine: quic_conn_state.Config = .{},
     x25519_seed: ?[32]u8 = null,
     client_random: ?[32]u8 = null,
+    /// Offered cipher suites and an optional session to resume (passed to
+    /// `quic_handshake.ClientConfig`). This driver does not send 0-RTT.
+    cipher_suites: []const quic_handshake.CipherSuite = &.{ .tls_aes_128_gcm_sha256, .tls_aes_256_gcm_sha384, .tls_chacha20_poly1305_sha256 },
+    session: ?quic_handshake.Session = null,
+    ticket_age_ms: u32 = 0,
+    /// Derive 0-RTT keys for `session` (exposed via the handshake); this driver
+    /// itself never emits 0-RTT packets.
+    offer_early_data: bool = false,
 };
 
 /// A queued application STREAM write awaiting an outbound 1-RTT packet.
@@ -411,17 +439,25 @@ pub const OutDatagram = struct {
 const SendState = struct {
     crypto_initial: quic_conn_state.CryptoSendBuffer = quic_conn_state.CryptoSendBuffer.init(),
     crypto_handshake: quic_conn_state.CryptoSendBuffer = quic_conn_state.CryptoSendBuffer.init(),
+    /// Post-handshake 1-RTT CRYPTO (the server's NewSessionTicket, RFC 9001
+    /// §4.1.3). Only ever written after handshake confirmation, which is what
+    /// lets `rewindCryptoTo` attribute a lost CRYPTO range to its level: before
+    /// confirmation all CRYPTO is Initial/Handshake, after it (both handshake
+    /// spaces discarded, RFC 9002 §6.4) all CRYPTO is 1-RTT. Not carried in
+    /// Helix snapshots: an unacknowledged ticket is simply dropped.
+    crypto_application: quic_conn_state.CryptoSendBuffer = quic_conn_state.CryptoSendBuffer.init(),
 
     fn deinit(self: *SendState, allocator: Allocator) void {
         self.crypto_initial.deinit(allocator);
         self.crypto_handshake.deinit(allocator);
+        self.crypto_application.deinit(allocator);
     }
 
     fn cryptoBuf(self: *SendState, level: EncryptionLevel) ?*quic_conn_state.CryptoSendBuffer {
         return switch (level) {
             .initial => &self.crypto_initial,
             .handshake => &self.crypto_handshake,
-            .application => null, // 1-RTT CRYPTO (post-handshake) is out of scope here
+            .application => &self.crypto_application,
         };
     }
 };
@@ -816,9 +852,44 @@ pub const ConnSnapshot = struct {
             self.path_validation.bytes_sent > self.path_validation.bytes_received *| 3)) return invalidServerSnapshot("active path validation");
         if (!self.path_validation.active and (!std.meta.eql(self.path_validation, PathValidation{})))
             return invalidServerSnapshot("inactive path validation");
-        if (self.key_update.ready != (self.handshake.suite != .tls_aes_256_gcm_sha384))
+        // SHA-256 suites are always key-update ready. A SHA-384 connection is
+        // ready when captured by this version (48-byte current secrets in the
+        // handshake ap-secret slots) or idle when captured by a version that
+        // had no SHA-384 key update; restore seeds the latter at generation 0.
+        // Compatibility is one-way by design: the wire schema is unchanged,
+        // but a binary predating SHA-384 key update requires `ready == false`
+        // for this suite and so fails closed (aborting the transactional
+        // adopt) on any live TLS_AES_256_GCM_SHA384 connection captured here.
+        // Emitting the legacy idle form instead would drop the §6.6 AEAD
+        // confidentiality-limit counters across each such handoff, so Helix
+        // DOWNGRADE across this change is unsupported for SHA-384 connections
+        // (SHA-384 is chosen only when the client does not offer AES-128-GCM).
+        const wide = self.handshake.suite == .tls_aes_256_gcm_sha384;
+        if (!wide and !self.key_update.ready)
             return invalidServerSnapshot("key update readiness");
-        if (self.key_update.ready) {
+        if (self.key_update.ready and wide) {
+            if (self.key_update.suite != .aes256gcm or
+                self.key_update.suite != self.app_keys.write.suite or
+                self.key_update.suite != self.app_keys.read.suite or
+                !std.mem.allEqual(u8, &self.key_update.write_secret, 0) or
+                !std.mem.allEqual(u8, &self.key_update.read_secret, 0) or
+                !std.mem.allEqual(u8, &self.key_update.next_read_secret, 0))
+                return invalidServerSnapshot("wide key update shape");
+            var next: [quic_handshake_max_hash]u8 = undefined;
+            defer std.crypto.secureZero(u8, &next);
+            quic_handshake.nextTrafficSecret(&self.handshake.client_ap_secret, &next);
+            if (!std.meta.eql(self.key_update.next_read, quic_handshake.keyUpdateDirection(self.app_keys.read, &next)))
+                return invalidServerSnapshot("next key update read keys");
+            const write = quic_handshake.packetKeysFromSecret(.aes256gcm, &self.handshake.server_ap_secret);
+            const read = quic_handshake.packetKeysFromSecret(.aes256gcm, &self.handshake.client_ap_secret);
+            if (!std.mem.eql(u8, write.keyBytes(), self.app_keys.write.keyBytes()) or
+                !std.mem.eql(u8, &write.iv, &self.app_keys.write.iv) or
+                !std.mem.eql(u8, read.keyBytes(), self.app_keys.read.keyBytes()) or
+                !std.mem.eql(u8, &read.iv, &self.app_keys.read.iv) or
+                !std.mem.eql(u8, self.app_keys.write.hpBytes(), self.handshake.application_keys.write.hpBytes()) or
+                !std.mem.eql(u8, self.app_keys.read.hpBytes(), self.handshake.application_keys.read.hpBytes()))
+                return invalidServerSnapshot("key update current keys");
+        } else if (self.key_update.ready) {
             if (self.key_update.suite != self.app_keys.write.suite or
                 self.key_update.suite != self.app_keys.read.suite or
                 !std.mem.eql(u8, &self.key_update.next_read_secret, &quic_tls.nextGenerationSecret(self.key_update.read_secret)) or
@@ -1018,6 +1089,24 @@ pub const Conn = struct {
     /// key phase stays 0.
     key_update: KeyUpdate = .{},
 
+    /// (Server) 0-RTT read keys, present only when the handshake accepted
+    /// early data (RFC 9001 §4.6). 0-RTT packets share the application
+    /// packet-number space (RFC 9000 §12.3). Discarded once an authenticated
+    /// 1-RTT packet arrives on the established connection (RFC 9001 §4.9.3).
+    /// Not part of the Helix snapshot (late 0-RTT after a handoff is dropped).
+    zero_rtt_keys: ?PacketKeys = null,
+    zero_rtt_discarded: bool = false,
+    /// Transient: the packet being processed is a short-header 1-RTT packet.
+    recv_is_1rtt: bool = false,
+    /// Transient: a 1-RTT packet in the current datagram failed to decrypt
+    /// (input to stateless-reset detection, RFC 9000 §10.3.1).
+    recv_open_failed: bool = false,
+    /// Transient: the current 1-RTT packet authenticated.
+    recv_1rtt_ok: bool = false,
+    /// (Client) the peer ended the connection with a valid Stateless Reset
+    /// (RFC 9000 §10.3.1): draining, nothing more is sent.
+    stateless_reset_received: bool = false,
+
     /// Long-header connection ids. `dcid` = the peer's, `scid` = ours.
     dcid: ConnectionId,
     scid: ConnectionId,
@@ -1164,6 +1253,15 @@ pub const Conn = struct {
             .transport_params = config.transport_params,
             .x25519_seed = config.x25519_seed,
             .server_random = config.server_random,
+            .group_order = config.group_order,
+            .ticket_key = config.ticket_key,
+            .previous_ticket_key = config.previous_ticket_key,
+            .ticket_lifetime_seconds = config.ticket_lifetime_seconds,
+            .now_unix_seconds = config.now_unix_seconds,
+            .enable_early_data = config.enable_early_data,
+            .replay_guard = config.replay_guard,
+            .early_data_age_skew_ms = config.early_data_age_skew_ms,
+            .stateless_reset_token = config.stateless_reset_token,
         }) catch return error.HandshakeFailed;
         errdefer server.deinit();
 
@@ -1181,6 +1279,10 @@ pub const Conn = struct {
             // RFC 9000 §7.3: authenticate the server's connection-id transport
             // parameters against the DCID of our first Initial.
             .original_dcid = config.initial_dcid,
+            .cipher_suites = config.cipher_suites,
+            .session = config.session,
+            .ticket_age_ms = config.ticket_age_ms,
+            .offer_early_data = config.offer_early_data,
         }) catch return error.HandshakeFailed;
         errdefer client.deinit();
 
@@ -1263,6 +1365,7 @@ pub const Conn = struct {
         std.crypto.secureZero(u8, std.mem.asBytes(&self.handshake_keys));
         std.crypto.secureZero(u8, std.mem.asBytes(&self.app_keys));
         std.crypto.secureZero(u8, std.mem.asBytes(&self.key_update));
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.zero_rtt_keys));
         std.crypto.secureZero(u8, &self.initial_secret_dcid);
         self.* = undefined;
     }
@@ -1563,6 +1666,9 @@ pub const Conn = struct {
         result.max_recv_datagrams = snapshot.max_recv_datagrams;
         result.next_bidi_stream = snapshot.next_bidi_stream;
         result.next_uni_stream = snapshot.next_uni_stream;
+        // A SHA-384 connection captured before SHA-384 key update existed is
+        // idle at generation 0 (validated above); arm its key update now.
+        if (!result.key_update.ready) result.initKeyUpdate();
         return result;
     }
 
@@ -1636,27 +1742,64 @@ pub const Conn = struct {
                 self.initKeyUpdate();
             }
         }
+        if (self.zero_rtt_keys == null and !self.zero_rtt_discarded) {
+            switch (self.handshake) {
+                .server => |*s| if (s.earlyDataReadKeys()) |k| {
+                    self.zero_rtt_keys = k;
+                    s.discardEarlyDataKeys(); // the driver owns the only copy now
+                },
+                .client => {},
+            }
+        }
         self.refreshEstablished();
     }
 
     /// Seed the 1-RTT key-update state from the handshake's application traffic
     /// secrets (RFC 9001 §6.1): record the current write/read secrets and
     /// pre-compute the next-generation read keys so a peer-initiated phase flip
-    /// can be trial-decrypted without deriving on the receive path. No-op for a
-    /// suite whose secret width the "quic ku" roll does not support (SHA-384);
-    /// the connection then simply never offers a key update (documented gap).
+    /// can be trial-decrypted without deriving on the receive path.
+    ///
+    /// Both hash widths are supported (RFC 9001 §6.1: "quic ku" uses the
+    /// negotiated suite's hash). SHA-256 suites keep the current-generation
+    /// secrets in `KeyUpdate`; for TLS_AES_256_GCM_SHA384 the 48-byte
+    /// current-generation secrets live in the handshake's `client_ap_secret` /
+    /// `server_ap_secret` slots (already carried by the Helix snapshot), and the
+    /// 32-byte `KeyUpdate` secret fields stay zero. This keeps the snapshot
+    /// layout unchanged.
     fn initKeyUpdate(self: *Conn) void {
         if (self.key_update.ready) return;
         const secrets = self.handshake.appTrafficSecrets() orelse return;
+        const cur_read = (self.app_keys orelse return).read;
         self.key_update.ready = true;
         self.key_update.phase = 0;
         self.key_update.suite = secrets.suite;
-        self.key_update.write_secret = secrets.write;
-        self.key_update.read_secret = secrets.read;
-        // Pre-compute the next-generation read keys (§6.3).
-        self.key_update.next_read_secret = quic_tls.nextGenerationSecret(secrets.read);
-        const cur_read = (self.app_keys orelse return).read;
-        self.key_update.next_read = quic_protect.keyUpdateDirection(cur_read, self.key_update.next_read_secret);
+        if (secrets.hash_len == 32) {
+            self.key_update.write_secret = secrets.write[0..32].*;
+            self.key_update.read_secret = secrets.read[0..32].*;
+            // Pre-compute the next-generation read keys (§6.3).
+            self.key_update.next_read_secret = quic_tls.nextGenerationSecret(self.key_update.read_secret);
+            self.key_update.next_read = quic_protect.keyUpdateDirection(cur_read, self.key_update.next_read_secret);
+        } else {
+            var next: [quic_handshake_max_hash]u8 = undefined;
+            defer std.crypto.secureZero(u8, &next);
+            quic_handshake.nextTrafficSecret(secrets.read[0..secrets.hash_len], next[0..secrets.hash_len]);
+            self.key_update.next_read = quic_handshake.keyUpdateDirection(cur_read, next[0..secrets.hash_len]);
+        }
+    }
+
+    /// Whether the 1-RTT secrets are the 48-byte SHA-384 ones (the only suite
+    /// using AES-256-GCM is TLS_AES_256_GCM_SHA384).
+    fn keyUpdateWide(self: *const Conn) bool {
+        return self.key_update.suite == .aes256gcm;
+    }
+
+    /// The handshake-owned 48-byte current-generation 1-RTT secrets used by
+    /// the SHA-384 key update (own write secret, peer read secret).
+    fn wideAppSecrets(self: *Conn) struct { write: *[quic_handshake_max_hash]u8, read: *[quic_handshake_max_hash]u8 } {
+        return switch (self.handshake) {
+            .server => |*s| .{ .write = &s.server_ap_secret, .read = &s.client_ap_secret },
+            .client => |*c| .{ .write = &c.client_ap_secret, .read = &c.server_ap_secret },
+        };
     }
 
     fn refreshEstablished(self: *Conn) void {
@@ -1729,9 +1872,11 @@ pub const Conn = struct {
         // subsequent no-address recv does not see a stale path.
         self.recv_src = src;
         self.recv_len = datagram.len;
+        self.recv_open_failed = false;
         defer {
             self.recv_src = null;
             self.recv_len = 0;
+            self.recv_open_failed = false;
         }
 
         // Adopt the very first addressed path as the current one (no migration on
@@ -1775,12 +1920,31 @@ pub const Conn = struct {
                 error.OutOfMemory => return err,
                 else => {
                     connDbg("recvOnePacket dropped at pos={d}/{d}: {s}", .{ pos, datagram.len, @errorName(err) });
+                    if ((datagram[pos] & 0x80) == 0) self.recv_open_failed = true;
                     break; // drop this packet + the rest of the datagram
                 },
             };
             if (consumed == 0) break; // defensive: never loop forever
             pos += consumed;
         }
+        if (self.role == .client and self.recv_open_failed) self.detectStatelessReset(datagram);
+    }
+
+    /// RFC 9000 §10.3.1: a datagram whose trailing 16 bytes equal the peer's
+    /// `stateless_reset_token`, and whose packet could not be processed, is a
+    /// Stateless Reset: enter draining without sending anything further. The
+    /// comparison is constant-time; a forged or wrong token changes nothing.
+    fn detectStatelessReset(self: *Conn, datagram: []const u8) void {
+        if (datagram.len < 21) return; // §10.3: shorter cannot be a reset
+        if ((datagram[0] & 0x80) != 0) return; // resets look like short headers
+        const token = switch (self.handshake) {
+            .client => |*c| c.peerStatelessResetToken() orelse return,
+            .server => return,
+        };
+        if (!secure_fns.ctEq(datagram[datagram.len - 16 ..], &token)) return;
+        self.stateless_reset_received = true;
+        self.closing = true;
+        self.close_pending = false;
     }
 
     /// Process one packet starting at `input[0]`. Returns the number of bytes
@@ -1801,10 +1965,12 @@ pub const Conn = struct {
             return error.UnsupportedVersion;
         }
 
+        if (dec.header.packet_type == .zero_rtt) return self.recvZeroRttPacket(input, dec.consumed, now);
+
         const level: EncryptionLevel = switch (dec.header.packet_type) {
             .initial => .initial,
             .handshake => .handshake,
-            .zero_rtt => return error.MalformedPacket, // 0-RTT unsupported (typed gap)
+            .zero_rtt => unreachable,
             .retry => return error.MalformedPacket, // Retry handled by the listener layer (typed gap here)
         };
 
@@ -1863,8 +2029,63 @@ pub const Conn = struct {
         if (input.len < pn_offset + 1) return error.MalformedPacket;
         // A short-header packet is always the last in its datagram (it has no
         // Length field), so it consumes the whole remaining slice.
+        self.recv_is_1rtt = true;
+        self.recv_1rtt_ok = false;
+        defer self.recv_is_1rtt = false;
         try self.openAndIntake(.application, input, pn_offset, now);
+        if (!self.recv_1rtt_ok) self.recv_open_failed = true;
         return input.len;
+    }
+
+    /// A 0-RTT long-header packet (RFC 9000 §17.2.3). Only a server that
+    /// accepted early data holds keys; otherwise the packet is dropped (the
+    /// client retransmits rejected early data at 1-RTT, RFC 9001 §4.6.2).
+    fn recvZeroRttPacket(self: *Conn, input: []const u8, header_len: usize, now: u64) Error!usize {
+        if (self.role != .server) return error.MalformedPacket; // §17.2.3: client never receives 0-RTT
+        var cursor = header_len;
+        const length_vi = decodeVarIntAt(input, cursor) catch return error.MalformedPacket;
+        cursor += length_vi.len;
+        const length = std.math.cast(usize, length_vi.value) orelse return error.MalformedPacket;
+        const pn_offset = cursor;
+        if (length > input.len - pn_offset) return error.MalformedPacket;
+        const packet_end = pn_offset + length;
+        const keys = self.zero_rtt_keys orelse return packet_end;
+
+        const buf = try self.allocator.alloc(u8, packet_end);
+        defer self.allocator.free(buf);
+        @memcpy(buf, input[0..packet_end]);
+        const plaintext = try self.allocator.alloc(u8, packet_end);
+        defer self.allocator.free(plaintext);
+        PnDecodeCtx.current = .{ .largest = self.engine.space(.application).largest_received };
+        const opened = quic_protect.openPacketSuite(plaintext, buf, pn_offset, keys, PnDecodeCtx.decode) catch return packet_end;
+        const pn = PnDecodeCtx.last_full;
+        const payload = plaintext[0..opened.plaintext_len];
+
+        // RFC 9000 §12.4 / §17.2.3: ACK, CRYPTO, HANDSHAKE_DONE, NEW_TOKEN,
+        // PATH_RESPONSE and RETIRE_CONNECTION_ID in 0-RTT are a
+        // PROTOCOL_VIOLATION.
+        {
+            var frames = quic_frame.decodeFrames(self.allocator, payload) catch return error.MalformedPacket;
+            defer frames.deinit();
+            for (frames.frames) |f| {
+                if (!quic_frame.permittedInZeroRtt(f)) {
+                    self.close(transport_error_protocol_violation);
+                    return error.MalformedPacket;
+                }
+            }
+        }
+        try self.intakeFrames(.application, pn, payload, now);
+        return packet_end;
+    }
+
+    /// Whether 0-RTT keys are currently installed (server, early data accepted).
+    pub fn zeroRttActive(self: *const Conn) bool {
+        return self.zero_rtt_keys != null;
+    }
+
+    /// (Client) whether the connection was ended by a peer Stateless Reset.
+    pub fn statelessResetReceived(self: *const Conn) bool {
+        return self.stateless_reset_received;
     }
 
     /// Open `packet` (a single QUIC packet slice) at `level`, decode its frames,
@@ -2066,18 +2287,33 @@ pub const Conn = struct {
         self.key_update.prev_read = cur.read;
         self.key_update.prev_read_until_ns = now +| KeyUpdate.retentionNs(self.recovery.ptoDuration());
 
-        // Roll write keys (own secret) to the next generation.
-        const next_write_secret = quic_tls.nextGenerationSecret(self.key_update.write_secret);
-        cur.write = quic_protect.keyUpdateDirection(cur.write, next_write_secret);
-        self.key_update.write_secret = next_write_secret;
+        if (self.keyUpdateWide()) {
+            // SHA-384 (48-byte secrets in the handshake slots, see initKeyUpdate).
+            const s = self.wideAppSecrets();
+            var next: [quic_handshake_max_hash]u8 = undefined;
+            defer std.crypto.secureZero(u8, &next);
+            quic_handshake.nextTrafficSecret(s.write, &next);
+            cur.write = quic_handshake.keyUpdateDirection(cur.write, &next);
+            s.write.* = next;
+            cur.read = self.key_update.next_read;
+            quic_handshake.nextTrafficSecret(s.read, &next);
+            s.read.* = next;
+            quic_handshake.nextTrafficSecret(s.read, &next);
+            self.key_update.next_read = quic_handshake.keyUpdateDirection(cur.read, &next);
+        } else {
+            // Roll write keys (own secret) to the next generation.
+            const next_write_secret = quic_tls.nextGenerationSecret(self.key_update.write_secret);
+            cur.write = quic_protect.keyUpdateDirection(cur.write, next_write_secret);
+            self.key_update.write_secret = next_write_secret;
 
-        // The pre-computed next read keys become current.
-        cur.read = self.key_update.next_read;
-        self.key_update.read_secret = self.key_update.next_read_secret;
+            // The pre-computed next read keys become current.
+            cur.read = self.key_update.next_read;
+            self.key_update.read_secret = self.key_update.next_read_secret;
 
-        // Pre-compute the following generation's read keys for the next update.
-        self.key_update.next_read_secret = quic_tls.nextGenerationSecret(self.key_update.read_secret);
-        self.key_update.next_read = quic_protect.keyUpdateDirection(cur.read, self.key_update.next_read_secret);
+            // Pre-compute the following generation's read keys for the next update.
+            self.key_update.next_read_secret = quic_tls.nextGenerationSecret(self.key_update.read_secret);
+            self.key_update.next_read = quic_protect.keyUpdateDirection(cur.read, self.key_update.next_read_secret);
+        }
 
         self.key_update.phase = new_phase;
         self.key_update.last_update_ns = now;
@@ -2086,6 +2322,16 @@ pub const Conn = struct {
     }
 
     fn intakeFrames(self: *Conn, level: EncryptionLevel, pn: u64, payload: []const u8, now: u64) Error!void {
+        if (self.recv_is_1rtt) {
+            self.recv_1rtt_ok = true;
+            // RFC 9001 §4.9.3: once 1-RTT keys are in use by the peer on the
+            // established connection, 0-RTT keys are no longer needed.
+            if (self.established and self.zero_rtt_keys != null) {
+                std.crypto.secureZero(u8, std.mem.asBytes(&self.zero_rtt_keys));
+                self.zero_rtt_keys = null;
+                self.zero_rtt_discarded = true;
+            }
+        }
         var frames = quic_frame.decodeFrames(self.allocator, payload) catch |e| {
             connDbg("decodeFrames FAILED lvl={s} pn={d} payload_len={d}: {s}", .{ @tagName(level), pn, payload.len, @errorName(e) });
             return error.MalformedPacket;
@@ -2197,7 +2443,7 @@ pub const Conn = struct {
     /// into the corresponding send buffers so the next `sendDatagrams` ships
     /// them. Idempotent: `takeFlight` returns empty once drained.
     fn collectHandshakeOutput(self: *Conn) Error!void {
-        inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |lvl| {
+        inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake, EncryptionLevel.application }) |lvl| {
             const bytes = self.handshake.takeFlight(lvl) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.HandshakeFailed,
@@ -2396,6 +2642,8 @@ pub const Conn = struct {
     }
 
     pub fn sendDatagramsAt(self: *Conn, out: *std.ArrayList(OutDatagram), now: u64) Error!usize {
+        // RFC 9000 §10.3.1: after a Stateless Reset nothing more is sent.
+        if (self.stateless_reset_received) return 0;
         // The client must emit its ClientHello before the first send.
         if (self.role == .client and !self.started) {
             switch (self.handshake) {
@@ -2623,6 +2871,20 @@ pub const Conn = struct {
             try quic_frame.encodeFrame(&payload, self.allocator, .{ .HANDSHAKE_DONE = {} });
             frames.append(.ping); // ack-eliciting; loss re-arms a fresh send
             ack_eliciting = true;
+        }
+
+        // Post-handshake CRYPTO (NewSessionTicket, RFC 9001 §4.1.3) rides 1-RTT
+        // packets, only after confirmation (see `SendState.crypto_application`).
+        if (self.recovery.handshake_confirmed) {
+            const app_crypto = &self.send.crypto_application;
+            while (app_crypto.pending() > 0) {
+                const used = payload.items.len + long_header_max + quic_protect.aead_tag_len;
+                if (used + 32 >= max_datagram) break;
+                const cf = app_crypto.nextFrame(max_datagram - used) orelse break;
+                try quic_frame.encodeFrame(&payload, self.allocator, .{ .CRYPTO = cf });
+                frames.append(.{ .crypto = .{ .offset = cf.offset, .len = cf.len } });
+                ack_eliciting = true;
+            }
         }
 
         // PATH_RESPONSE echoes (RFC 9000 §8.2.2): reply to every PATH_CHALLENGE we
@@ -3312,6 +3574,17 @@ pub const Conn = struct {
     /// owns the offset (Initial or Handshake); the application level has no
     /// send-side CRYPTO buffer here.
     fn rewindCryptoTo(self: *Conn, offset: u64) void {
+        if (self.role == .server and self.recovery.handshake_confirmed) {
+            // A server confirms only after the client Finished, which proves
+            // the client holds our whole handshake flight; the Initial and
+            // Handshake spaces are then discarded, so a lost CRYPTO range can
+            // only be post-handshake 1-RTT CRYPTO (the client never sends any).
+            const buf = &self.send.crypto_application;
+            const lo = buf.base_offset;
+            const hi = buf.base_offset + buf.buf.items.len;
+            if (offset >= lo and offset < hi and offset < buf.send_offset) buf.send_offset = offset;
+            return;
+        }
         inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |lvl| {
             const buf = self.send.cryptoBuf(lvl).?;
             // The offset belongs to this buffer if it lies within its written
@@ -4850,4 +5123,368 @@ test "quic migration — no-address (loopback) recv never migrates (back-compat)
     try testing.expect(!lb.server.currentPath().isSet());
     var rbuf: [64]u8 = undefined;
     try testing.expectEqualSlices(u8, "loopback-no-addr", rbuf[0..lb.server.readStream(sid, &rbuf)]);
+}
+
+// ---------------------------------------------------------------------------
+// Resumption, 0-RTT, SHA-384 key update and stateless-reset detection
+// ---------------------------------------------------------------------------
+
+const feat_now: i64 = 1_800_000_000;
+const feat_ticket_key: [32]u8 = @splat(0x3c);
+
+const FeatPair = struct {
+    kp: Ed25519.KeyPair,
+    cert_buf: [1024]u8 = undefined,
+    cert_chain: [1][]const u8 = .{&.{}},
+
+    fn init(self: *FeatPair) !void {
+        self.kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x37)));
+        self.cert_chain[0] = try mintCert(&self.cert_buf, self.kp);
+    }
+
+    fn serverConfig(self: *const FeatPair) ServerConfig {
+        return .{
+            .cert_chain = &self.cert_chain,
+            .signing_key = .{ .ed25519 = self.kp },
+            .alpn_protocols = &test_alpn,
+            .transport_params = test_server_params,
+            .local_cid = &test_server_cid,
+            .ticket_key = feat_ticket_key,
+            .now_unix_seconds = feat_now,
+        };
+    }
+
+    fn clientConfig() ClientConfig {
+        return .{
+            .alpn_protocols = &test_alpn,
+            .transport_params = test_client_params,
+            .local_cid = &test_client_cid,
+            .initial_dcid = &test_initial_dcid,
+        };
+    }
+};
+
+fn featDrive(alloc: Allocator, client: *Conn, server: *Conn) !void {
+    var rounds: usize = 0;
+    while (rounds < 12) : (rounds += 1) {
+        _ = try pump(alloc, client, server);
+        _ = try pump(alloc, server, client);
+        if (client.isEstablished() and server.isEstablished() and rounds >= 2) return;
+    }
+    return error.HandshakeDidNotComplete;
+}
+
+const FeatSession = struct {
+    session: quic_handshake.Session,
+    ticket: [512]u8 = undefined,
+
+    fn take(client: *const Conn) !FeatSession {
+        const s = client.handshake.client.resumptionSession() orelse return error.TestUnexpectedResult;
+        var out: FeatSession = .{ .session = s };
+        @memcpy(out.ticket[0..s.ticket.len], s.ticket);
+        return out;
+    }
+
+    fn get(self: *const FeatSession) quic_handshake.Session {
+        var s = self.session;
+        s.ticket = self.ticket[0..self.session.ticket.len];
+        return s;
+    }
+};
+
+fn featIssue(alloc: Allocator, fp: *const FeatPair, scfg: ServerConfig) !FeatSession {
+    var server = try Conn.initServer(alloc, scfg);
+    defer server.deinit();
+    var client = try Conn.initClient(alloc, FeatPair.clientConfig());
+    defer client.deinit();
+    _ = fp;
+    try featDrive(alloc, &client, &server);
+    return FeatSession.take(&client);
+}
+
+/// Seal a client 0-RTT long-header packet (RFC 9000 §17.2.3) carrying `payload`.
+fn craftZeroRtt(alloc: Allocator, client: *const Conn, keys: PacketKeys, pn: u64, payload: []const u8) ![]u8 {
+    var header: [long_header_max]u8 = undefined;
+    var pos = try quic_packet.encodeLongHeader(&header, .{
+        .packet_type = .zero_rtt,
+        .version = quic_version_1,
+        .dcid = client.dcid,
+        .scid = client.scid,
+        .packet_number_len = try quic_packet.PacketNumberLength.fromByteLen(4),
+    });
+    const length_value = 4 + payload.len + quic_protect.aead_tag_len;
+    std.mem.writeInt(u16, header[pos..][0..2], @as(u16, @intCast(length_value)) | 0x4000, .big);
+    pos += 2;
+    pos += try quic_packet.encodePacketNumber(header[pos..], @intCast(pn), try quic_packet.PacketNumberLength.fromByteLen(4));
+    const out = try alloc.alloc(u8, pos + payload.len + quic_protect.aead_tag_len);
+    errdefer alloc.free(out);
+    const sealed = try quic_protect.sealPacketSuite(out, header[0..pos], pos - 4, 4, pn, payload, keys);
+    std.debug.assert(sealed.len == out.len);
+    return out;
+}
+
+fn streamPayload(alloc: Allocator, sid: u64, data: []const u8) !std.ArrayList(u8) {
+    var p: std.ArrayList(u8) = .empty;
+    try quic_frame.encodeFrame(&p, alloc, .{ .STREAM = .{ .stream_id = sid, .offset = 0, .fin = true, .len = data.len, .data = data } });
+    return p;
+}
+
+/// The client's first flight (the Initial datagram carrying the ClientHello).
+fn firstFlight(alloc: Allocator, client: *Conn) ![]u8 {
+    var out: std.ArrayList(OutDatagram) = .empty;
+    defer out.deinit(alloc);
+    _ = try client.sendDatagrams(&out);
+    if (out.items.len != 1) {
+        for (out.items) |d| alloc.free(d.bytes);
+        return error.TestUnexpectedResult;
+    }
+    return out.items[0].bytes;
+}
+
+test "quic conn resumption — the ticket rides 1-RTT CRYPTO and a later connection resumes" {
+    const alloc = testing.allocator;
+    var fp: FeatPair = undefined;
+    try fp.init();
+    const owned = try featIssue(alloc, &fp, fp.serverConfig());
+
+    var server = try Conn.initServer(alloc, fp.serverConfig());
+    defer server.deinit();
+    var ccfg = FeatPair.clientConfig();
+    ccfg.session = owned.get();
+    var client = try Conn.initClient(alloc, ccfg);
+    defer client.deinit();
+    try featDrive(alloc, &client, &server);
+    try testing.expect(server.handshake.server.isResumed());
+    try testing.expect(client.handshake.client.isResumed());
+
+    // Application data flows on the resumed connection.
+    const sid = try client.openStream();
+    try client.sendStream(sid, "resumed-data", true);
+    _ = try pump(alloc, &client, &server);
+    var buf: [64]u8 = undefined;
+    const n = server.readStream(sid, &buf);
+    try testing.expectEqualSlices(u8, "resumed-data", buf[0..n]);
+}
+
+test "quic conn 0-RTT — accepted early STREAM data is delivered; a replayed flight gets none" {
+    const alloc = testing.allocator;
+    var fp: FeatPair = undefined;
+    try fp.init();
+    var guard: quic_handshake.EarlyDataReplayGuard = .{};
+    var scfg = fp.serverConfig();
+    scfg.enable_early_data = true;
+    scfg.replay_guard = &guard;
+    const owned = try featIssue(alloc, &fp, scfg);
+
+    var ccfg = FeatPair.clientConfig();
+    ccfg.session = owned.get();
+    ccfg.offer_early_data = true;
+    var client = try Conn.initClient(alloc, ccfg);
+    defer client.deinit();
+    const initial = try firstFlight(alloc, &client);
+    defer alloc.free(initial);
+    const early_keys = client.handshake.client.earlyDataWriteKeys().?;
+    var payload = try streamPayload(alloc, 0, "early-hello");
+    defer payload.deinit(alloc);
+    const zero_rtt = try craftZeroRtt(alloc, &client, early_keys, 0, payload.items);
+    defer alloc.free(zero_rtt);
+
+    // First delivery: 0-RTT accepted, early bytes readable before the
+    // handshake completes, then the handshake finishes normally.
+    var server = try Conn.initServer(alloc, scfg);
+    defer server.deinit();
+    try server.recvDatagram(initial);
+    try testing.expect(server.zeroRttActive());
+    try server.recvDatagram(zero_rtt);
+    var buf: [64]u8 = undefined;
+    const n = server.readStream(0, &buf);
+    try testing.expectEqualSlices(u8, "early-hello", buf[0..n]);
+    try featDrive(alloc, &client, &server);
+    try testing.expect(client.handshake.client.earlyDataAccepted());
+
+    // An attacker replays the captured Initial + 0-RTT datagrams to another
+    // server instance sharing the guard: 0-RTT is rejected (no keys), the
+    // early STREAM bytes are dropped, and the connection is not failed.
+    var replay = try Conn.initServer(alloc, scfg);
+    defer replay.deinit();
+    try replay.recvDatagram(initial);
+    try testing.expect(!replay.zeroRttActive());
+    try testing.expect(replay.handshake.server.isResumed());
+    try replay.recvDatagram(zero_rtt);
+    try testing.expectEqual(@as(usize, 0), replay.readStream(0, &buf));
+    try testing.expect(!replay.isClosing());
+}
+
+test "quic conn 0-RTT — a forbidden frame in a 0-RTT packet is a PROTOCOL_VIOLATION" {
+    const alloc = testing.allocator;
+    var fp: FeatPair = undefined;
+    try fp.init();
+    var guard: quic_handshake.EarlyDataReplayGuard = .{};
+    var scfg = fp.serverConfig();
+    scfg.enable_early_data = true;
+    scfg.replay_guard = &guard;
+    const owned = try featIssue(alloc, &fp, scfg);
+    var ccfg = FeatPair.clientConfig();
+    ccfg.session = owned.get();
+    ccfg.offer_early_data = true;
+    var client = try Conn.initClient(alloc, ccfg);
+    defer client.deinit();
+    const initial = try firstFlight(alloc, &client);
+    defer alloc.free(initial);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+    try quic_frame.encodeFrame(&payload, alloc, .{ .CRYPTO = .{ .offset = 0, .len = 3, .data = "bad" } });
+    const zero_rtt = try craftZeroRtt(alloc, &client, client.handshake.client.earlyDataWriteKeys().?, 0, payload.items);
+    defer alloc.free(zero_rtt);
+    var server = try Conn.initServer(alloc, scfg);
+    defer server.deinit();
+    try server.recvDatagram(initial);
+    try server.recvDatagram(zero_rtt);
+    try testing.expect(server.isClosing());
+    try testing.expectEqual(transport_error_protocol_violation, server.close_error.?);
+}
+
+fn sha384Pair(alloc: Allocator, fp: *const FeatPair, server: *Conn, client: *Conn) !void {
+    var scfg = fp.serverConfig();
+    scfg.ticket_key = null;
+    server.* = try Conn.initServer(alloc, scfg);
+    errdefer server.deinit();
+    var ccfg = FeatPair.clientConfig();
+    ccfg.cipher_suites = &.{.tls_aes_256_gcm_sha384};
+    client.* = try Conn.initClient(alloc, ccfg);
+    errdefer client.deinit();
+    try featDrive(alloc, client, server);
+}
+
+test "quic conn key update — TLS_AES_256_GCM_SHA384 rolls both directions with 48-byte secrets" {
+    const alloc = testing.allocator;
+    var fp: FeatPair = undefined;
+    try fp.init();
+    var server: Conn = undefined;
+    var client: Conn = undefined;
+    try sha384Pair(alloc, &fp, &server, &client);
+    defer server.deinit();
+    defer client.deinit();
+    try testing.expectEqual(quic_handshake.CipherSuite.tls_aes_256_gcm_sha384, server.handshake.server.suite.?);
+    try testing.expect(server.key_update.ready and client.key_update.ready);
+
+    const before = server.handshake.server.client_ap_secret;
+    try testing.expect(try client.initiateKeyUpdate());
+    const sid = try client.openStream();
+    try client.sendStream(sid, "sha384 phase 1", true);
+    _ = try pump(alloc, &client, &server);
+    var buf: [64]u8 = undefined;
+    var n = server.readStream(sid, &buf);
+    try testing.expectEqualSlices(u8, "sha384 phase 1", buf[0..n]);
+    try testing.expectEqual(@as(u1, 1), server.keyPhase());
+    try testing.expect(!std.mem.eql(u8, &before, &server.handshake.server.client_ap_secret));
+    // Both ends hold the same rolled 48-byte secrets.
+    try testing.expectEqualSlices(u8, &client.handshake.client.client_ap_secret, &server.handshake.server.client_ap_secret);
+    try testing.expectEqualSlices(u8, &client.handshake.client.server_ap_secret, &server.handshake.server.server_ap_secret);
+
+    try server.sendStream(sid, "reply", true);
+    _ = try pump(alloc, &server, &client);
+    n = client.readStream(sid, &buf);
+    try testing.expectEqualSlices(u8, "reply", buf[0..n]);
+
+    // A second update after confirmation (server-initiated, generation 2):
+    // the client authenticates it with its pre-computed next SHA-384 keys.
+    _ = try pump(alloc, &client, &server);
+    try testing.expect(try server.initiateKeyUpdate());
+    try testing.expectEqual(@as(u1, 0), server.keyPhase());
+    const sid2 = try server.openStream();
+    try server.sendStream(sid2, "gen2", true);
+    _ = try pump(alloc, &server, &client);
+    n = client.readStream(sid2, &buf);
+    try testing.expectEqualSlices(u8, "gen2", buf[0..n]);
+}
+
+test "quic conn snapshot — a SHA-384 connection round-trips after a key update; tampering and legacy idle form" {
+    const alloc = testing.allocator;
+    var fp: FeatPair = undefined;
+    try fp.init();
+    var server: Conn = undefined;
+    var client: Conn = undefined;
+    try sha384Pair(alloc, &fp, &server, &client);
+    defer server.deinit();
+    defer client.deinit();
+    var restore_cfg = fp.serverConfig();
+    restore_cfg.ticket_key = null;
+
+    // Legacy form: a pre-SHA-384-key-update binary captured the connection as
+    // key-update idle at generation 0. It validates and restores armed.
+    {
+        var snap = try server.captureEstablishedServerSnapshot(alloc);
+        defer snap.deinit(alloc);
+        try testing.expect(snap.key_update.ready);
+        snap.key_update = .{};
+        snap.key_update.next_read = zeroSnapshotPacketKeys();
+        try snap.validate();
+        var restored = try Conn.restoreEstablishedServerSnapshot(alloc, &snap, restore_cfg);
+        defer restored.deinit();
+        try testing.expect(restored.key_update.ready);
+        try testing.expect(std.meta.eql(restored.key_update.next_read, server.key_update.next_read));
+    }
+
+    try testing.expect(try client.initiateKeyUpdate());
+    const sid = try client.openStream();
+    try client.sendStream(sid, "x", true);
+    _ = try pump(alloc, &client, &server);
+    try testing.expectEqual(@as(u1, 1), server.keyPhase());
+
+    var snap = try server.captureEstablishedServerSnapshot(alloc);
+    defer snap.deinit(alloc);
+    try snap.validate();
+    var restored = try Conn.restoreEstablishedServerSnapshot(alloc, &snap, restore_cfg);
+    defer restored.deinit();
+    var again = try restored.captureEstablishedServerSnapshot(alloc);
+    defer again.deinit(alloc);
+    try testing.expectEqualDeep(snap, again);
+
+    // The restored server keeps talking to the client in phase 1.
+    try restored.sendStream(sid, "after-restore", true);
+    _ = try pump(alloc, &restored, &client);
+    var buf: [64]u8 = undefined;
+    const n = client.readStream(sid, &buf);
+    try testing.expectEqualSlices(u8, "after-restore", buf[0..n]);
+
+    // A tampered current secret or stray 32-byte secret is refused.
+    snap.handshake.client_ap_secret[0] ^= 1;
+    try testing.expectError(error.InvalidSnapshot, snap.validate());
+    snap.handshake.client_ap_secret[0] ^= 1;
+    snap.key_update.write_secret[0] = 1;
+    try testing.expectError(error.InvalidSnapshot, snap.validate());
+    snap.key_update.write_secret[0] = 0;
+    try snap.validate();
+}
+
+test "quic conn client honours a Stateless Reset carrying the advertised token and ignores forgeries" {
+    const alloc = testing.allocator;
+    var fp: FeatPair = undefined;
+    try fp.init();
+    const token: [16]u8 = @splat(0xd4);
+    var scfg = fp.serverConfig();
+    scfg.stateless_reset_token = token;
+    var server = try Conn.initServer(alloc, scfg);
+    defer server.deinit();
+    var client = try Conn.initClient(alloc, FeatPair.clientConfig());
+    defer client.deinit();
+    try featDrive(alloc, &client, &server);
+
+    var reset: [40]u8 = @splat(0x5a);
+    reset[0] = 0x45; // short-header form
+    // Forged token (one bit off): not a reset.
+    reset[reset.len - 16 ..][0..16].* = token;
+    reset[reset.len - 1] ^= 1;
+    try client.recvDatagram(&reset);
+    try testing.expect(!client.statelessResetReceived());
+    try testing.expect(!client.isClosing());
+    // Genuine token: draining, nothing more sent.
+    reset[reset.len - 1] ^= 1;
+    try client.recvDatagram(&reset);
+    try testing.expect(client.statelessResetReceived());
+    try client.sendStream(try client.openStream(), "never", true);
+    var out: std.ArrayList(OutDatagram) = .empty;
+    defer out.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), try client.sendDatagrams(&out));
 }

@@ -56,10 +56,13 @@
 //!     replayed/expired/wrong-IP token is rejected (falls back to a new Retry).
 //!   * Stateless reset (RFC 9000 §10.3): a short-header (1-RTT) datagram whose
 //!     DCID matches no live connection is answered with a Stateless Reset. The
-//!     16-byte token is HMAC(reset_key, DCID) under the per-process key; the
-//!     reset is shaped like a 1-RTT packet, never larger than the trigger
-//!     (§10.3.3 never-amplify), only sent when the trigger is large enough, and
-//!     token-bucket rate-limited (§21.11) so it cannot be used as a reflector.
+//!     16-byte token is HMAC(static_key, DCID) (§10.3.2): the static key is
+//!     `stateless_reset_key` or is derived from the TLS signing key, so a
+//!     restarted process recognises its predecessor's connections. Each new
+//!     connection advertises its token in `stateless_reset_token` (§18.2). The
+//!     reset is shaped like a 1-RTT packet, strictly shorter than the trigger
+//!     (§10.3.3, loops terminate), never sent for a datagram that ends in one of
+//!     our own tokens (a reflected reset), and token-bucket rate-limited (§21.11).
 //!   * One server SCID per connection. Connection migration + path validation
 //!     (RFC 9000 §9) ARE supported: a 1-RTT packet from a new source address on
 //!     an established connection triggers a PATH_CHALLENGE to the new address
@@ -138,6 +141,18 @@ const quic_retry = @import("../proto/quic_retry.zig");
 const http3_conn = @import("../proto/http3_conn.zig");
 const quic_transport_params = @import("../proto/quic_transport_params.zig");
 const quic_handshake = @import("../proto/quic_handshake.zig");
+const tls_resumption = @import("../crypto/tls_resumption.zig");
+
+/// Process-wide time-bounded single-use guard for accepted QUIC 0-RTT binders
+/// (RFC 8446 §8). It is deliberately NOT carried across Helix: every listener
+/// construction (cold start, `initRestored`) instead arms a quiet window of one
+/// replay-retention period during which all 0-RTT is rejected (the handshake
+/// still resumes at 1-RTT), so a flight captured before the restart cannot be
+/// replayed into the new process (`armEarlyDataQuietWindow`).
+var quic_replay_guard: quic_handshake.EarlyDataReplayGuard = .{};
+/// RFC 8446 §8.3 ticket-age tolerance used for QUIC 0-RTT; also sizes the
+/// replay guard's retention and the post-restart quiet window.
+const quic_early_data_skew_ms: u32 = 10_000;
 const proxy_protocol = @import("../proto/proxy_protocol.zig");
 const media_socket = @import("../substrate/media_socket.zig");
 const dualstack_udp = @import("dualstack_udp.zig");
@@ -330,8 +345,35 @@ pub const WebTransportListener = struct {
     reset_rate_per_s: f64 = default_reset_rate_per_s,
     /// Maximum reset burst (token-bucket capacity).
     reset_burst: u32 = default_reset_burst,
+    /// Operator-supplied static stateless-reset key (RFC 9000 §10.3.2). When
+    /// null the key is derived from the TLS signing key (`staticResetKey`), so
+    /// every process serving the same certificate key — including one started
+    /// after a crash, the case resets exist for — derives the same tokens.
+    stateless_reset_key: ?[32]u8 = null,
+    /// Cache of the key derived from the TLS signing key (cleared on TLS swap).
+    derived_reset_key: ?[32]u8 = null,
+    /// Tokens of recently emitted resets, so a reflected reset of ours is never
+    /// answered (RFC 9000 §10.3.3 loop avoidance).
+    recent_resets: quic_retry.RecentResets = .{},
+
+    /// QUIC session resumption (RFC 9001 §4.5). Null ticket key = off: no
+    /// NewSessionTicket is issued. Rotate by moving the old key to
+    /// `quic_previous_ticket_key`.
+    quic_ticket_key: ?[32]u8 = null,
+    quic_previous_ticket_key: ?[32]u8 = null,
+    quic_ticket_lifetime_seconds: u32 = 86_400,
+    /// 0-RTT (RFC 9001 §4.6). OFF by default; needs `quic_ticket_key` too.
+    /// The replay guard is process-wide (`quic_replay_guard`, time-bounded,
+    /// with a post-start quiet window); it is per node, so multi-node replay
+    /// protection needs a per-node ticket key (RFC 8446 §8 / RFC 9001 §9.2).
+    /// NOTE: no config loader sets the `quic_*` / `stateless_reset_key`
+    /// fields yet and they are not carried in `Snapshot` (integrator work).
+    quic_enable_early_data: bool = false,
+    /// Server key-exchange group order (HRR + key_share choice).
+    quic_group_order: []const quic_handshake.KeyExchangeGroup = &quic_handshake.default_group_order,
 
     pub fn init(allocator: std.mem.Allocator, tls: TlsConfig, irc_port: u16) WebTransportListener {
+        armEarlyDataQuietWindow(wallClockSeconds());
         return .{ .allocator = allocator, .tls = tls, .irc_port = irc_port };
     }
 
@@ -606,6 +648,8 @@ pub const WebTransportListener = struct {
         var prior = try self.captureIdle(.paused);
         defer prior.deinit();
         self.tls = replacement;
+        if (self.derived_reset_key) |*k| std.crypto.secureZero(u8, k);
+        self.derived_reset_key = null;
     }
     pub fn captureUnstarted(self: *WebTransportListener) !Snapshot {
         lockSpin(&self.worker_mutex);
@@ -1088,27 +1132,45 @@ pub const WebTransportListener = struct {
     ///   * Rate limit (§21.11): a token-bucket caps resets so an attacker cannot
     ///     turn the endpoint into a reflection amplifier by flooding unknown CIDs.
     fn sendStatelessReset(self: *WebTransportListener, dcid: []const u8, trigger: []const u8, from: TransportAddress) void {
-        // Never-amplify floor (§10.3.3): if the triggering packet is too small to
-        // carry a reset, send nothing (a smaller reply would still be an amplifier
-        // risk and a too-small reset is invalid anyway).
-        if (trigger.len < quic_retry.min_stateless_reset_len) return;
+        // §10.3.3: strictly shorter than the trigger (so resets can never ping-
+        // pong at a fixed size), capped so a large datagram is never reflected,
+        // and at least the minimum reset size; otherwise send nothing.
+        const max_reset_len: usize = 64;
+        const reset_len = quic_retry.statelessResetLen(trigger.len, max_reset_len) orelse return;
 
-        // Rate limit before doing any work (§21.11).
+        // Never answer what could itself be one of our resets (§10.3.3): a
+        // datagram ending in the token we would emit for this DCID, or in one we
+        // recently emitted.
+        const key = self.staticResetKey();
+        if (quic_retry.mightBeOwnReset(&key, &self.recent_resets, dcid, trigger)) return;
+
+        // Rate limit before doing any further work (§21.11).
         if (!self.takeResetToken()) return;
 
-        // Size the reset like a plausible 1-RTT packet but never larger than the
-        // triggering datagram (§10.3.3). Cap at a modest size so we never reflect a
-        // large datagram back; the token lives in the trailing 16 bytes regardless.
-        const max_reset_len: usize = 64;
-        const reset_len = @min(@min(trigger.len, max_reset_len), @as(usize, quic_retry.retry_packet_max));
-        if (reset_len < quic_retry.min_stateless_reset_len) return;
-
-        const token = quic_retry.statelessResetToken(self.secret(), dcid);
+        const token = quic_retry.statelessResetTokenWithKey(&key, dcid);
         var out: [64]u8 = undefined;
         const n = quic_retry.encodeStatelessReset(out[0..reset_len], token) catch return;
-        if (n > trigger.len) return; // defensive: never amplify
+        if (n >= trigger.len) return; // defensive: never amplify
+        self.recent_resets.record(token);
         const sock = if (self.socket) |*s| s else return;
         sock.sendTo(from, out[0..n]);
+    }
+
+    /// The static stateless-reset key (RFC 9000 §10.3.2): the operator key
+    /// when configured, else HKDF of the TLS signing key's private material.
+    pub fn staticResetKey(self: *WebTransportListener) [32]u8 {
+        if (self.stateless_reset_key) |k| return k;
+        if (self.derived_reset_key) |k| return k;
+        const k = deriveResetKeyFromSigningKey(self.tls.signing_key);
+        self.derived_reset_key = k;
+        return k;
+    }
+
+    /// The process-wide 0-RTT replay guard. A global (not a listener field)
+    /// so listener struct copies across Helix/candidate handling never alias
+    /// or double-free it; it is internally synchronized.
+    fn replayGuard(_: *WebTransportListener) ?*quic_handshake.EarlyDataReplayGuard {
+        return &quic_replay_guard;
     }
 
     /// Token-bucket gate for stateless resets (RFC 9000 §21.11). Refills
@@ -1514,12 +1576,25 @@ pub const WebTransportListener = struct {
         // to its own SCID). A real QUIC client (curl/ngtcp2) validates this and
         // closes with TRANSPORT_PARAMETER_ERROR (0x08) if it is missing/wrong —
         // both must point at the stable per-connection storage above.
+        const reset_key = self.staticResetKey();
+        const early_guard: ?*quic_handshake.EarlyDataReplayGuard = if (self.quic_enable_early_data and self.quic_ticket_key != null) self.replayGuard() else null;
         qconn.* = quic_conn.Conn.initServer(self.allocator, .{
             .cert_chain = self.tls.cert_chain,
             .signing_key = self.tls.signing_key,
             .alpn_protocols = &[_][]const u8{"h3"},
             .transport_params = serverTransportParams(conn.scidSlice(), conn.origDcidSlice(), conn.retryScidSlice()),
             .local_cid = conn.scidSlice(),
+            // RFC 9000 §10.3 / §18.2: advertise the token a later Stateless
+            // Reset for this SCID will carry, derived from the static key.
+            .stateless_reset_token = quic_retry.statelessResetTokenWithKey(&reset_key, conn.scidSlice()),
+            .group_order = self.quic_group_order,
+            .ticket_key = self.quic_ticket_key,
+            .previous_ticket_key = self.quic_previous_ticket_key,
+            .ticket_lifetime_seconds = self.quic_ticket_lifetime_seconds,
+            .now_unix_seconds = wallClockSeconds(),
+            .enable_early_data = early_guard != null,
+            .replay_guard = early_guard,
+            .early_data_age_skew_ms = quic_early_data_skew_ms,
         }) catch {
             self.allocator.destroy(qconn);
             self.allocator.destroy(conn);
@@ -1643,6 +1718,50 @@ pub const WebTransportListener = struct {
 /// the transport parameters came from the endpoint it addressed. Both slices
 /// must outlive the handshake (the encoder borrows them); callers pass the
 /// connection's stable per-connection storage.
+/// Static stateless-reset key from the TLS signing key's private material
+/// (RFC 9000 §10.3.2 static key; HKDF with a dedicated label, so the reset key
+/// reveals nothing about the signing key and is unrelated to other uses).
+fn deriveResetKeyFromSigningKey(key: quic_handshake.SigningKey) [32]u8 {
+    var buf: [600]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
+    const ikm: []const u8 = switch (key) {
+        .ed25519 => |kp| blk: {
+            buf[0] = 1;
+            @memcpy(buf[1..65], &kp.secret_key.bytes);
+            break :blk buf[0..65];
+        },
+        .ecdsa_p256 => |kp| blk: {
+            buf[0] = 2;
+            @memcpy(buf[1..33], &kp.secret_key.bytes);
+            break :blk buf[0..33];
+        },
+        .rsa => |k| blk: {
+            buf[0] = 3;
+            const n = @min(k.d.len, buf.len - 1);
+            @memcpy(buf[1 .. 1 + n], k.d[0..n]);
+            break :blk buf[0 .. 1 + n];
+        },
+    };
+    return quic_retry.deriveStaticResetKey(ikm);
+}
+
+/// Reject all QUIC 0-RTT for one replay-retention window from `now_s`: this
+/// process's guard has not seen what a predecessor (crashed process or Helix
+/// source) accepted, and a replay of such a flight can pass the ticket-age
+/// check for up to 2·skew after its first acceptance (RFC 8446 §8.3).
+fn armEarlyDataQuietWindow(now_s: i64) void {
+    quic_replay_guard.refuseUntil(now_s + quic_handshake.EarlyDataReplayGuard.retentionSeconds(quic_early_data_skew_ms));
+}
+
+/// Wall-clock Unix seconds for ticket issue/expiry (the QUIC engine reads no
+/// clock itself).
+fn wallClockSeconds() i64 {
+    if (comptime builtin.os.tag != .linux) return @divTrunc(@import("../substrate/platform.zig").realtimeMillis(), 1000);
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+    return @intCast(ts.sec);
+}
+
 fn serverTransportParams(
     scid: []const u8,
     original_dcid: []const u8,
@@ -2856,12 +2975,13 @@ test "stateless reset — an unknown short-header DCID yields a reset carrying t
     // Shaped like a 1-RTT packet: high bit clear, fixed bit set.
     try testing.expectEqual(@as(u8, 0x00), reply[0] & 0x80);
     try testing.expectEqual(@as(u8, 0x40), reply[0] & 0x40);
-    // Never amplifies: the reset is no larger than the triggering datagram.
-    try testing.expect(n <= pkt.len);
+    // Never amplifies: the reset is strictly smaller than the trigger
+    // (RFC 9000 §10.3.3), so two endpoints can never loop at a fixed size.
+    try testing.expect(n < pkt.len);
     try testing.expect(n >= quic_retry.min_stateless_reset_len);
 
-    // The trailing 16 bytes are the stateless-reset token = HMAC(reset_key, DCID).
-    const expected = quic_retry.statelessResetToken(fx.lst.secret(), &dcid);
+    // The trailing 16 bytes are the stateless-reset token = HMAC(static key, DCID).
+    const expected = quic_retry.statelessResetTokenWithKey(&fx.lst.staticResetKey(), &dcid);
     try testing.expectEqualSlices(u8, &expected, reply[n - quic_retry.stateless_reset_token_len .. n]);
 
     // No connection was created for the unknown short-header packet.
@@ -2910,6 +3030,68 @@ test "stateless reset — the emit is rate-limited (token bucket)" {
         if (fx.exchange(pkt, &reply) != null) got += 1;
     }
     try testing.expectEqual(@as(usize, 3), got);
+}
+
+test "stateless reset — never answers a datagram that could be one of our own resets" {
+    var fx: PolicyFixture = undefined;
+    try fx.init(.never);
+    defer fx.deinit();
+    const dcid = [_]u8{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 };
+    var buf: [128]u8 = undefined;
+    var reply: [256]u8 = undefined;
+    // Ends in the token we would emit for this very DCID (a reset bounced
+    // between two nodes sharing the static key): no reply.
+    var pkt = buildShortHeaderDatagram(&buf, dcid, 40);
+    buf[pkt.len - 16 ..][0..16].* = quic_retry.statelessResetTokenWithKey(&fx.lst.staticResetKey(), &dcid);
+    try testing.expect(fx.exchange(pkt, &reply) == null);
+
+    // Our own emitted reset, reflected back at us from the same source: its
+    // DCID bytes are random, but its tail is a token we just sent: no reply.
+    pkt = buildShortHeaderDatagram(&buf, dcid, 50);
+    const n = fx.exchange(pkt, &reply) orelse return error.TestUnexpectedResult;
+    var echo: [256]u8 = undefined;
+    @memcpy(echo[0..n], reply[0..n]);
+    try testing.expect(fx.exchange(echo[0..n], &reply) == null);
+}
+
+test "stateless reset — tokens come from a static key and are advertised in the transport parameters" {
+    var fx: PolicyFixture = undefined;
+    try fx.init(.never);
+    defer fx.deinit();
+    // Derived from the TLS signing key: a second listener (e.g. after a
+    // restart) with the same key derives the same tokens.
+    var twin = WebTransportListener.init(testing.allocator, fx.lst.tls, 0);
+    defer twin.deinit();
+    try testing.expectEqualSlices(u8, &fx.lst.staticResetKey(), &twin.staticResetKey());
+    // An operator key overrides the derivation; a forged key does not match.
+    twin.stateless_reset_key = quic_retry.deriveStaticResetKey("operator");
+    try testing.expect(!std.mem.eql(u8, &fx.lst.staticResetKey(), &twin.staticResetKey()));
+
+    const dcid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const conn = fx.lst.createConnection(&dcid, fx.peer_addr, .{ .original_dcid = &dcid }) orelse return error.TestUnexpectedResult;
+    const advertised = conn.conn.handshake.server.config.stateless_reset_token.?;
+    try testing.expectEqualSlices(u8, &quic_retry.statelessResetTokenWithKey(&fx.lst.staticResetKey(), conn.scidSlice()), &advertised);
+    // Resumption and 0-RTT are off unless configured.
+    try testing.expect(conn.conn.handshake.server.config.ticket_key == null);
+    try testing.expect(!conn.conn.handshake.server.config.enable_early_data);
+}
+
+test "0-RTT replay guard — every listener construction (cold start or Helix initRestored) arms a quiet window" {
+    const now = wallClockSeconds();
+    var fx: PolicyFixture = undefined;
+    try fx.init(.never);
+    defer fx.deinit();
+    const retention = quic_handshake.EarlyDataReplayGuard.retentionSeconds(quic_early_data_skew_ms);
+    // A binder a predecessor process accepted is unknown to this guard; it is
+    // still refused for the whole window in which its replay could pass the
+    // ticket-age check.
+    var binder: [32]u8 = @splat(0xc3);
+    std.mem.writeInt(i64, binder[0..8], now, .little);
+    try testing.expect(!quic_replay_guard.checkAndRecord(&binder, now, retention));
+    try testing.expect(!quic_replay_guard.checkAndRecord(&binder, now + retention - 1, retention));
+    // After the window the guard works normally (single use).
+    try testing.expect(quic_replay_guard.checkAndRecord(&binder, now + retention + 1, retention));
+    try testing.expect(!quic_replay_guard.checkAndRecord(&binder, now + retention + 1, retention));
 }
 
 // ===========================================================================
