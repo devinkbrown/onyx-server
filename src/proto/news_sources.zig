@@ -45,7 +45,7 @@ pub const sources = [_]Source{
     .{ .key = "guardian", .name = "The Guardian", .url = "https://www.theguardian.com/world/rss", .leaning = "center-left", .topics = &.{ "world", "us", "politics", "environment" } },
     .{ .key = "nyt", .name = "NY Times", .url = "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml", .leaning = "center-left", .topics = &.{ "world", "us", "politics" } },
     .{ .key = "npr", .name = "NPR", .url = "https://feeds.npr.org/1001/rss.xml", .leaning = "center-left", .topics = &.{ "us", "world" } },
-    .{ .key = "hill", .name = "The Hill", .url = "https://thehill.com/rss/syndicator/19110/", .leaning = "center", .topics = &.{ "politics", "us" } },
+    .{ .key = "hill", .name = "The Hill", .url = "https://thehill.com/news/feed/", .leaning = "center", .topics = &.{ "politics", "us" } },
     .{ .key = "fox", .name = "Fox News", .url = "https://moxie.foxnews.com/google-publisher/latest.xml", .leaning = "right", .topics = &.{ "world", "us", "politics" } },
     .{ .key = "ars", .name = "Ars Technica", .url = "https://feeds.arstechnica.com/arstechnica/index", .leaning = "center", .topics = &.{ "tech", "science" } },
     .{ .key = "verge", .name = "The Verge", .url = "https://www.theverge.com/rss/index.xml", .leaning = "center-left", .topics = &.{ "tech", "science", "entertainment" } },
@@ -60,7 +60,6 @@ pub const sources = [_]Source{
     .{ .key = "sky", .name = "Sky News", .url = "https://feeds.skynews.com/feeds/rss/world.xml", .leaning = "center", .topics = &.{ "world", "uk" } },
     .{ .key = "wapo", .name = "Washington Post", .url = "https://feeds.washingtonpost.com/rss/world", .leaning = "center-left", .topics = &.{ "world", "us", "politics" } },
     .{ .key = "dw", .name = "Deutsche Welle", .url = "https://rss.dw.com/rdf/rss-en-all", .leaning = "center", .topics = &.{ "world", "europe" } },
-    .{ .key = "cnn", .name = "CNN", .url = "https://rss.cnn.com/rss/edition.rss", .leaning = "center-left", .topics = &.{ "world", "us" } },
 };
 
 /// Pick a pseudo-random general source from `sources` for `seed` (e.g. a clock
@@ -74,17 +73,17 @@ pub fn randomSource(seed: u64) Source {
 pub const country_feeds = [_]CountryFeed{
     .{ .cc = "US", .name = "NPR News", .url = "https://feeds.npr.org/1001/rss.xml" },
     .{ .cc = "GB", .name = "BBC News", .url = "https://feeds.bbci.co.uk/news/rss.xml" },
-    .{ .cc = "CA", .name = "CBC News", .url = "https://www.cbc.ca/cmlink/rss-topstories" },
+    .{ .cc = "CA", .name = "CBC News", .url = "https://www.cbc.ca/webfeed/rss/rss-topstories" },
     .{ .cc = "AU", .name = "SBS News", .url = "https://www.sbs.com.au/news/feed" },
     .{ .cc = "NZ", .name = "Radio New Zealand", .url = "https://www.rnz.co.nz/rss/news.xml" },
-    .{ .cc = "IE", .name = "RTÉ News", .url = "https://www.rte.ie/news/rss/news-headlines.xml" },
+    .{ .cc = "IE", .name = "RTÉ News", .url = "https://www.rte.ie/feeds/rss/?index=/news/&limit=20" },
     .{ .cc = "IN", .name = "Times of India", .url = "https://timesofindia.indiatimes.com/rssfeedstopstories.cms" },
     .{ .cc = "DE", .name = "Der Spiegel", .url = "https://www.spiegel.de/international/index.rss" },
     .{ .cc = "FR", .name = "France 24", .url = "https://www.france24.com/en/rss" },
-    .{ .cc = "JP", .name = "NHK World", .url = "https://www3.nhk.or.jp/nhkworld/en/news/feeds/rss.xml" },
+    .{ .cc = "JP", .name = "The Japan Times", .url = "https://www.japantimes.co.jp/feed/" },
     .{ .cc = "BR", .name = "BBC Brasil", .url = "https://feeds.bbci.co.uk/portuguese/brasil/rss.xml" },
-    .{ .cc = "ZA", .name = "News24", .url = "https://feeds.24.com/articles/news24/TopStories/rss" },
-    .{ .cc = "KR", .name = "Korea Herald", .url = "https://www.koreaherald.com/rss/01.xml" },
+    .{ .cc = "ZA", .name = "Daily Maverick", .url = "https://www.dailymaverick.co.za/dmrss/" },
+    .{ .cc = "KR", .name = "Korea Herald", .url = "https://www.koreaherald.com/rss/newsAll" },
     .{ .cc = "SG", .name = "Channel NewsAsia", .url = "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml" },
     .{ .cc = "PH", .name = "Philippine Star", .url = "https://www.philstar.com/rss/headlines" },
     .{ .cc = "PK", .name = "Dawn News", .url = "https://www.dawn.com/feeds/home" },
@@ -94,29 +93,29 @@ pub const country_feeds = [_]CountryFeed{
     .{ .cc = "SE", .name = "The Local Sweden", .url = "https://www.thelocal.se/feeds/rss.php" },
     .{ .cc = "NO", .name = "The Local Norway", .url = "https://www.thelocal.no/feeds/rss.php" },
     .{ .cc = "DK", .name = "The Local Denmark", .url = "https://www.thelocal.dk/feeds/rss.php" },
-    .{ .cc = "FI", .name = "Yle News", .url = "https://feeds.yle.fi/uutiset/v1/majorHeadlines/YLE_UUTISET.rss" },
+    .{ .cc = "FI", .name = "Yle News", .url = "https://yle.fi/rss/t/18-34837/en" },
     .{ .cc = "NL", .name = "DutchNews.nl", .url = "https://www.dutchnews.nl/feed/" },
-    .{ .cc = "CH", .name = "Swiss Info", .url = "https://www.swissinfo.ch/eng/rss/headline_news" },
+    .{ .cc = "CH", .name = "SRF News", .url = "https://www.srf.ch/news/bnf/rss/1646" },
     .{ .cc = "AT", .name = "The Local Austria", .url = "https://www.thelocal.at/feeds/rss.php" },
     .{ .cc = "RU", .name = "The Moscow Times", .url = "https://www.themoscowtimes.com/rss/news" },
     .{ .cc = "IL", .name = "Jerusalem Post", .url = "https://www.jpost.com/rss/rssfeedsheadlines.aspx" },
     .{ .cc = "SA", .name = "Arab News", .url = "https://www.arabnews.com/rss.xml" },
-    .{ .cc = "AE", .name = "The National", .url = "https://www.thenationalnews.com/rss" },
+    .{ .cc = "AE", .name = "The National", .url = "https://www.thenationalnews.com/arc/outboundfeeds/rss/?outputType=xml&size=20" },
     .{ .cc = "GR", .name = "Ekathimerini", .url = "https://www.ekathimerini.com/rss" },
     .{ .cc = "IT", .name = "The Local Italy", .url = "https://www.thelocal.it/feeds/rss.php" },
     .{ .cc = "ES", .name = "The Local Spain", .url = "https://www.thelocal.es/feeds/rss.php" },
     .{ .cc = "PT", .name = "The Portugal News", .url = "https://www.theportugalnews.com/rss" },
     .{ .cc = "MY", .name = "Malay Mail", .url = "https://www.malaymail.com/feed" },
-    .{ .cc = "ID", .name = "Jakarta Post", .url = "https://www.thejakartapost.com/rss/dailyheadline.xml" },
+    .{ .cc = "ID", .name = "ANTARA News", .url = "https://en.antaranews.com/rss/news.xml" },
     .{ .cc = "TH", .name = "Bangkok Post", .url = "https://www.bangkokpost.com/rss/data/topstories.xml" },
-    .{ .cc = "VN", .name = "Vietnam News", .url = "https://vietnamnews.vn/rss/20.rss" },
-    .{ .cc = "HK", .name = "SCMP", .url = "https://www.scmp.com/rss/91/feed" },
+    .{ .cc = "VN", .name = "VnExpress International", .url = "https://e.vnexpress.net/rss/news.rss" },
+    .{ .cc = "HK", .name = "SCMP", .url = "https://www.scmp.com/rss/91/feed/" },
     .{ .cc = "TW", .name = "Taiwan News", .url = "https://www.taiwannews.com.tw/ch/rss.php" },
     .{ .cc = "KE", .name = "Daily Nation Kenya", .url = "https://nation.africa/kenya/rss.xml" },
     .{ .cc = "MA", .name = "Morocco World News", .url = "https://www.moroccoworldnews.com/feed/" },
-    .{ .cc = "CL", .name = "Santiago Times", .url = "https://santiagotimes.cl/feed/" },
+    .{ .cc = "CL", .name = "La Tercera", .url = "https://www.latercera.com/arc/outboundfeeds/rss/?outputType=xml&size=20" },
     .{ .cc = "BE", .name = "The Brussels Times", .url = "https://www.brusselstimes.com/feed" },
-    .{ .cc = "CN", .name = "China Daily", .url = "https://www.chinadaily.com.cn/rss/cndy_rss.xml" },
+    .{ .cc = "CN", .name = "CGTN", .url = "https://www.cgtn.com/subscribe/rss/section/china.xml" },
 };
 
 /// Look up a general source by its key (case-insensitive), or null.
@@ -300,7 +299,7 @@ test "defaultSource is a valid configured source" {
 }
 
 test "countryFeed maps ISO codes to feeds" {
-    try std.testing.expectEqualStrings("NHK World", countryFeed("JP").?.name);
+    try std.testing.expectEqualStrings("The Japan Times", countryFeed("JP").?.name);
     try std.testing.expectEqualStrings("NPR News", countryFeed("us").?.name);
     try std.testing.expect(countryFeed("ZZ") == null);
 }
@@ -315,6 +314,56 @@ test "usesImperial matches the imperial set" {
 test "every source and country feed has an https url" {
     for (sources) |s| try std.testing.expect(std.mem.startsWith(u8, s.url, "https://"));
     for (country_feeds) |f| try std.testing.expect(std.mem.startsWith(u8, f.url, "https://"));
+}
+
+test "retired feed URLs stay out of the catalogue" {
+    // Each of these failed a live probe on 2026-11-07 (TLS failure, NXDOMAIN,
+    // 3xx the fetcher does not follow, 404/410, a body over the 1 MiB fetch
+    // cap, or a 200 with no <item>/<entry>). None may come back.
+    const retired = [_][]const u8{
+        "https://rss.cnn.com/rss/edition.rss",
+        "https://feeds.24.com/articles/news24/TopStories/rss",
+        "https://www.swissinfo.ch/eng/rss/headline_news",
+        "https://thehill.com/rss/syndicator/19110/",
+        "https://www.cbc.ca/cmlink/rss-topstories",
+        "https://www.rte.ie/news/rss/news-headlines.xml",
+        "https://feeds.yle.fi/uutiset/v1/majorHeadlines/YLE_UUTISET.rss",
+        "https://www.thenationalnews.com/rss",
+        "https://www.scmp.com/rss/91/feed",
+        "https://santiagotimes.cl/feed/",
+        "https://www3.nhk.or.jp/nhkworld/en/news/feeds/rss.xml",
+        "https://www.thejakartapost.com/rss/dailyheadline.xml",
+        "https://www.chinadaily.com.cn/rss/cndy_rss.xml",
+        "https://www.koreaherald.com/rss/01.xml",
+        "https://vietnamnews.vn/rss/20.rss",
+    };
+    for (retired) |dead| {
+        for (sources) |s| try std.testing.expect(!std.mem.eql(u8, s.url, dead));
+        for (country_feeds) |f| try std.testing.expect(!std.mem.eql(u8, f.url, dead));
+    }
+    // CNN publishes no live HTTPS feed (rss.cnn.com fails TLS; its plain-HTTP
+    // feeds stopped updating in 2024), so the key resolves to nothing.
+    try std.testing.expect(sourceByKey("cnn") == null);
+}
+
+test "catalogue keys, country codes, and URL shapes are well formed" {
+    for (sources, 0..) |s, i| {
+        for (sources[i + 1 ..]) |other| try std.testing.expect(!std.ascii.eqlIgnoreCase(s.key, other.key));
+        const rest = s.url["https://".len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.TestUnexpectedResult;
+        try std.testing.expect(slash > 0);
+        try std.testing.expect(s.topics.len > 0);
+        for (s.topics) |tag| try std.testing.expect(canonicalTopic(tag) != null);
+    }
+    for (country_feeds, 0..) |f, i| {
+        try std.testing.expectEqual(@as(usize, 2), f.cc.len);
+        for (f.cc) |c| try std.testing.expect(c >= 'A' and c <= 'Z');
+        for (country_feeds[i + 1 ..]) |other| try std.testing.expect(!std.ascii.eqlIgnoreCase(f.cc, other.cc));
+        const rest = f.url["https://".len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.TestUnexpectedResult;
+        try std.testing.expect(slash > 0);
+        for (f.url) |c| try std.testing.expect(c > 0x20 and c < 0x7f);
+    }
 }
 
 test "parseNewsCommand distinguishes sources, topics, counts, and usage" {
