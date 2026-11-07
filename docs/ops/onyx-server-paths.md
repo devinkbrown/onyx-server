@@ -173,9 +173,17 @@ When the target lacks them, the predecessor does this before exec:
 
 Hot rollback procedure (one node at a time):
 
-1. Set `[tls] ktls = "off"`, or set `enable_tls12 = false`. Then Helix UPGRADE to the **current** image.
-   The successor reads the new config and existing connections are carried.
-   New TLS 1.2 sessions are no longer offloaded.
+1. Set `[tls] ktls = "off"`. Then Helix UPGRADE to the **current** image.
+   The successor reads the new config. Existing connections are carried, and
+   offloaded rows keep their offload. New TLS 1.2 sessions are no longer
+   offloaded.
+   Do **not** set `enable_tls12 = false` for this step. A successor with TLS
+   1.2 disabled has no TLS 1.2 config, so it cannot resume any carried TLS 1.2
+   row. It rejects the whole handoff and drops every client on the node. The
+   predecessor does not check the target's config, so nothing refuses the
+   UPGRADE first. The same happens if `0.10.4` boots with TLS 1.2 disabled
+   while TLS 1.2 rows are carried. Keep `enable_tls12 = true` through every
+   Helix step while TLS 1.2 clients are connected.
 2. Wait until `onyx_tls_ktls12_active` on `:9130/metrics` reaches `0`. You can
    also ask the remaining TLS 1.2 clients to reconnect, or disconnect them.
 3. Point the service binary at `0.10.4` and Helix UPGRADE. A refusal leaves
