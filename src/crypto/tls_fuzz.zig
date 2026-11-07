@@ -29,29 +29,20 @@
 //!     `zig build fuzz --fuzz` step) the SAME targets run coverage-guided. See
 //!     build.zig's `fuzz` step.
 //!
-//!     TOOLCHAIN NOTE (re-verified 2026-07-07 against Zig 0.17.0-dev.1282+c0f9b51d8,
-//!     the compiler now installed on both hosts). Two facts:
-//!       * `zig build fuzz` (bounded corpus replay, no `--fuzz`) COMPILES and
-//!         PASSES. The `std.testing.fuzz` signature, the `*std.testing.Smith`
-//!         callback shape, `smith.slice`/`smith.valueRangeAtMost`, and the
-//!         `.corpus` option used here are all current for 0.17 — no call-site
-//!         change was needed.
-//!       * `zig build fuzz --fuzz` now BUILDS, LINKS, and ENTERS coverage-guided
-//!         fuzzing. The old Zig 0.16 blocker — a `StackTrace` type mismatch in the
-//!         compiler's own `compiler/test_runner.zig`, behind `if (builtin.fuzz)` —
-//!         is GONE in 0.17: the fuzz artifact links, replays the seed corpus
-//!         ("fuzz success"), starts the web UI, and begins mutating. The fuzzer
-//!         THEN crashes DETERMINISTICALLY with
-//!         `panic: start index 1 is larger than end index 0`. That is a
-//!         slice-bounds bug in the compiler's OWN fuzzer runtime (the `[1..]`
-//!         mutation-copy path in `lib/zig/fuzzer.zig`), NOT in any Onyx Server parser:
-//!         a trivial standalone `smith.slice` target containing zero Onyx Server code
-//!         reproduces the identical panic on every run, immediately after
-//!         "fuzz success". So coverage-guided `--fuzz` is unblocked at the BUILD
-//!         level but blocked at RUNTIME by this upstream 0.17-dev toolchain bug;
-//!         until it is fixed the deterministic layer above remains the operative
-//!         fuzzer. The targets here are the correct API and become coverage-guided
-//!         the moment the runtime bug is resolved.
+//!     TOOLCHAIN NOTE (re-verified 2026-11-07 against Zig 0.17.0):
+//!       * `zig build fuzz` (bounded corpus replay, no `--fuzz`) compiles and
+//!         passes.
+//!       * `zig build fuzz --fuzz[=N]` runs coverage-guided. Earlier failures had
+//!         two causes. On 0.17.0-dev.1282 the fuzzer runtime panicked with
+//!         `start index 1 is larger than end index 0`; that panic does not
+//!         reproduce on 0.17.0 (a trivial standalone target and these targets
+//!         both run cleanly). On 0.17.0 the remaining failure was
+//!         `corrupted coverage file ...: pcs_len was zero`: the default Debug
+//!         backend on x86_64 Linux is self-hosted and emits no SanitizerCoverage
+//!         PCs. build.zig now forces the fuzz artifact onto the LLVM backend,
+//!         and the x509 target then ran about 900k inputs with no crash.
+//!     Whole-engine fuzzing (TLS 1.3 server/client, QUIC, DTLS) is in
+//!     `tls_engine_fuzz.zig`, `proto/quic_fuzz.zig` and `proto/dtls_fuzz.zig`.
 const std = @import("std");
 
 const x509 = @import("x509.zig");
