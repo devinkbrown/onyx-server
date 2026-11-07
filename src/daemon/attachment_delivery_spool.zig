@@ -514,6 +514,37 @@ pub const Spool = struct {
         return false;
     }
 
+    /// Read-only operator census of exactly the state `hasUncheckpointedOutput`
+    /// refuses on. `blocks()` is equivalent to that predicate by construction.
+    pub const UncheckpointedCensus = struct {
+        output_barriers: usize = 0,
+        barrier_clients: usize = 0,
+        plaintext_entries: usize = 0,
+        preframed_secure_entries: usize = 0,
+        irc_record_entries: usize = 0,
+
+        pub fn uncheckpointedEntries(self: UncheckpointedCensus) usize {
+            return self.plaintext_entries + self.preframed_secure_entries;
+        }
+
+        pub fn blocks(self: UncheckpointedCensus) bool {
+            return self.output_barriers != 0 or self.uncheckpointedEntries() != 0;
+        }
+    };
+
+    pub fn uncheckpointedCensus(self: *const Spool) UncheckpointedCensus {
+        var census: UncheckpointedCensus = .{
+            .output_barriers = self.output_barrier_count,
+            .barrier_clients = self.output_barriers.count(),
+        };
+        for (self.entries.items) |entry| switch (entry.encoding) {
+            .irc_record => census.irc_record_entries += 1,
+            .plaintext => census.plaintext_entries += 1,
+            .preframed_secure => census.preframed_secure_entries += 1,
+        };
+        return census;
+    }
+
     /// Exact physical terminal retirement, never a queue reset or handoff.
     pub fn discardUncheckpointedOutput(self: *Spool, client: ClientId) usize {
         var retired: usize = 0;
@@ -2657,4 +2688,42 @@ test "output barrier plaintext prepare allocation cuts leave sequence bytes and 
         }
     }
     return error.TestUnexpectedResult;
+}
+
+test "uncheckpointed census counts exactly the Helix-refused barriers and non-IRC encodings" {
+    const a = std.testing.allocator;
+    var spool = try Spool.init(a, .{});
+    defer spool.deinit();
+    try std.testing.expect(!spool.uncheckpointedCensus().blocks());
+    _ = try spool.reserveBatch(&.{.{ .client = 1, .event_id = @splat(1), .bytes = ":old NOTICE one :before\r\n" }});
+    // Checkpointable ADS1 records alone never block.
+    var census = spool.uncheckpointedCensus();
+    try std.testing.expect(!census.blocks());
+    try std.testing.expectEqual(@as(usize, 1), census.irc_record_entries);
+    try std.testing.expectEqual(spool.hasUncheckpointedOutput(), census.blocks());
+    var gates = try spool.prepareOutputBarriers(4, &.{ 1, 2 }, 4);
+    defer gates.deinit();
+    gates.commit();
+    var output = try spool.prepareOutputBatch(&.{
+        .{ .client = 3, .bytes = ":s NOTICE x :plain\r\n" },
+        .{ .client = 3, .bytes = "\x81\x01X", .encoding = .preframed_secure },
+        .{ .client = 5, .bytes = "\x81\x01Y", .encoding = .preframed_secure },
+    });
+    defer output.deinit();
+    _ = output.commit();
+    census = spool.uncheckpointedCensus();
+    try std.testing.expect(census.blocks());
+    try std.testing.expectEqual(spool.hasUncheckpointedOutput(), census.blocks());
+    try std.testing.expectEqual(@as(usize, 2), census.output_barriers);
+    try std.testing.expectEqual(@as(usize, 2), census.barrier_clients);
+    try std.testing.expectEqual(@as(usize, 1), census.plaintext_entries);
+    try std.testing.expectEqual(@as(usize, 2), census.preframed_secure_entries);
+    try std.testing.expectEqual(@as(usize, 3), census.uncheckpointedEntries());
+    try std.testing.expectEqual(@as(usize, 2), spool.discardOutputBarriers(1) + spool.discardOutputBarriers(2));
+    try std.testing.expectEqual(@as(usize, 2), spool.discardUncheckpointedOutput(3));
+    try std.testing.expectEqual(@as(usize, 1), spool.discardUncheckpointedOutput(5));
+    census = spool.uncheckpointedCensus();
+    try std.testing.expect(!census.blocks());
+    try std.testing.expectEqual(spool.hasUncheckpointedOutput(), census.blocks());
+    try std.testing.expectEqual(@as(usize, 1), census.irc_record_entries);
 }

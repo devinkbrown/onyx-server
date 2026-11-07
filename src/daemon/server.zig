@@ -8573,6 +8573,7 @@ pub const LinuxServer = struct {
         try self.writeRelayV2BackpressurePrometheus(self.allocator, &out);
         try self.writeResourceBudgetPrometheus(self.allocator, &out);
         try self.writeSessionCredentialPrometheus(self.allocator, &out);
+        try self.writeUpgradeContinuityPrometheus(self.allocator, &out);
         const webpush_dropped: usize = if (self.webpush_worker) |worker| worker.dropped.load(.monotonic) else 0;
         try webpush_mod.appendDroppedSample(&out, self.allocator, webpush_dropped);
         var offer_retry_metrics: [offer_retry_reuse.RetryReasonStats.max_render_len]u8 = undefined;
@@ -11618,6 +11619,7 @@ pub const LinuxServer = struct {
         // enqueue a later event to that generation.
         self.abortPoisonedDeliveries();
         self.drainAttachmentSpoolForCurrentReactor();
+        self.retireStrandedClosingDiversions();
         self.retryPendingRemoteMemberships();
         self.retryPreparedPeerCloses();
         self.reconcilePendingRemotePublicIdentities();
@@ -18187,6 +18189,60 @@ pub const LinuxServer = struct {
         _ = try reserved;
         self.wakeShard(id.shard);
         if (id.shard == self.rx().shard_id) self.drainAttachmentSpoolForCurrentReactor();
+    }
+
+    /// True while `physical` owns any state that only its own owner drain or
+    /// its exact physical close (`forgetRemoteIdentityRecipient`) can retire:
+    /// local QUIT captures, output barriers, uncheckpointed (non-ADS1) output,
+    /// registry host records, or unreceipted departure-image records.
+    fn physicalHoldsDivertedCustodyLocked(self: *LinuxServer, physical: u64, conn: *const ConnState) bool {
+        if (conn.local_quit_captures != 0 or self.attachment_delivery_spool.hasOutputBarrier(physical)) return true;
+        for (self.attachment_delivery_spool.entries.items) |entry| {
+            if (entry.client == physical and entry.encoding != .irc_record) return true;
+        }
+        if (self.hasPendingRemoteHostForPhysicalLocked(physical)) return true;
+        var image = self.remote_departures;
+        while (image) |current| : (image = current.next) {
+            for (current.recipients.items, current.starts, current.ends) |id, cursor, end| {
+                if (monitorIdFromClient(id) == physical and cursor != end) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Timer-driven terminal step for a client that is already closing but
+    /// can never reach `closeConn` on its own.
+    ///
+    /// Timer closes (ping and registration timeout) append ERROR, set
+    /// `closing` and rely on the send-drain completion in `handleSend` to call
+    /// `closeConn`. While the connection's output is diverted into the
+    /// attachment-delivery lane (`output_barrier_server`), that ERROR enters
+    /// ADS rather than the SendQ, and every owner drain (ADS heads, departure
+    /// images, local QUIT captures) skips `closing` connections. The SendQ
+    /// stays empty, no SEND is ever armed, and only a remote TCP failure could
+    /// ever close the generation. Meanwhile its captures, barriers, host
+    /// records and non-ADS1 output refuse every Helix UPGRADE indefinitely.
+    ///
+    /// Nothing remains that a SEND could carry, so perform exactly the close
+    /// the send-drain path would have performed. `closeConn` runs the existing
+    /// exact physical retirement (`forgetRemoteIdentityRecipient`): physical
+    /// output is retired for this generation only, reusable ADS1 session
+    /// records are untouched, and no accepted event is transferred or
+    /// duplicated. Connections with unsent wire, an in-flight SEND, or no
+    /// stranded custody are left to their existing completion paths.
+    fn retireStrandedClosingDiversions(self: *LinuxServer) void {
+        for (self.rx().clients.slots.items, 0..) |*slot, index| {
+            if (!slot.occupied) continue;
+            const conn = &slot.value;
+            if (!conn.closing or conn.output_barrier_server == null) continue;
+            if (conn.s2s != null or conn.s2s_secured != null or hasUnsentOutput(conn)) continue;
+            const physical = monitorIdFromClient(slotClientId(self.rx(), index, slot.gen));
+            lockSpin(&self.attachment_delivery_mu);
+            const stranded = self.physicalHoldsDivertedCustodyLocked(physical, conn);
+            self.attachment_delivery_mu.unlock();
+            if (!stranded) continue;
+            self.closeConn(conn.token, conn.close_reason) catch {};
+        }
     }
 
     /// Owner-only SendQ drain for durable attachment records. SendQ pressure is
@@ -39032,6 +39088,9 @@ pub const LinuxServer = struct {
             blocker_len += 1;
         }
         const continuity = self.upgradeContinuityBlockersLocked();
+        // Census at the same World cut as the scan, before any notice below
+        // can itself enter a diverted physical output lane.
+        const census = self.remoteVisibleContinuityCensus(true);
         for (continuity.ordered()) |blocker| {
             blockers[blocker_len] = upgradePlanContinuityBlocker(blocker);
             blocker_len += 1;
@@ -39076,6 +39135,11 @@ pub const LinuxServer = struct {
             return;
         };
         for (lines.slice()) |line| try self.noticeTo(conn, line);
+        if (continuity.all.contains(.remote_visible_identity)) {
+            var census_buf: [512]u8 = undefined;
+            var line_buf: [600]u8 = undefined;
+            try self.noticeTo(conn, std.fmt.bufPrint(&line_buf, "UPGRADE PLAN: remote visible identity detail: {s}", .{formatRemoteVisibleContinuityCensus(&census, &census_buf)}) catch "UPGRADE PLAN: remote visible identity detail does not fit");
+        }
         try self.noticeTo(conn, "UPGRADE PLAN: dry run; nothing queued; the target probe runs only at UPGRADE and seamless requires carry=total with no blockers");
     }
 
@@ -41629,6 +41693,139 @@ pub const LinuxServer = struct {
         };
     }
 
+    const PhysicalAttachmentState = enum { attached, closing, detached };
+
+    /// Operator census behind the `remote_visible_identity` refusal. Every
+    /// counter maps to exactly one sub-predicate of
+    /// `scanUpgradeContinuityBlockersLocked`; `blocks()` is their disjunction.
+    const RemoteVisibleContinuityCensus = struct {
+        local_quit_operations: usize = 0,
+        local_quit_pending_recipients: usize = 0,
+        pending_remote_host_records: usize = 0,
+        remote_departure_images: usize = 0,
+        remote_departure_pending_records: usize = 0,
+        spool: attachment_delivery_spool.Spool.UncheckpointedCensus = .{},
+        /// The fields below are filled only by a classifying census, whose
+        /// caller holds World (connection tables are then stable).
+        classified: bool = false,
+        pending_remote_host_records_unattached: usize = 0,
+        non_irc_attached: usize = 0,
+        non_irc_closing: usize = 0,
+        non_irc_detached: usize = 0,
+        barrier_clients_attached: usize = 0,
+        barrier_clients_closing: usize = 0,
+        barrier_clients_detached: usize = 0,
+        samples: [max_samples]Sample = undefined,
+        sample_len: usize = 0,
+
+        const max_samples = 4;
+        const Sample = struct {
+            client: u64,
+            sequence: u64,
+            bytes: usize,
+            encoding: attachment_delivery_spool.OutputEncoding,
+            state: PhysicalAttachmentState,
+        };
+
+        fn blocks(self: *const @This()) bool {
+            return self.local_quit_operations != 0 or self.pending_remote_host_records != 0 or
+                self.remote_departure_images != 0 or self.spool.blocks();
+        }
+    };
+
+    fn physicalAttachmentState(self: *LinuxServer, physical: u64) PhysicalAttachmentState {
+        const conn = self.connFor(clientIdFromMonitor(physical)) orelse return .detached;
+        return if (conn.closing) .closing else .attached;
+    }
+
+    /// Takes only `attachment_delivery_mu`, so the unclassified form is safe
+    /// for the metrics cadence. `classify` additionally resolves each physical
+    /// owner and requires World (refusal path and UPGRADE PLAN hold it).
+    fn remoteVisibleContinuityCensus(self: *LinuxServer, classify: bool) RemoteVisibleContinuityCensus {
+        var census: RemoteVisibleContinuityCensus = .{ .classified = classify };
+        lockSpin(&self.attachment_delivery_mu);
+        defer self.attachment_delivery_mu.unlock();
+        for (&self.local_quits) |*operation| if (operation.active) {
+            census.local_quit_operations += 1;
+            census.local_quit_pending_recipients += operation.pending;
+        };
+        census.pending_remote_host_records = self.pending_remote_host_records.count();
+        var image = self.remote_departures;
+        while (image) |current| : (image = current.next) {
+            census.remote_departure_images += 1;
+            census.remote_departure_pending_records += current.records.items.len - current.cursor;
+        }
+        census.spool = self.attachment_delivery_spool.uncheckpointedCensus();
+        if (!classify) return census;
+        var keys = self.pending_remote_host_records.keyIterator();
+        while (keys.next()) |key| if (self.physicalAttachmentState(key.client) != .attached) {
+            census.pending_remote_host_records_unattached += 1;
+        };
+        for (self.attachment_delivery_spool.entries.items) |entry| {
+            if (entry.encoding == .irc_record) continue;
+            const state = self.physicalAttachmentState(entry.client);
+            switch (state) {
+                .attached => census.non_irc_attached += 1,
+                .closing => census.non_irc_closing += 1,
+                .detached => census.non_irc_detached += 1,
+            }
+            if (census.sample_len < census.samples.len) {
+                census.samples[census.sample_len] = .{ .client = entry.client, .sequence = entry.sequence, .bytes = entry.bytes.len, .encoding = entry.encoding, .state = state };
+                census.sample_len += 1;
+            }
+        }
+        var lanes = self.attachment_delivery_spool.output_barriers.keyIterator();
+        while (lanes.next()) |client| switch (self.physicalAttachmentState(client.*)) {
+            .attached => census.barrier_clients_attached += 1,
+            .closing => census.barrier_clients_closing += 1,
+            .detached => census.barrier_clients_detached += 1,
+        };
+        return census;
+    }
+
+    /// One operator line naming which `remote_visible_identity` sub-conditions
+    /// hold, with counts and physical-owner states.
+    fn formatRemoteVisibleContinuityCensus(census: *const RemoteVisibleContinuityCensus, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(
+            buf,
+            "local_quit_captures={d} (recipients={d}) pending_remote_host_records={d} (unattached={d}) departures={d} (records={d}) spool_barriers={d} (clients={d}: attached={d} closing={d} detached={d}) spool_non_irc={d} (plaintext={d} preframed_secure={d}; attached={d} closing={d} detached={d})",
+            .{
+                census.local_quit_operations,       census.local_quit_pending_recipients,
+                census.pending_remote_host_records, census.pending_remote_host_records_unattached,
+                census.remote_departure_images,     census.remote_departure_pending_records,
+                census.spool.output_barriers,       census.spool.barrier_clients,
+                census.barrier_clients_attached,    census.barrier_clients_closing,
+                census.barrier_clients_detached,    census.spool.uncheckpointedEntries(),
+                census.spool.plaintext_entries,     census.spool.preframed_secure_entries,
+                census.non_irc_attached,            census.non_irc_closing,
+                census.non_irc_detached,
+            },
+        ) catch "census does not fit";
+    }
+
+    /// Caller holds World. Logs the census and up to four non-IRC samples.
+    fn logRemoteVisibleContinuityRefusal(self: *LinuxServer) void {
+        const census = self.remoteVisibleContinuityCensus(true);
+        var buf: [512]u8 = undefined;
+        srvLog("onyx-server: UPGRADE continuity detail: {s}\n", .{formatRemoteVisibleContinuityCensus(&census, &buf)});
+        for (census.samples[0..census.sample_len]) |sample| {
+            srvLog("onyx-server: UPGRADE continuity non-IRC output client={x} sequence={d} bytes={d} encoding={s} owner={s}\n", .{ sample.client, sample.sequence, sample.bytes, @tagName(sample.encoding), @tagName(sample.state) });
+        }
+    }
+
+    fn writeUpgradeContinuityPrometheus(self: *LinuxServer, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        const census = self.remoteVisibleContinuityCensus(false);
+        try writePromGauge(allocator, out, "onyx_helix_continuity_local_quit_captures", "Local QUIT captures still owed to physical recipients (blocks Helix)", census.local_quit_operations);
+        try writePromGauge(allocator, out, "onyx_helix_continuity_local_quit_recipients", "Physical recipients still owed a captured local QUIT", census.local_quit_pending_recipients);
+        try writePromGauge(allocator, out, "onyx_helix_continuity_pending_remote_host_records", "Remote host/split notification records awaiting physical receipt (blocks Helix)", census.pending_remote_host_records);
+        try writePromGauge(allocator, out, "onyx_helix_continuity_departure_images", "Peer departure images awaiting physical receipt (blocks Helix)", census.remote_departure_images);
+        try writePromGauge(allocator, out, "onyx_helix_continuity_departure_records", "Peer departure records awaiting physical receipt", census.remote_departure_pending_records);
+        try writePromGauge(allocator, out, "onyx_helix_continuity_spool_barriers", "Attachment-delivery output barriers held (blocks Helix)", census.spool.output_barriers);
+        try writePromGauge(allocator, out, "onyx_helix_continuity_spool_plaintext", "Uncheckpointed plaintext attachment-delivery entries (blocks Helix)", census.spool.plaintext_entries);
+        try writePromGauge(allocator, out, "onyx_helix_continuity_spool_preframed_secure", "Uncheckpointed preframed-secure attachment-delivery entries (blocks Helix)", census.spool.preframed_secure_entries);
+        try writePromGauge(allocator, out, "onyx_helix_continuity_remote_visible_blocked", "Whether remote visible identity continuity currently refuses Helix (1=yes, 0=no)", @as(u8, if (census.blocks()) 1 else 0));
+    }
+
     /// Post-capability-probe half of `performUpgrade`. Kept as a narrow test seam
     /// so failure-unwind tests can enter the producer barrier deterministically
     /// without depending on a separately-installed Onyx Server executable. Production
@@ -41989,6 +42186,7 @@ pub const LinuxServer = struct {
             var blocker_buf: [192]u8 = undefined;
             const blocker_name = upgradeContinuityBlockerName(blocker);
             srvLog("onyx-server: UPGRADE refused — {s} has no exact Helix checkpoint\n", .{blocker_name});
+            if (blocker == .remote_visible_identity) self.logRemoteVisibleContinuityRefusal();
             self.deferredUpgradeNotice(
                 request,
                 std.fmt.bufPrint(
@@ -186724,4 +186922,127 @@ test "armor3: TLS metrics expose kTLS 1.2, delegated credential expiry and QUIC 
     try std.testing.expect(std.mem.indexOf(u8, out.items, "onyx_quic_early_data_rejected_total ") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "onyx_quic_stateless_resets_sent_total ") != null);
     _ = server.tls_ktls12_active.fetchSub(2, .monotonic);
+}
+
+/// Builds the incident shape on a real test server: a remote departure image
+/// holds an output barrier on a pressured observer, so the observer's output
+/// is diverted into ADS; the observer then misses PING and the timeout sweep
+/// marks it closing with its final ERROR diverted behind that barrier.
+fn strandClosingDivertedObserverForTest(f: *RemoteHostNotifyFixtureForTest, channel: []const u8) !*ConnState {
+    try f.deliver(channel, "old.public", 100);
+    try f.join(f.observer, channel);
+    const conn = f.server.connFor(f.observer).?;
+    resetTestSendQ(conn);
+    conn.sendq_cap = 1;
+    conn.send_buf[0] = 'X';
+    conn.send_len = 1;
+    f.server.world.lockWrite();
+    defer f.server.world.unlockWrite();
+    try f.server.closeConn(f.server.connFor(f.peer).?.token, "peer drop under observer pressure");
+    f.link = null;
+    try std.testing.expect(conn.output_barrier_server != null);
+    try std.testing.expect(f.server.attachment_delivery_spool.hasOutputBarrier(monitorIdFromClient(f.observer)));
+    // The IRC-unresponsive client keeps its TCP endpoint alive: no PONG.
+    conn.awaiting_pong = true;
+    conn.ping_sent_ms = f.server.nowMs() - f.server.config.ping_timeout_ms - 1;
+    f.server.sweepTimeouts();
+    try std.testing.expect(conn.closing);
+    try std.testing.expectEqualStrings("Ping timeout", conn.close_reason);
+    // The kernel accepted the earlier byte; the SendQ is healthy again.
+    resetTestSendQ(conn);
+    conn.sendq_cap = default_sendq_cap;
+    return conn;
+}
+
+test "Helix continuity: ping-timeout close with diverted output strands state until the stranded-close retirement" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var f = try RemoteHostNotifyFixtureForTest.create();
+    defer f.deinit();
+    const conn = try strandClosingDivertedObserverForTest(&f, "#stranded-close");
+    f.server.world.lockWrite();
+    defer f.server.world.unlockWrite();
+    // Every pre-existing owner turn runs many times; none makes progress.
+    for (0..8) |_| {
+        f.server.drainAttachmentSpoolForCurrentReactorDeep();
+        f.server.sweepTimeouts();
+        f.server.retryPreparedPeerCloses();
+    }
+    try std.testing.expect(f.server.connFor(f.observer) == conn and conn.closing);
+    // The final ERROR never reached the SendQ: no SEND can complete, so the
+    // send-drain close in handleSend can never run for this generation.
+    try std.testing.expect(!LinuxServer.hasUnsentOutput(conn));
+    var census = f.server.remoteVisibleContinuityCensus(true);
+    try std.testing.expect(census.blocks());
+    try std.testing.expectEqual(@as(usize, 1), census.remote_departure_images);
+    try std.testing.expectEqual(@as(usize, 1), census.barrier_clients_closing);
+    try std.testing.expect(census.non_irc_closing != 0);
+    try std.testing.expectEqual(@as(usize, 0), census.non_irc_attached + census.non_irc_detached);
+    try std.testing.expectEqual(LinuxServer.UpgradeContinuityBlocker.remote_visible_identity, f.server.upgradeContinuityBlockerLocked().?);
+    // The bounded maintenance step finishes the close the SEND would have.
+    f.server.retireStrandedClosingDiversions();
+    try std.testing.expect(f.server.connFor(f.observer) == null);
+    census = f.server.remoteVisibleContinuityCensus(true);
+    try std.testing.expect(!census.blocks());
+    f.server.drainAttachmentSpoolForCurrentReactorDeep();
+    try std.testing.expect(f.server.remote_departures == null);
+    try std.testing.expectEqual(@as(usize, 0), f.server.pendingRemoteHostRecordCount());
+    try std.testing.expectEqual(@as(usize, 0), f.server.attachment_delivery_spool.len());
+    try std.testing.expect(f.server.upgradeContinuityBlockerLocked() == null);
+}
+
+test "Helix continuity: remote visible identity refusal census reaches UPGRADE PLAN, log and metrics" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var f = try RemoteHostNotifyFixtureForTest.create();
+    defer f.deinit();
+    {
+        // Clean node: every sub-condition reads zero and nothing blocks.
+        var clean: std.ArrayList(u8) = .empty;
+        defer clean.deinit(a);
+        try f.server.writeUpgradeContinuityPrometheus(a, &clean);
+        try expectContains(clean.items, "onyx_helix_continuity_remote_visible_blocked 0\n");
+        try expectContains(clean.items, "onyx_helix_continuity_spool_barriers 0\n");
+    }
+    _ = try strandClosingDivertedObserverForTest(&f, "#census-detail");
+    const requester = f.server.connFor(f.negative).?;
+    resetTestSendQ(requester);
+    f.server.world.lockWrite();
+    {
+        defer f.server.world.unlockWrite();
+        const census = f.server.remoteVisibleContinuityCensus(true);
+        // The census is exactly the scan's sub-predicate disjunction.
+        lockSpin(&f.server.attachment_delivery_mu);
+        const spool_blocks = f.server.attachment_delivery_spool.hasUncheckpointedOutput();
+        f.server.attachment_delivery_mu.unlock();
+        try std.testing.expectEqual(f.server.hasLocalQuitCapture() or f.server.pendingRemoteHostRecordCount() != 0 or f.server.remote_departures != null or spool_blocks, census.blocks());
+        try std.testing.expect(census.sample_len != 0);
+        try std.testing.expectEqual(LinuxServer.PhysicalAttachmentState.closing, census.samples[0].state);
+        try std.testing.expectEqual(monitorIdFromClient(f.observer), census.samples[0].client);
+        var buf: [512]u8 = undefined;
+        const line = LinuxServer.formatRemoteVisibleContinuityCensus(&census, &buf);
+        try expectContains(line, "local_quit_captures=0 (recipients=0)");
+        try expectContains(line, "departures=1 (records=");
+        try expectContains(line, "spool_barriers=1 (clients=1: attached=0 closing=1 detached=0)");
+        try expectContains(line, "detached=0)");
+        f.server.logRemoteVisibleContinuityRefusal();
+        try f.server.emitUpgradePlan(requester);
+    }
+    const plan = try copyTestSendQ(a, requester);
+    defer a.free(plan);
+    try expectContains(plan, "UPGRADE PLAN: remote visible identity detail: local_quit_captures=0 ");
+    try expectContains(plan, "spool_barriers=1 (clients=1: attached=0 closing=1 detached=0)");
+    var metrics: std.ArrayList(u8) = .empty;
+    defer metrics.deinit(a);
+    try f.server.writeUpgradeContinuityPrometheus(a, &metrics);
+    try expectContains(metrics.items, "# TYPE onyx_helix_continuity_departure_images gauge\n");
+    try expectContains(metrics.items, "onyx_helix_continuity_departure_images 1\n");
+    try expectContains(metrics.items, "onyx_helix_continuity_spool_barriers 1\n");
+    try expectContains(metrics.items, "onyx_helix_continuity_local_quit_captures 0\n");
+    try expectContains(metrics.items, "onyx_helix_continuity_remote_visible_blocked 1\n");
+    // The full scrape renders the same series.
+    try f.server.refreshMetricsSnapshotFallible();
 }
