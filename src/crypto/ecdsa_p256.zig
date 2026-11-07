@@ -233,6 +233,38 @@ pub fn keyPairFromSecretKey(secret_key: SecretKey) SignError!KeyPair {
     return .{ .secret_key = secret_key, .public_key = public_key };
 }
 
+/// Length of the seed taken by `generateDeterministic` (same as std's
+/// `KeyPair.seed_length`).
+pub const seed_length = Impl.KeyPair.seed_length;
+
+/// Derive a key pair from `seed` in constant time. Byte-identical to std's
+/// `KeyPair.generateDeterministic`: d is the RFC 6979 sec. 3.2 HMAC_DRBG
+/// output with h = 0^32, x = 0x01^32 and the seed as the extra-noise block,
+/// which is exactly std's `deterministicScalar(0^32, 0x01^32, seed)`. Unlike
+/// std, Q = [d]G runs on `p256_ct` instead of the leaky `P256.mul`.
+pub fn generateDeterministic(seed: [seed_length]u8) SignError!KeyPair {
+    const zero_h: [prehash_len]u8 = @splat(0x00);
+    const k0: [scalar_len]u8 = @splat(0x01);
+    var d = deriveNonce(zero_h, k0, seed);
+    defer std.crypto.secureZero(u8, &d);
+    return keyPairFromSecretKey(.{ .bytes = d });
+}
+
+/// Generate a fresh random key pair in constant time. Same construction as
+/// std's `KeyPair.generate` (fresh `io.random` seed into
+/// `generateDeterministic`), but [d]G runs on `p256_ct`.
+pub fn generate(io: std.Io) KeyPair {
+    var seed: [seed_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed);
+    while (true) {
+        io.random(&seed);
+        return generateDeterministic(seed) catch {
+            @branchHint(.unlikely);
+            continue;
+        };
+    }
+}
+
 /// Verify `sig` over `msg` against `public_key`. Returns `true` on success;
 /// any verification or decoding error from the primitive maps to `false`.
 pub fn verify(sig: Signature, msg: []const u8, public_key: PublicKey) bool {
@@ -622,4 +654,25 @@ test "keyPairFromSecretKey matches std's KeyPair.fromSecretKey" {
         try testing.expectEqualSlices(u8, &want.public_key.toUncompressedSec1(), &got.public_key.toUncompressedSec1());
         try testing.expectEqualSlices(u8, &want.secret_key.bytes, &got.secret_key.bytes);
     }
+}
+
+test "generateDeterministic is byte-identical to std's KeyPair.generateDeterministic" {
+    var prng = std.Random.DefaultPrng.init(0x67656e64);
+    const rnd = prng.random();
+    for (0..32) |_| {
+        var seed: [seed_length]u8 = undefined;
+        rnd.bytes(&seed);
+        const want = try KeyPair.generateDeterministic(seed);
+        const got = try generateDeterministic(seed);
+        try testing.expectEqualSlices(u8, &want.secret_key.bytes, &got.secret_key.bytes);
+        try testing.expectEqualSlices(u8, &want.public_key.toUncompressedSec1(), &got.public_key.toUncompressedSec1());
+    }
+}
+
+test "generate yields a usable key pair whose signature std verifies" {
+    const kp = generate(testing.io);
+    const derived = try KeyPair.fromSecretKey(kp.secret_key);
+    try testing.expectEqualSlices(u8, &derived.public_key.toUncompressedSec1(), &kp.public_key.toUncompressedSec1());
+    const sig = try sign("onyx generate", kp);
+    try sig.verify("onyx generate", kp.public_key);
 }

@@ -156,7 +156,7 @@ pub fn ed25519Pkcs8Der(seed: [32]u8) [48]u8 {
 pub fn generatePem(io: std.Io, alg: Algorithm, buf: []u8) ![]const u8 {
     switch (alg) {
         .ec => {
-            var kp = ecdsa_p256.KeyPair.generate(io);
+            var kp = ecdsa_p256.generate(io);
             defer ecdsa_p256.wipeKeyPair(&kp);
             var der = ecPrivateKeyDer(&kp);
             defer std.crypto.secureZero(u8, &der);
@@ -213,7 +213,7 @@ pub fn inspectPem(text: []const u8) !KeyInfo {
         defer std.crypto.secureZero(u8, &scalar);
         var sk = try ecdsa_p256.SecretKey.fromBytes(scalar);
         defer ecdsa_p256.wipeSecretKey(&sk);
-        var kp = try ecdsa_p256.KeyPair.fromSecretKey(sk);
+        var kp = try ecdsa_p256.keyPairFromSecretKey(sk);
         defer ecdsa_p256.wipeKeyPair(&kp);
         var info = KeyInfo{ .kind = .ec, .public = undefined, .public_len = ecdsa_p256.sec1_uncompressed_length };
         const sec1 = kp.public_key.toUncompressedSec1();
@@ -328,6 +328,31 @@ test "armorcli pkey inspection fails closed on malformed and truncated keys" {
 
     // Not a key at all.
     try testing.expectError(error.UnsupportedKey, inspectPem("hello world"));
+}
+
+test "armorcli pkey inspection derives EC keys in constant time and rejects d >= n" {
+    // d = n + 1 is not a P-256 private key (SEC 1 v2 sec. 3.2.1). std's
+    // KeyPair.fromSecretKey accepted it ([n+1]G = G) and reported G as the
+    // public key; the constant-time derivation fails closed instead.
+    var d: [32]u8 = undefined;
+    std.mem.writeInt(u256, &d, 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632552, .big);
+    const g = try ecdsa_p256.keyPairFromSecretKey(try ecdsa_p256.SecretKey.fromBytes(@as([31]u8, @splat(0)) ++ [_]u8{1}));
+    const bad_kp: ecdsa_p256.KeyPair = .{ .secret_key = try ecdsa_p256.SecretKey.fromBytes(d), .public_key = g.public_key };
+    var der = ecPrivateKeyDer(&bad_kp);
+    defer std.crypto.secureZero(u8, &der);
+    var pem_buf: [512]u8 = undefined;
+    const bad_pem = try pem.encode(&pem_buf, "EC PRIVATE KEY", &der);
+    try testing.expectError(error.NonCanonical, inspectPem(bad_pem));
+
+    // A valid key still reports the std-derived public point.
+    var good_kp = try ecdsa_p256.generateDeterministic(@splat(0x44));
+    defer ecdsa_p256.wipeKeyPair(&good_kp);
+    var good_der = ecPrivateKeyDer(&good_kp);
+    defer std.crypto.secureZero(u8, &good_der);
+    var pem_buf2: [512]u8 = undefined;
+    const info = try inspectPem(try pem.encode(&pem_buf2, "EC PRIVATE KEY", &good_der));
+    const want = try ecdsa_p256.KeyPair.fromSecretKey(good_kp.secret_key);
+    try testing.expectEqualSlices(u8, &want.public_key.toUncompressedSec1(), info.publicSlice());
 }
 
 test "armorcli genpkey writes the key file 0o600" {

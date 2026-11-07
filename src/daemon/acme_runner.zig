@@ -632,7 +632,7 @@ pub fn loadOrCreateAccountKey(io: std.Io, dir: std.Io.Dir, path: []const u8) !Ac
         else => return err,
     }
 
-    var kp = ecdsa_p256.KeyPair.generate(io);
+    var kp = ecdsa_p256.generate(io);
     errdefer ecdsa_p256.wipeKeyPair(&kp);
     var pem_buf: [512]u8 = undefined;
     defer std.crypto.secureZero(u8, &pem_buf);
@@ -671,7 +671,7 @@ pub fn loadAccountKey(io: std.Io, dir: std.Io.Dir, path: []const u8) !ecdsa_p256
     var scalar = ec_pkcs.parseScalar(der) catch return error.InvalidAccountKey;
     defer std.crypto.secureZero(u8, &scalar);
     const sk = ecdsa_p256.SecretKey.fromBytes(scalar) catch return error.InvalidAccountKey;
-    return ecdsa_p256.KeyPair.fromSecretKey(sk) catch return error.InvalidAccountKey;
+    return ecdsa_p256.keyPairFromSecretKey(sk) catch return error.InvalidAccountKey;
 }
 
 /// Create `path` exclusively with owner-only permissions (fsync + link), so a
@@ -945,7 +945,7 @@ const tls_alpn01_lifetime_s: i64 = 7 * 24 * 60 * 60;
 /// ephemeral key. The serial is derived from the public key (unique per key;
 /// no RNG needed beyond key generation).
 pub fn mintTlsAlpn01(io: std.Io, out: []u8, domain: []const u8, key_authorization: []const u8, now_unix: i64) !struct { der: []const u8, key_pair: ecdsa_p256.KeyPair } {
-    var kp = ecdsa_p256.KeyPair.generate(io);
+    var kp = ecdsa_p256.generate(io);
     errdefer ecdsa_p256.wipeKeyPair(&kp);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(&kp.public_key.toUncompressedSec1(), &digest, .{});
@@ -1920,9 +1920,9 @@ test "Windows TLS ACME loopback issuance serves HTTP-01 and publishes a private 
         .ip_addresses = &.{&.{ 127, 0, 0, 1 }},
         .is_ca = true,
     });
-    const account_key = ecdsa_p256.KeyPair.generate(io);
-    const cert_key = ecdsa_p256.KeyPair.generate(io);
-    const issuer_key = ecdsa_p256.KeyPair.generate(io);
+    const account_key = ecdsa_p256.generate(io);
+    const cert_key = ecdsa_p256.generate(io);
+    const issuer_key = ecdsa_p256.generate(io);
     var issuer_der_buf: [2048]u8 = undefined;
     const issuer_der = try selfsign.buildSelfSignedEcdsaP256(&issuer_der_buf, .{
         .common_name = "localhost",
@@ -2190,7 +2190,7 @@ test "account key is generated once, persisted 0600, reloaded, and distinct from
     try std.testing.expectEqualSlices(u8, &first.key_pair.secret_key.toBytes(), &second.key_pair.secret_key.toBytes());
 
     // A per-issuance certificate key is a different key pair.
-    const cert_key = ecdsa_p256.KeyPair.generate(io);
+    const cert_key = ecdsa_p256.generate(io);
     try std.testing.expect(!std.mem.eql(u8, &cert_key.public_key.toUncompressedSec1(), &first.key_pair.public_key.toUncompressedSec1()));
 
     // The persisted form is the SEC1 PEM the TLS loader also reads.
@@ -2347,7 +2347,7 @@ test "waitForPropagation polls the probe and times out closed" {
 
 test "TlsAlpn01Store put/lookup/remove is case-insensitive, bounded, and serves only acme-tls/1 hellos" {
     var store: TlsAlpn01Store = .{};
-    const kp = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x21)));
+    const kp = try ecdsa_p256.generateDeterministic(@as([32]u8, @splat(0x21)));
     try std.testing.expect(store.isEmpty());
     try store.put("irc.example.test", "CERT-A", kp);
     try store.put("IRC.example.test", "CERT-B", kp); // replaces
@@ -2452,8 +2452,8 @@ test "runSteps dns-01: hook add + propagation before validation, del after, cert
     var entries = sinkFlow("dns-01", "https://ca/chal/d");
     var mock = SinkMock{ .entries = &entries, .observer = &rec, .on_post = Recorder.onPost };
 
-    const account = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x31)));
-    const cert_key = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x32)));
+    const account = try ecdsa_p256.generateDeterministic(@as([32]u8, @splat(0x31)));
+    const cert_key = try ecdsa_p256.generateDeterministic(@as([32]u8, @splat(0x32)));
     var account_es = Es256Signer.init(account);
     var cert_es = Es256Signer.init(cert_key);
     var client = acme.Acme.init(std.testing.allocator, .{
@@ -2521,8 +2521,8 @@ test "runSteps dns-01: a failing hook add still gets del and aborts before valid
     var hook = Failing{};
     var entries = sinkFlow("dns-01", "https://ca/chal/d");
     var mock = SinkMock{ .entries = &entries };
-    const account = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x41)));
-    const cert_key = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x42)));
+    const account = try ecdsa_p256.generateDeterministic(@as([32]u8, @splat(0x41)));
+    const cert_key = try ecdsa_p256.generateDeterministic(@as([32]u8, @splat(0x42)));
     var account_es = Es256Signer.init(account);
     var cert_es = Es256Signer.init(cert_key);
     var client = acme.Acme.init(std.testing.allocator, .{
@@ -2572,8 +2572,8 @@ test "runSteps tls-alpn-01: challenge cert is live in the store during validatio
     var obs = Observer{ .store = &store };
     var entries = sinkFlow("tls-alpn-01", "https://ca/chal/t");
     var mock = SinkMock{ .entries = &entries, .observer = &obs, .on_post = Observer.onPost };
-    const account = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x51)));
-    const cert_key = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x52)));
+    const account = try ecdsa_p256.generateDeterministic(@as([32]u8, @splat(0x51)));
+    const cert_key = try ecdsa_p256.generateDeterministic(@as([32]u8, @splat(0x52)));
     var account_es = Es256Signer.init(account);
     var cert_es = Es256Signer.init(cert_key);
     var client = acme.Acme.init(std.testing.allocator, .{
@@ -2605,8 +2605,8 @@ test "runSteps tls-alpn-01: challenge cert is live in the store during validatio
 test "runSteps fails closed when the configured challenge has no provisioner" {
     var entries = sinkFlow("dns-01", "https://ca/chal/d");
     var mock = SinkMock{ .entries = &entries };
-    const account = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x61)));
-    const cert_key = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x62)));
+    const account = try ecdsa_p256.generateDeterministic(@as([32]u8, @splat(0x61)));
+    const cert_key = try ecdsa_p256.generateDeterministic(@as([32]u8, @splat(0x62)));
     var account_es = Es256Signer.init(account);
     var cert_es = Es256Signer.init(cert_key);
     var client = acme.Acme.init(std.testing.allocator, .{

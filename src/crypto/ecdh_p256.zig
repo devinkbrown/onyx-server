@@ -4,9 +4,16 @@
 //! Ephemeral ECDH over NIST P-256 (secp256r1) for TLS ECDHE key exchange.
 //!
 //! This module provides ephemeral Elliptic Curve Diffie-Hellman key agreement
-//! on the NIST P-256 curve, built directly on `std.crypto.ecc.P256`. It is the
-//! curve component used by the `ecdhe_ecdsa`/`ecdhe_rsa` TLS 1.2 cipher suites
-//! and by the TLS 1.3 `secp256r1` named group.
+//! on the NIST P-256 curve. It is the curve component used by the
+//! `ecdhe_ecdsa`/`ecdhe_rsa` TLS 1.2 cipher suites and by the TLS 1.3
+//! `secp256r1` named group.
+//!
+//! Every operation on the secret scalar (public-key derivation [d]G and the
+//! shared secret [d]Q) runs on the constant-time arithmetic in `p256_ct.zig`.
+//! `std.crypto.ecc.P256.mul` is NOT used for secret scalars: `zig build
+//! ct-check` measured it leaking the scalar through branch timing under
+//! ReleaseFast (see `p256_ct.zig`). std is still used for public-point SEC1
+//! parsing, where every input is public.
 //!
 //! Conventions:
 //!   * Scalars (private keys) are 32-byte big-endian, in the range [1, n-1].
@@ -19,6 +26,7 @@
 
 const std = @import("std");
 const random_mod = @import("random.zig");
+const p256_ct = @import("p256_ct.zig");
 
 const P256 = std.crypto.ecc.P256;
 const scalar = P256.scalar;
@@ -70,8 +78,11 @@ fn osEntropy(buf: []u8) EcdhError!void {
 /// Returns `error.InvalidPrivateKey` if the scalar yields the identity element
 /// (which cannot happen for a canonical non-zero scalar, but is checked anyway).
 fn derivePublic(secret: [scalar_length]u8) EcdhError![public_length]u8 {
-    const point = P256.basePoint.mul(secret, .big) catch return error.InvalidPrivateKey;
-    return point.toUncompressedSec1();
+    // Constant-time [d]G (the scalar is secret).
+    var point = p256_ct.mulBaseCt(secret);
+    defer point.wipe();
+    const aff = point.affine() orelse return error.InvalidPrivateKey;
+    return [_]u8{sec1_uncompressed_prefix} ++ aff.x ++ aff.y;
 }
 
 /// Validate that `secret` is a canonical, non-zero P-256 scalar.
@@ -142,10 +153,16 @@ pub fn sharedSecret(
     peer_sec1: [public_length]u8,
 ) EcdhError![scalar_length]u8 {
     try validateScalar(my_secret);
-    const peer = try parsePoint(peer_sec1);
-    const product = peer.mul(my_secret, .big) catch return error.IdentityElement;
-    const affine = product.affineCoordinates();
-    return affine.x.toBytes(.big);
+    // Public-key validation (SEC 1 v2 sec. 3.2.2.1): prefix, on-curve, not the
+    // identity. The peer point is public, so std's parser is fine here.
+    _ = try parsePoint(peer_sec1);
+    // Lift into the constant-time representation. fromAffine re-checks the
+    // curve equation, so this cannot disagree with parsePoint (fail closed).
+    const peer = p256_ct.Point.fromAffine(peer_sec1[1..33].*, peer_sec1[33..65].*) orelse
+        return error.InvalidPublicKey;
+    // SEC 1 v2 sec. 3.3.1: z = x_P of [d]Q, rejecting the identity. Constant
+    // time in the secret scalar.
+    return p256_ct.ecdhX(peer, my_secret) orelse error.IdentityElement;
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +282,57 @@ test "shared secret is the 32-byte X coordinate of the product point" {
     // Assert: length is 32 and equals the X coordinate.
     try testing.expectEqual(@as(usize, scalar_length), secret.len);
     try testing.expectEqualSlices(u8, &expected_x, &secret);
+}
+
+test "constant-time derivation and shared secret match std P256.mul" {
+    // Interop: the constant-time path must agree bit-for-bit with std's
+    // (variable-time) reference over many scalars.
+    var prng = std.Random.DefaultPrng.init(0x65636468);
+    const rnd = prng.random();
+    for (0..24) |_| {
+        var sa: [32]u8 = undefined;
+        var sb: [32]u8 = undefined;
+        rnd.bytes(&sa);
+        rnd.bytes(&sb);
+        const a = try generateDeterministic(sa);
+        const b = try generateDeterministic(sb);
+        const want_pub = (try P256.basePoint.mul(a.secret, .big)).toUncompressedSec1();
+        try testing.expectEqualSlices(u8, &want_pub, &a.public_sec1);
+        const peer = try parsePoint(b.public_sec1);
+        const want = (try peer.mul(a.secret, .big)).affineCoordinates().x.toBytes(.big);
+        try testing.expectEqualSlices(u8, &want, &(try sharedSecret(a.secret, b.public_sec1)));
+    }
+}
+
+test "RFC 5903 sec. 8.1 ECDH P-256 known-answer test" {
+    // RFC 5903 sec. 8.1 (256-bit Random ECP Group) test vector.
+    const i_secret = hexArray(32, "C88F01F510D9AC3F70A292DAA2316DE544E9AAB8AFE84049C62A9C57862D1433");
+    const i_pub = hexArray(65, "04" ++
+        "DAD0B65394221CF9B051E1FECA5787D098DFE637FC90B9EF945D0C3772581180" ++
+        "5271A0461CDB8252D61F1C456FA3E59AB1F45B33ACCF5F58389E0577B8990BB3");
+    const r_secret = hexArray(32, "C6EF9C5D78AE012A011164ACB397CE2088685D8F06BF9BE0B283AB46476BEE53");
+    const r_pub = hexArray(65, "04" ++
+        "D12DFB5289C8D4F81208B70270398C342296970A0BCCB74C736FC7554494BF63" ++
+        "56FBF3CA366CC23E8157854C13C58D6AAC23F046ADA30F8353E74F33039872AB");
+    const shared_x = hexArray(32, "D6840F6B42F6EDAFD13116E0E12565202FEF8E9ECE7DCE03812464D04B9442DE");
+
+    const i = try generateFromSecretForTest(i_secret);
+    const r = try generateFromSecretForTest(r_secret);
+    try testing.expectEqualSlices(u8, &i_pub, &i.public_sec1);
+    try testing.expectEqualSlices(u8, &r_pub, &r.public_sec1);
+    try testing.expectEqualSlices(u8, &shared_x, &(try sharedSecret(i_secret, r_pub)));
+    try testing.expectEqualSlices(u8, &shared_x, &(try sharedSecret(r_secret, i_pub)));
+}
+
+fn hexArray(comptime n: usize, comptime s: []const u8) [n]u8 {
+    var out: [n]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
+    return out;
+}
+
+fn generateFromSecretForTest(secret: [scalar_length]u8) EcdhError!KeyPair {
+    try validateScalar(secret);
+    return .{ .secret = secret, .public_sec1 = try derivePublic(secret) };
 }
 
 test "sharedSecret rejects a zero scalar" {

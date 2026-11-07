@@ -4,10 +4,15 @@
 //! RFC 6979 Appendix A.2.5 verify-side known-answer tests for ECDSA over
 //! NIST P-256 with SHA-256.
 //!
-//! Why verify-side only: `ecdsa_p256.sign()` drives Zig std's deterministic
-//! (null-noise) nonce path, which is NOT RFC 6979's HMAC_DRBG nonce, so our
-//! signer does not reproduce RFC 6979's exact (r, s). What is still fully
-//! independent — and what these tests pin — is verification: RFC 6979's
+//! Why verify-side only: `ecdsa_p256.sign()` runs on the constant-time
+//! arithmetic in `p256_ct.zig`, but derives its nonce exactly like Zig std's
+//! null-noise signer: the RFC 6979 sec. 3.2 HMAC_DRBG shape with an extra
+//! 32-byte noise block (zeros) before the key. That is NOT RFC 6979's exact k,
+//! so the signer does not reproduce RFC 6979's (r, s) from the message alone.
+//! The signing equation itself is pinned in `ecdsa_p256.zig` by injecting the
+//! RFC's k ("RFC 6979 A.2.5 ... reproduced from the RFC's nonce k"), and its
+//! output is checked byte-for-byte against std's signer there. What is still
+//! fully independent — and what these tests pin — is verification: RFC 6979's
 //! published (public key, message, signature) triples MUST verify, and any
 //! corruption of the signature, message, or key MUST be rejected. The vectors
 //! come straight from the RFC and are independent of Onyx Server's implementation.

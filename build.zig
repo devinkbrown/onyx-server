@@ -1560,7 +1560,8 @@ pub fn build(b: *std.Build) void {
 
     // `zig build ct-check` — the opt-in, dudect-style constant-time verification
     // harness (roadmap 0.4). It measures execution-time independence from secret
-    // inputs for ECDSA-P256 sign and key derivation, X25519 scalar-mult, and the blinded RSA-2048
+    // inputs for ECDSA-P256 sign and key derivation, ECDH-P256 shared-secret
+    // derivation, X25519 scalar-mult, and the blinded RSA-2048
     // private op, reporting a Welch t-statistic per primitive.
     //
     // Deliberately a SEPARATE step, NOT part of `zig build test`: a timing

@@ -319,7 +319,7 @@ fn loadEc(der: []const u8) Error!LoadedKey {
     var scalar = try ec_pkcs.parseScalar(der);
     defer std.crypto.secureZero(u8, &scalar);
     const secret = ecdsa_p256.SecretKey.fromBytes(scalar) catch return error.UnsupportedAlgorithm;
-    const kp = ecdsa_p256.KeyPair.fromSecretKey(secret) catch return error.UnsupportedAlgorithm;
+    const kp = ecdsa_p256.keyPairFromSecretKey(secret) catch return error.UnsupportedAlgorithm;
     return .{ .key_kind = .ecdsa_p256, .ecdsa_p256_signing_key = kp };
 }
 
@@ -352,7 +352,7 @@ fn bootstrap(allocator: std.mem.Allocator, io: std.Io, dns_name: []const u8) Err
 }
 
 fn bootstrapWebTransport(allocator: std.mem.Allocator, io: std.Io, dns_name: []const u8) Error!Loaded {
-    const key_pair = ecdsa_p256.KeyPair.generate(io);
+    const key_pair = ecdsa_p256.generate(io);
     const now = std.Io.Clock.real.now(io).toSeconds();
     var der_buf: [2048]u8 = undefined;
     const der = try x509_selfsign.buildSelfSignedEcdsaP256(&der_buf, .{
@@ -390,7 +390,7 @@ pub const Tls12 = struct {
 /// Mint a fresh ECDSA-P256 keypair + self-signed leaf for the hardened TLS 1.2
 /// leg of the listener (`dns_name` as CN/SAN; self-anchoring CA).
 pub fn bootstrapTls12(allocator: std.mem.Allocator, io: std.Io, dns_name: []const u8) !Tls12 {
-    const key = ecdsa_p256.KeyPair.generate(io);
+    const key = ecdsa_p256.generate(io);
     const now = std.Io.Clock.real.now(io).toSeconds();
     var der_buf: [2048]u8 = undefined;
     const der = try x509_selfsign.buildSelfSignedEcdsaP256(&der_buf, .{
@@ -492,6 +492,27 @@ test "loadOrBootstrapWebTransport: pathless leaf is short-lived P-256 with DNS a
     }
     const link = try x509_verify.linkInfo(loaded.cert_chain[0]);
     try x509_verify.verifyCertSignature(link.tbs_der, link.signature_der, link.sig_alg_oid, link.sig_alg_params, link.spki_der);
+}
+
+test "loadEc: derives the key in constant time and fails closed on d >= n" {
+    // SEC1 ECPrivateKey: SEQUENCE { INTEGER 1, OCTET STRING d }.
+    const sec1 = struct {
+        fn der(d: [32]u8) [39]u8 {
+            return [_]u8{ 0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20 } ++ d;
+        }
+    };
+    // A valid scalar loads, and the public half matches std's derivation.
+    const d_ok: [32]u8 = @splat(0x11);
+    const ok = try loadEc(&sec1.der(d_ok));
+    const want = try ecdsa_p256.KeyPair.fromSecretKey(try ecdsa_p256.SecretKey.fromBytes(d_ok));
+    try testing.expectEqualSlices(u8, &want.public_key.toUncompressedSec1(), &ok.ecdsa_p256_signing_key.?.public_key.toUncompressedSec1());
+    // d = n + 1 is not a valid private key (SEC 1 v2 sec. 3.2.1: d in
+    // [1, n-1]). std's fromSecretKey accepted it ([n+1]G = G); the
+    // constant-time derivation rejects it.
+    var d_bad: [32]u8 = undefined;
+    std.mem.writeInt(u256, &d_bad, 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632552, .big);
+    try testing.expectError(error.UnsupportedAlgorithm, loadEc(&sec1.der(d_bad)));
+    try testing.expectError(error.UnsupportedAlgorithm, loadEc(&sec1.der(@splat(0))));
 }
 
 test "loadOrBootstrap: bootstrap keypairs differ across calls" {

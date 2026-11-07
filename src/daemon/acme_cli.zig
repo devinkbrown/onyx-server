@@ -214,7 +214,7 @@ pub fn runIssue(allocator: Allocator, io: std.Io, opts: Options) !bool {
     var account = try acme_runner.loadOrCreateAccountKey(io, std.Io.Dir.cwd(), account_path);
     defer account.wipe();
     dlog.log("acme: account key {s} ({s})\n", .{ account_path, if (account.created) "created; registering new account" else "loaded" });
-    var cert_key = ecdsa_p256.KeyPair.generate(io);
+    var cert_key = ecdsa_p256.generate(io);
     defer ecdsa_p256.wipeKeyPair(&cert_key);
 
     // --- Loopback HTTP-01 listener (nginx proxies the challenge path here) ---

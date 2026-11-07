@@ -7,8 +7,13 @@
 //! layer needs: deterministic ephemeral P-256 key generation for tests, ECDH
 //! shared-secret computation, and the TLS 1.2 PRF calls for master_secret and
 //! Finished verify_data. Record and handshake message wiring live elsewhere.
+//!
+//! Secret-scalar operations ([d]G and [d]Q) run on the constant-time P-256
+//! arithmetic in `crypto/p256_ct.zig`, never on `std.crypto.ecc.P256.mul`,
+//! which `zig build ct-check` measured leaking the scalar under ReleaseFast.
 const std = @import("std");
 const dtls_srtp = @import("dtls_srtp.zig");
+const p256_ct = @import("../crypto/p256_ct.zig");
 
 const P256 = std.crypto.ecc.P256;
 const scalar = P256.scalar;
@@ -37,8 +42,18 @@ fn validScalar(secret: [secret_length]u8) bool {
 }
 
 fn derivePublic(secret: [secret_length]u8) [public_length]u8 {
-    const point = P256.basePoint.mul(secret, .big) catch unreachable;
-    return point.toUncompressedSec1();
+    return publicFromSecret(secret) orelse unreachable;
+}
+
+/// Constant-time SEC1 public key `[secret]G` for a canonical non-zero
+/// scalar, or null when `secret` is not in [1, n-1] (fail closed). Used to
+/// re-validate a carried ECDHE secret against its public half.
+pub fn publicFromSecret(secret: [secret_length]u8) ?[public_length]u8 {
+    if (!validScalar(secret)) return null;
+    var point = p256_ct.mulBaseCt(secret);
+    defer point.wipe();
+    const aff = point.affine() orelse return null;
+    return [_]u8{sec1_uncompressed_prefix} ++ aff.x ++ aff.y;
 }
 
 fn parsePublicKey(public: [public_length]u8) Error!P256 {
@@ -77,10 +92,12 @@ pub fn computeSharedSecret(
     peer_public: [public_length]u8,
 ) Error![shared_secret_length]u8 {
     if (!validScalar(my_secret)) return error.Weak;
-    const peer = try parsePublicKey(peer_public);
-    const product = peer.mul(my_secret, .big) catch return error.IdentityElement;
-    product.rejectIdentity() catch return error.IdentityElement;
-    return product.affineCoordinates().x.toBytes(.big);
+    // The peer point is public: std's SEC1 parser validates it.
+    _ = try parsePublicKey(peer_public);
+    const peer = p256_ct.Point.fromAffine(peer_public[1..33].*, peer_public[33..65].*) orelse
+        return error.InvalidPublicKey;
+    // SEC 1 v2 sec. 3.3.1, constant time in the secret scalar.
+    return p256_ct.ecdhX(peer, my_secret) orelse error.IdentityElement;
 }
 
 /// TLS 1.2 master_secret derivation (RFC 5246 §8.1):
@@ -134,6 +151,25 @@ test "deterministic P-256 ECDH key agreement matches on both sides" {
     const bob_shared = try computeSharedSecret(bob.secret, alice.public);
 
     try testing.expectEqualSlices(u8, &alice_shared, &bob_shared);
+}
+
+test "constant-time ECDH matches std P256.mul and rejects non-canonical secrets" {
+    var prng = std.Random.DefaultPrng.init(0x64746c73);
+    const rnd = prng.random();
+    for (0..16) |_| {
+        var sa: [32]u8 = undefined;
+        var sb: [32]u8 = undefined;
+        rnd.bytes(&sa);
+        rnd.bytes(&sb);
+        const a = generateKeyPair(sa);
+        const b = generateKeyPair(sb);
+        try testing.expectEqualSlices(u8, &(try P256.basePoint.mul(a.secret, .big)).toUncompressedSec1(), &a.public);
+        const peer = try P256.fromSec1(&b.public);
+        const want = (try peer.mul(a.secret, .big)).affineCoordinates().x.toBytes(.big);
+        try testing.expectEqualSlices(u8, &want, &(try computeSharedSecret(a.secret, b.public)));
+    }
+    try testing.expect(publicFromSecret(@splat(0)) == null);
+    try testing.expect(publicFromSecret(@splat(0xff)) == null);
 }
 
 test "master secret is 48 bytes, deterministic, and input-sensitive" {

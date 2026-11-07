@@ -389,7 +389,7 @@ pub fn decodeOwned(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
             var raw: [32]u8 = undefined;
             @memcpy(&raw, encoded);
             defer std.crypto.secureZero(u8, &raw);
-            loaded.ecdsa_p256_signing_key = try ecdsa_p256.KeyPair.fromSecretKey(try ecdsa_p256.SecretKey.fromBytes(raw));
+            loaded.ecdsa_p256_signing_key = try ecdsa_p256.keyPairFromSecretKey(try ecdsa_p256.SecretKey.fromBytes(raw));
         },
         .rsa => {
             const fields = try readRsaFields(&reader);
@@ -425,7 +425,7 @@ pub fn decodeOwned(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
         var raw: [32]u8 = undefined;
         @memcpy(&raw, encoded);
         defer std.crypto.secureZero(u8, &raw);
-        const key = try ecdsa_p256.KeyPair.fromSecretKey(try ecdsa_p256.SecretKey.fromBytes(raw));
+        const key = try ecdsa_p256.keyPairFromSecretKey(try ecdsa_p256.SecretKey.fromBytes(raw));
         result.generated_tls12 = .{ .cert_chain = chain, .key = key };
         chain_owned = false;
         try proof.validateGeneratedTls12(.{ .cert_chain = chain, .signing_key = &result.generated_tls12.?.key });
@@ -561,7 +561,7 @@ test "HXTM carries exact Ed25519 and generated TLS 1.2 material with pending rel
     const allocator = std.testing.allocator;
     const x509_selfsign = @import("../../proto/x509_selfsign.zig");
     const ed = try Ed25519.KeyPair.generateDeterministic(@splat(0x42));
-    const ec = try ecdsa_p256.KeyPair.fromSecretKey(try ecdsa_p256.SecretKey.fromBytes(@splat(0x23)));
+    const ec = try ecdsa_p256.keyPairFromSecretKey(try ecdsa_p256.SecretKey.fromBytes(@splat(0x23)));
     var cert13_buf: [4096]u8 = undefined;
     var cert12_buf: [4096]u8 = undefined;
     const cert13 = try x509_selfsign.buildSelfSigned(&cert13_buf, .{ .common_name = "acme.test", .not_before = 1_700_000_000, .not_after = 1_900_000_000, .serial = &.{1}, .key_pair = ed });
@@ -576,7 +576,7 @@ test "HXTM carries exact Ed25519 and generated TLS 1.2 material with pending rel
         .reload_pending = true,
         .reload_retry_after_ms = 123_456_789,
     };
-    const wrong_ec = try ecdsa_p256.KeyPair.fromSecretKey(try ecdsa_p256.SecretKey.fromBytes(@splat(0x24)));
+    const wrong_ec = try ecdsa_p256.keyPairFromSecretKey(try ecdsa_p256.SecretKey.fromBytes(@splat(0x24)));
     var wrong_leg = source;
     wrong_leg.tls12_serving = .{ .cert_chain = &chain12, .ecdsa_p256_signing_key = &wrong_ec };
     try std.testing.expectError(error.TlsKeyMismatch, encodeSnapshot(allocator, wrong_leg));
@@ -622,8 +622,8 @@ test "HXTM second handoff carries a renewed generation instead of the first" {
     const x509_selfsign = @import("../../proto/x509_selfsign.zig");
     const ed_a = try Ed25519.KeyPair.generateDeterministic(@splat(0x51));
     const ed_b = try Ed25519.KeyPair.generateDeterministic(@splat(0x52));
-    const ec_a = try ecdsa_p256.KeyPair.fromSecretKey(try ecdsa_p256.SecretKey.fromBytes(@splat(0x31)));
-    const ec_b = try ecdsa_p256.KeyPair.fromSecretKey(try ecdsa_p256.SecretKey.fromBytes(@splat(0x32)));
+    const ec_a = try ecdsa_p256.keyPairFromSecretKey(try ecdsa_p256.SecretKey.fromBytes(@splat(0x31)));
+    const ec_b = try ecdsa_p256.keyPairFromSecretKey(try ecdsa_p256.SecretKey.fromBytes(@splat(0x32)));
     var cert13_a_buf: [4096]u8 = undefined;
     var cert13_b_buf: [4096]u8 = undefined;
     var cert12_a_buf: [4096]u8 = undefined;
@@ -667,7 +667,7 @@ test "HXTM second handoff carries a renewed generation instead of the first" {
 test "HXTM shared TLS 1.2 leg follows the default P256 generation" {
     const allocator = std.testing.allocator;
     const x509_selfsign = @import("../../proto/x509_selfsign.zig");
-    const ec = try ecdsa_p256.KeyPair.fromSecretKey(try ecdsa_p256.SecretKey.fromBytes(@splat(0x34)));
+    const ec = try ecdsa_p256.keyPairFromSecretKey(try ecdsa_p256.SecretKey.fromBytes(@splat(0x34)));
     var cert_buf: [4096]u8 = undefined;
     const cert = try x509_selfsign.buildSelfSignedEcdsaP256(&cert_buf, .{ .common_name = "shared.test", .not_before = 1_700_000_000, .not_after = 1_900_000_000, .serial = &.{5}, .key_pair = ec });
     const chain = [_][]const u8{cert};

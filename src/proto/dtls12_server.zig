@@ -244,11 +244,9 @@ pub const Terminator = struct {
             for (self.flight4[self.flight4_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
             for (self.flight6[self.flight6_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
             try self.transcript.validate();
-            const P256 = std.crypto.ecc.P256;
-            P256.scalar.rejectNonCanonical(self.ecdhe_secret, .big) catch return error.InvalidSnapshot;
-            const public = P256.basePoint.mul(self.ecdhe_secret, .big) catch return error.InvalidSnapshot;
-            public.rejectIdentity() catch return error.InvalidSnapshot;
-            if (!std.crypto.timing_safe.eql([65]u8, public.toUncompressedSec1(), self.ecdhe_public)) return error.InvalidSnapshot;
+            // Constant-time [d]G: the carried ECDHE scalar is secret.
+            const public = kx.publicFromSecret(self.ecdhe_secret) orelse return error.InvalidSnapshot;
+            if (!std.crypto.timing_safe.eql([65]u8, public, self.ecdhe_public)) return error.InvalidSnapshot;
             if (self.have_keys != self.got_cke or self.have_keys != (self.key_block != null) or self.have_client_pubkey != (self.client_public != null)) return error.InvalidSnapshot;
             if (self.client_public) |point| _ = try ecdsa_p256.parsePublicKeySec1(&point);
             if (self.client_cert_verified and (!self.have_client_pubkey or !self.got_client_cv)) return error.InvalidSnapshot;
@@ -365,7 +363,7 @@ pub const Terminator = struct {
 
     pub fn prepareRestore(allocator: std.mem.Allocator, snapshot: *const Snapshot, policy: peer_verify.EnginePolicy) !Restoration {
         try snapshot.validate(policy);
-        var key = try ecdsa_p256.KeyPair.fromSecretKey(try ecdsa_p256.SecretKey.fromBytes(snapshot.identity.secret_key));
+        var key = try ecdsa_p256.keyPairFromSecretKey(try ecdsa_p256.SecretKey.fromBytes(snapshot.identity.secret_key));
         defer std.crypto.secureZero(u8, std.mem.asBytes(&key));
         var random = try snapshot.identity.random.restore();
         defer std.crypto.secureZero(u8, std.mem.asBytes(&random));
@@ -394,7 +392,7 @@ pub const Terminator = struct {
         var key_seed: [ecdsa_p256.KeyPair.seed_length]u8 = undefined;
         defer std.crypto.secureZero(u8, &key_seed);
         rng.bytes(&key_seed);
-        self.cert_key = ecdsa_p256.KeyPair.generateDeterministic(key_seed) catch
+        self.cert_key = ecdsa_p256.generateDeterministic(key_seed) catch
             return error.CertBuildFailed;
 
         var serial: [8]u8 = undefined;
@@ -1620,7 +1618,7 @@ test "RFC 8122: a mismatched peer fingerprint stays fail-closed (no keys, no pro
 /// must outlive the handshake.
 fn makeClientAuth(seed_byte: u8, cert_buf: []u8) !ClientAuth {
     const key_seed: [ecdsa_p256.KeyPair.seed_length]u8 = @splat(seed_byte);
-    const kp = try ecdsa_p256.KeyPair.generateDeterministic(key_seed);
+    const kp = try ecdsa_p256.generateDeterministic(key_seed);
     const serial = [_]u8{ 0x0a, 0x0b, 0x0c, 0x0d, 0x01, 0x02, 0x03, 0x04 };
     const der = try x509_selfsign.buildSelfSignedEcdsaP256(cert_buf, .{
         .common_name = "webrtc-client",
