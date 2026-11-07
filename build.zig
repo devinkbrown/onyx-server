@@ -1714,13 +1714,15 @@ pub fn build(b: *std.Build) void {
     //   * `zig build fuzz --fuzz`  — drive the SAME targets coverage-guided via
     //                                Zig's builtin fuzzer (runs until stopped).
     //
-    // Toolchain status (Zig 0.17.0-dev, re-verified 2026-07-07): the bounded
-    // `zig build fuzz` mode compiles and passes. Coverage-guided `--fuzz` now
-    // BUILDS, LINKS, and starts fuzzing (the Zig 0.16 test_runner StackTrace build
-    // error is gone), but the compiler's own fuzzer runtime then crashes
-    // deterministically (`panic: start index 1 is larger than end index 0`, a
-    // slice-bounds bug in lib/zig/fuzzer.zig — reproducible with a trivial
-    // zero-onyx target). See the TOOLCHAIN NOTE in src/crypto/tls_fuzz.zig.
+    // Toolchain status (Zig 0.17.0, re-verified 2026-11-07): both modes work.
+    // Coverage-guided `--fuzz` needs SanitizerCoverage PCs, which only the LLVM
+    // backend emits. The default Debug backend on x86_64 Linux is the
+    // self-hosted one, whose artifact makes the fuzz runner fail with
+    // `corrupted coverage file ...: pcs_len was zero`; the fuzz artifact is
+    // therefore forced onto LLVM below (Windows keeps its self-hosted handling).
+    // The older `start index 1 is larger than end index 0` fuzzer-runtime panic
+    // seen on 0.17.0-dev.1282 does not reproduce on 0.17.0. See the TOOLCHAIN
+    // NOTE in src/crypto/tls_fuzz.zig.
     //
     // Kept SEPARATE from `zig build test` (which still runs these targets, but
     // only in bounded corpus-replay mode) so the fuzz filter never perturbs the
@@ -1731,6 +1733,8 @@ pub fn build(b: *std.Build) void {
         .root_module = test_mod,
         .filters = &.{"cov-fuzz:"},
     });
+    // LLVM backend: the self-hosted backend emits no coverage PCs for --fuzz.
+    if (os_tag != .windows) fuzz_tests.use_llvm = true;
     const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
     if (os_tag == .windows) {
         fuzz_tests.stack_size = 64 * 1024 * 1024;
