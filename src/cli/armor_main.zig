@@ -28,10 +28,13 @@ fn topUsage(w: *Writer) Writer.Error!void {
         \\  rand        cryptographically-random bytes (raw/-hex/-base64)
         \\  ciphers     list supported TLS suites, groups, signature schemes
         \\  asn1parse   dump a DER structure
-        \\  ocsp        display/verify a stapled OCSP response (no HTTP fetch)
+        \\  ocsp        display/verify an OCSP response, or -fetch one online
         \\  crl         display/verify an X.509 CRL (no HTTP fetch)
-        \\  s_client    TLS client (loopback handshake; live -connect is follow-up)
-        \\  s_server / enc   not yet implemented (exit 3)
+        \\  s_client    TLS 1.3 client: -connect host:port, prints session, relays stdin
+        \\  s_server    TLS 1.3 echo server: -accept port -cert -key
+        \\  enc         AEAD file encryption (Argon2id passphrase file; never argv)
+        \\  ech-gen     generate an ECH key + ECHConfigList for [[tls.ech_keys]]
+        \\  dc          mint / inspect / validate RFC 9345 delegated credentials
         \\
         \\exit codes: 0 ok, 1 failed, 2 usage, 3 not implemented
         \\
@@ -95,6 +98,22 @@ fn dispatch(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8, args: []const [
         if (wantsHelp(args)) return cli.s_client_cmd.usage(out);
         return cli.s_client_cmd.run(gpa, io, try cli.s_client_cmd.parseArgs(args), out);
     }
+    if (std.mem.eql(u8, cmd, "s_server")) {
+        if (wantsHelp(args)) return cli.s_server_cmd.usage(out);
+        return cli.s_server_cmd.run(gpa, io, try cli.s_server_cmd.parseArgs(args), out);
+    }
+    if (std.mem.eql(u8, cmd, "enc")) {
+        if (wantsHelp(args)) return cli.enc_cmd.usage(out);
+        return cli.enc_cmd.run(gpa, io, try cli.enc_cmd.parseArgs(args), out);
+    }
+    if (std.mem.eql(u8, cmd, "ech-gen")) {
+        if (wantsHelp(args)) return cli.ech_gen_cmd.usage(out);
+        return cli.ech_gen_cmd.run(gpa, io, try cli.ech_gen_cmd.parseArgs(args), out);
+    }
+    if (std.mem.eql(u8, cmd, "dc")) {
+        if (wantsHelp(args)) return cli.dc_cmd.usage(out);
+        return cli.dc_cmd.run(gpa, io, try cli.dc_cmd.parseArgs(args), out);
+    }
     if (cli.stub_cmds.isStub(cmd)) return cli.stub_cmds.run(cmd, out);
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         return topUsage(out);
@@ -121,28 +140,49 @@ pub fn main(init: std.process.Init) !void {
     };
     while (args_it.next()) |a| try rest.append(gpa, a);
 
+    // Interactive verbs (live sockets) stream to stdout as data arrives; the
+    // rest buffer so a failure never leaves half a PEM on stdout before exit.
+    if (isStreaming(cmd)) {
+        var sbuf: [4096]u8 = undefined;
+        var fw = std.Io.File.stdout().writerStreaming(io, &sbuf);
+        dispatch(gpa, io, cmd, rest.items, &fw.interface) catch |err| {
+            fw.interface.flush() catch {};
+            fail(gpa, io, cmd, err);
+        };
+        try fw.interface.flush();
+        return;
+    }
+
     var aw = Writer.Allocating.init(gpa);
     defer aw.deinit();
 
     dispatch(gpa, io, cmd, rest.items, &aw.writer) catch |err| {
         // Flush whatever the subcommand produced (stub notices, partial help).
         std.Io.File.stdout().writeStreamingAll(io, aw.written()) catch {};
-        switch (err) {
-            error.Usage => {
-                var uw = Writer.Allocating.init(gpa);
-                defer uw.deinit();
-                usageFor(cmd, &uw.writer) catch {};
-                std.Io.File.stderr().writeStreamingAll(io, uw.written()) catch {};
-                std.process.exit(2);
-            },
-            error.NotImplemented => std.process.exit(3),
-            else => {
-                std.debug.print("armor {s}: {s}\n", .{ cmd, @errorName(err) });
-                std.process.exit(1);
-            },
-        }
+        fail(gpa, io, cmd, err);
     };
     try std.Io.File.stdout().writeStreamingAll(io, aw.written());
+}
+
+fn isStreaming(cmd: []const u8) bool {
+    return std.mem.eql(u8, cmd, "s_client") or std.mem.eql(u8, cmd, "s_server");
+}
+
+fn fail(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8, err: anyerror) noreturn {
+    switch (err) {
+        error.Usage => {
+            var uw = Writer.Allocating.init(gpa);
+            defer uw.deinit();
+            usageFor(cmd, &uw.writer) catch {};
+            std.Io.File.stderr().writeStreamingAll(io, uw.written()) catch {};
+            std.process.exit(2);
+        },
+        error.NotImplemented => std.process.exit(3),
+        else => {
+            std.debug.print("armor {s}: {s}\n", .{ cmd, @errorName(err) });
+            std.process.exit(1);
+        },
+    }
 }
 
 fn usageFor(cmd: []const u8, w: *Writer) Writer.Error!void {
@@ -158,6 +198,10 @@ fn usageFor(cmd: []const u8, w: *Writer) Writer.Error!void {
     if (std.mem.eql(u8, cmd, "ocsp")) return cli.ocsp_cmd.usage(w);
     if (std.mem.eql(u8, cmd, "crl")) return cli.crl_cmd.usage(w);
     if (std.mem.eql(u8, cmd, "s_client")) return cli.s_client_cmd.usage(w);
+    if (std.mem.eql(u8, cmd, "s_server")) return cli.s_server_cmd.usage(w);
+    if (std.mem.eql(u8, cmd, "enc")) return cli.enc_cmd.usage(w);
+    if (std.mem.eql(u8, cmd, "ech-gen")) return cli.ech_gen_cmd.usage(w);
+    if (std.mem.eql(u8, cmd, "dc")) return cli.dc_cmd.usage(w);
     return topUsage(w);
 }
 
@@ -167,14 +211,20 @@ test {
 
 const testing = std.testing;
 
-test "GAP-K6 armor enc and s_server stay unimplemented" {
+test "armor enc, s_server, ech-gen and dc are implemented and validate their arguments" {
     var aw = Writer.Allocating.init(testing.allocator);
     defer aw.deinit();
-    try testing.expectError(error.NotImplemented, dispatch(testing.allocator, std.testing.io, "enc", &.{}, &aw.writer));
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "openssl-enc-compatible format") != null);
-    aw.clearRetainingCapacity();
-    try testing.expectError(error.NotImplemented, dispatch(testing.allocator, std.testing.io, "s_server", &.{}, &aw.writer));
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "not yet implemented") != null);
+    // Missing required inputs are usage errors (exit 2), never "not implemented".
+    for ([_][]const u8{ "enc", "s_server", "ech-gen", "dc" }) |cmd| {
+        try testing.expectError(error.Usage, dispatch(testing.allocator, std.testing.io, cmd, &.{}, &aw.writer));
+        aw.clearRetainingCapacity();
+        try dispatch(testing.allocator, std.testing.io, cmd, &.{"--help"}, &aw.writer);
+        try testing.expect(std.mem.indexOf(u8, aw.written(), "usage: armor ") != null);
+        aw.clearRetainingCapacity();
+    }
+    // A passphrase on argv is refused outright.
+    try testing.expectError(error.Usage, dispatch(testing.allocator, std.testing.io, "enc", &.{ "-pass", "pass:hunter2" }, &aw.writer));
+    try testing.expect(isStreaming("s_client") and isStreaming("s_server") and !isStreaming("enc"));
 }
 
 test "armor dispatch routes ciphers and rejects unknown commands" {
@@ -186,8 +236,8 @@ test "armor dispatch routes ciphers and rejects unknown commands" {
     aw.clearRetainingCapacity();
     try testing.expectError(error.Usage, dispatch(testing.allocator, std.testing.io, "nonsense", &.{}, &aw.writer));
     try testing.expectError(error.Usage, dispatch(testing.allocator, std.testing.io, "s_client", &.{}, &aw.writer));
-    try testing.expectError(error.NotImplemented, dispatch(testing.allocator, std.testing.io, "enc", &.{}, &aw.writer));
-    try testing.expectError(error.NotImplemented, dispatch(testing.allocator, std.testing.io, "s_server", &.{}, &aw.writer));
+    try testing.expectError(error.Usage, dispatch(testing.allocator, std.testing.io, "enc", &.{}, &aw.writer));
+    try testing.expectError(error.Usage, dispatch(testing.allocator, std.testing.io, "s_server", &.{}, &aw.writer));
 
     aw.clearRetainingCapacity();
     try dispatch(testing.allocator, std.testing.io, "ocsp", &.{"--help"}, &aw.writer);
