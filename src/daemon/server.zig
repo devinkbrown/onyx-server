@@ -24441,24 +24441,16 @@ pub const LinuxServer = struct {
         if (conn.s2s != null or conn.s2s_secured != null) return false;
         const nick = conn.session.displayName();
         if (std.mem.eql(u8, nick, "*")) return false;
-        // Reservation and nick delay are decided by registerConnNick after
-        // 001 too; answer them here first so the client can pick another
-        // nick on the same transport (a reconnecting web client re-offering
-        // its just-released nick hit the delay hold and was closed).
-        var numeric: Numeric = .ERR_NICKNAMEINUSE;
-        var reason: []const u8 = "Nickname is already in use";
-        if (self.nickReservationBlocks(conn, nick)) |entry| {
-            numeric = .ERR_ERRONEUSNICKNAME;
-            reason = serverAccessReason(entry, "Nickname is reserved");
-        } else if (self.nickDelayBlocks(conn, nick)) {
-            numeric = .ERR_UNAVAILRESOURCE;
-            reason = "Nick is held (nick delay); try again shortly";
-        } else {
-            const holder = self.world.findNick(nick) orelse return false;
-            if (holder.eql(worldIdFromClient(id))) return false;
-            if (conn.session.account()) |acct| {
-                if (self.nickHeldBySameAccount(nick, acct, worldIdFromClient(id))) return false;
-            }
+        // Reservation and nick delay depend on the visible host and the
+        // connection class, which are only settled in completeLiveRegistration;
+        // registerConnNick answers them there and renames to a fallback nick
+        // instead of closing (renameRegistrationNick).
+        const numeric: Numeric = .ERR_NICKNAMEINUSE;
+        const reason: []const u8 = "Nickname is already in use";
+        const holder = self.world.findNick(nick) orelse return false;
+        if (holder.eql(worldIdFromClient(id))) return false;
+        if (conn.session.account()) |acct| {
+            if (self.nickHeldBySameAccount(nick, acct, worldIdFromClient(id))) return false;
         }
         conn.session.registration.registered = false;
         conn.session.registration.nick_seen = false;
@@ -24481,8 +24473,6 @@ pub const LinuxServer = struct {
     fn registrationNickBlock(self: *LinuxServer, conn: *ConnState, nick: []const u8) ?RegistrationNickBlock {
         if (self.registeredNickRequiresAuthentication(conn, nick))
             return .{ .numeric = .ERR_ERRONEUSNICKNAME, .reason = "Nickname is registered; authenticate as this account before using it" };
-        if (self.saccess.matchNick(nick)) |entry|
-            return .{ .numeric = .ERR_ERRONEUSNICKNAME, .reason = serverAccessReason(entry, "Nickname blocked by SACCESS") };
         if (self.nickReservationBlocks(conn, nick)) |entry|
             return .{ .numeric = .ERR_ERRONEUSNICKNAME, .reason = serverAccessReason(entry, "Nickname is reserved") };
         if (self.nickDelayBlocks(conn, nick))
@@ -24500,14 +24490,17 @@ pub const LinuxServer = struct {
     fn renameRegistrationNick(self: *LinuxServer, conn: *ConnState, block: RegistrationNickBlock) !bool {
         const old = conn.session.displayName();
         try queueNumeric(conn, block.numeric, &.{old}, block.reason);
-        const limit = @max(@as(usize, 6), @min(@as(usize, self.config.nicklen), 64));
-        const stem_len = @min(old.len, limit - 5);
+        const limit = @min(@as(usize, self.config.nicklen), 64);
+        if (limit < 6) return false;
+        const stem = utf8PrefixWithin(old, limit - 5);
         var candidate_buf: [64]u8 = undefined;
         var attempt: u32 = 0;
         while (attempt < 32) : (attempt += 1) {
             self.registration_nick_fallback_seq +%= 1;
             const tag: u16 = @truncate((@as(u64, @bitCast(self.nowMs())) *% 0x9E3779B97F4A7C15) >> 48 ^ self.registration_nick_fallback_seq);
-            const candidate = std.fmt.bufPrint(&candidate_buf, "{s}-{x:0>4}", .{ old[0..stem_len], tag }) catch return false;
+            const candidate = std.fmt.bufPrint(&candidate_buf, "{s}-{x:0>4}", .{ stem, tag }) catch return false;
+            if (!isValidNick(candidate)) return false;
+            if (self.saccess.matchNick(candidate) != null) continue;
             if (self.world.findNick(candidate) != null) continue;
             if (self.registrationNickBlock(conn, candidate) != null) continue;
             var prefix_buf: ClientPrefixBuffer = undefined;
@@ -24523,6 +24516,13 @@ pub const LinuxServer = struct {
 
     fn registerConnNick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
         if (std.mem.eql(u8, conn.session.displayName(), "*")) return;
+        // A SACCESS nick deny is a policy refusal, not a clash: keep closing
+        // (a renamed `<stem>-xxxx` would keep the denied stem visible).
+        if (self.saccess.matchNick(conn.session.displayName())) |entry| {
+            try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{conn.session.displayName()}, serverAccessReason(entry, "Nickname blocked by SACCESS"));
+            conn.closing = true;
+            return;
+        }
         if (self.registrationNickBlock(conn, conn.session.displayName())) |block| {
             if (!try self.renameRegistrationNick(conn, block)) {
                 conn.close_reason = "Registration nickname unavailable";
@@ -126851,7 +126851,7 @@ test "registration: a nick refused after the welcome is renamed to a free fallba
     try std.testing.expect(std.mem.indexOf(u8, out1, " 433 taken ") != null);
 }
 
-test "threaded server: a nick under nick delay answers 437 before 001 and keeps the connection for a retry" {
+test "threaded server: a nick under nick delay answers 437 and renames to a fallback, keeping the connection" {
     var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0, .nick_delay_ms = 60_000 }) catch |err| switch (err) {
         error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
         else => return err,
@@ -126886,11 +126886,13 @@ test "threaded server: a nick under nick delay answers 437 before 001 and keeps 
             if (std.mem.indexOf(u8, again.written(), " 433 ") != null) continue;
             return error.TestUnexpectedResult;
         };
-        try std.testing.expect(std.mem.indexOf(u8, again.written(), " 001 ") == null);
+        // Nick delay depends on the class, settled at registration: the client
+        // is welcomed, told why, and moved to a fallback nick on the same socket.
+        try recvUntil(&again, " NICK ", 200);
+        try std.testing.expect(std.mem.indexOf(u8, again.written(), ":guest-") != null or std.mem.indexOf(u8, again.written(), " guest-") != null);
         again.reset();
-        try writeAllFd(fd, "NICK guest3\r\nPING :delay-retry-alive\r\n");
+        try writeAllFd(fd, "PING :delay-retry-alive\r\n");
         try recvUntil(&again, " :delay-retry-alive\r\n", 200);
-        try std.testing.expectEqual(@as(usize, 1), countOccurrences(again.written(), " 001 guest3 "));
         return;
     }
     return error.TestUnexpectedResult;
