@@ -708,6 +708,80 @@ pub const Server = struct {
         return opened.plaintext;
     }
 
+    /// Cipher identity for Linux kTLS offload. Deliberately the same type as the
+    /// TLS 1.3 engine's (`tls_server.Server.KtlsCipher`) so the daemon maps both
+    /// engines to kernel `TLS_CIPHER_*` code points with one switch; crypto never
+    /// depends on the daemon's `ktls` module.
+    pub const KtlsCipher = tls_server.Server.KtlsCipher;
+
+    /// One direction's TLS 1.2 AEAD material for `setsockopt(TLS_TX|TLS_RX)`
+    /// with `version = TLS_1_2_VERSION`:
+    ///   * `key` — the directional write key (`keyLen()` bytes). Aliases the live
+    ///     key material; exposed ONLY for the kernel-offload path.
+    ///   * `fixed_iv` — the key-block IV: the 4-byte implicit GCM salt
+    ///     (RFC 5288 §3, `GCMNonce.salt`) or the full 12-byte ChaCha20-Poly1305
+    ///     IV (RFC 7905 §2). Aliases live key material.
+    ///   * `seq` — the next record sequence number of this direction. For AES-GCM
+    ///     this engine's explicit nonce is ALWAYS `seq` (see
+    ///     `tls12.gcmExplicitNonce`), so the daemon must install the kernel `iv`
+    ///     field = `seq` big-endian as well as `rec_seq` = `seq`; the kernel then
+    ///     increments both together and every post-handoff nonce
+    ///     `salt ‖ seq` is distinct from every pre-handoff one.
+    pub const KtlsParams = struct {
+        cipher: KtlsCipher,
+        key: []const u8,
+        fixed_iv: []const u8,
+        seq: u64,
+    };
+
+    fn ktlsCipher(suite: tls12.CipherSuite) KtlsCipher {
+        return switch (suite.aead()) {
+            .aes_128_gcm => .aes_128_gcm,
+            .aes_256_gcm => .aes_256_gcm,
+            .chacha20_poly1305 => .chacha20_poly1305,
+        };
+    }
+
+    fn ktlsBase(self: *const Server) ?tls12.CipherSuite {
+        if (self.read_failed or self.alert_taken or self.app_write_active != null) return null;
+        if (self.state != .connected) return null;
+        return self.selected_suite;
+    }
+
+    /// TX (server→client) offload parameters for a connected TLS 1.2 AEAD
+    /// session, or null when the kernel cannot take over the direction exactly:
+    /// before the handshake completes, after a failure/alert, with a staged
+    /// `PreparedAppWrite`, when the client's RFC 8449 record_size_limit is below
+    /// 2^14 (the kernel always fills records to 2^14 plaintext), or when the
+    /// sequence space is exhausted (RFC 5246 §6.1: sequence numbers never wrap).
+    pub fn ktlsTxParams(self: *const Server) ?KtlsParams {
+        const suite = self.ktlsBase() orelse return null;
+        if (tls_record.recordContentLimit12(self.peer_record_size_limit) != tls_record.max_plaintext_len) return null;
+        _ = tls12.reserveAppSeq(self.app_write_seq) catch return null;
+        return .{
+            .cipher = ktlsCipher(suite),
+            .key = self.keys.server_write.key[0..suite.keyLen()],
+            .fixed_iv = self.keys.server_write.iv[0..suite.fixedIvLen()],
+            .seq = self.app_write_seq,
+        };
+    }
+
+    /// RX (client→server) offload parameters, or null under the same lifecycle
+    /// conditions as `ktlsTxParams`, and additionally when this server advertised
+    /// a receive record_size_limit below 2^14 (the kernel only enforces the
+    /// protocol maximum, so a lower negotiated bound must stay in userspace).
+    pub fn ktlsRxParams(self: *const Server) ?KtlsParams {
+        const suite = self.ktlsBase() orelse return null;
+        if (self.client_offered_record_size_limit and self.receive_record_size_limit != tls_record.record_size_limit_max12) return null;
+        _ = tls12.reserveAppSeq(self.app_read_seq) catch return null;
+        return .{
+            .cipher = ktlsCipher(suite),
+            .key = self.keys.client_write.key[0..suite.keyLen()],
+            .fixed_iv = self.keys.client_write.iv[0..suite.fixedIvLen()],
+            .seq = self.app_read_seq,
+        };
+    }
+
     /// Everything a successor process needs to keep driving an ESTABLISHED
     /// hardened TLS 1.2 connection: the negotiated suite, the derived directional
     /// AEAD key material, and the live record sequence numbers. There is no
@@ -1758,6 +1832,157 @@ test "GAP-K13 an application record after the last sequence fails closed" {
     try std.testing.expectEqual(last, server.app_read_seq);
 
     std.debug.print("GAP-K13 branch=an application record after the last sequence fails closed\n", .{});
+}
+
+test "TLS 1.2 kTLS params expose live directional AEAD material and fail closed" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    inline for (.{ LoopbackSuite.aes128, LoopbackSuite.aes256, LoopbackSuite.chacha }) |kind| {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        var client = try tls12_client.Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors, .now_unix_seconds = 1_735_689_600 });
+        defer client.deinit();
+        switch (kind) {
+            .aes128 => client.offerOnlyAes128ForTest(),
+            .aes256 => client.offerOnlyAes256ForTest(),
+            .chacha => client.offerOnlyChaChaForTest(),
+        }
+        try std.testing.expect(server.ktlsTxParams() == null);
+        try std.testing.expect(server.ktlsRxParams() == null);
+        const ch = try client.start();
+        defer allocator.free(ch);
+        const sf = switch (try server.feed(ch)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(sf);
+        try std.testing.expect(server.ktlsTxParams() == null); // mid-handshake
+        const cf = switch (try client.feed(sf)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(cf);
+        const sfin = switch (try server.feed(cf)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.BadHandshake,
+        };
+        defer allocator.free(sfin);
+        _ = try client.feed(sfin);
+
+        const suite = server.selected_suite.?;
+        const tx = server.ktlsTxParams() orelse return error.TestUnexpectedResult;
+        const rx = server.ktlsRxParams() orelse return error.TestUnexpectedResult;
+        const want: Server.KtlsCipher = switch (kind) {
+            .aes128 => .aes_128_gcm,
+            .aes256 => .aes_256_gcm,
+            .chacha => .chacha20_poly1305,
+        };
+        try std.testing.expectEqual(want, tx.cipher);
+        try std.testing.expectEqual(want, rx.cipher);
+        // TX = server_write, RX = client_write, the exact key-block slices.
+        try std.testing.expectEqualSlices(u8, server.keys.server_write.key[0..suite.keyLen()], tx.key);
+        try std.testing.expectEqualSlices(u8, server.keys.server_write.iv[0..suite.fixedIvLen()], tx.fixed_iv);
+        try std.testing.expectEqualSlices(u8, server.keys.client_write.key[0..suite.keyLen()], rx.key);
+        try std.testing.expectEqualSlices(u8, server.keys.client_write.iv[0..suite.fixedIvLen()], rx.fixed_iv);
+        try std.testing.expectEqual(@as(usize, if (kind == .chacha) 12 else 4), tx.fixed_iv.len);
+        // The client derived the same material for the opposite roles.
+        try std.testing.expectEqualSlices(u8, client.keys.server_write.key[0..suite.keyLen()], tx.key);
+        try std.testing.expectEqualSlices(u8, client.keys.client_write.iv[0..suite.fixedIvLen()], rx.fixed_iv);
+        // Finished consumed seq 0 in each direction; application data begins at 1.
+        try std.testing.expectEqual(@as(u64, 1), tx.seq);
+        try std.testing.expectEqual(@as(u64, 1), rx.seq);
+
+        const app = try server.encrypt("x");
+        allocator.free(app);
+        try std.testing.expectEqual(@as(u64, 2), server.ktlsTxParams().?.seq);
+        try std.testing.expectEqual(@as(u64, 1), server.ktlsRxParams().?.seq);
+
+        // A staged userspace write owns the TX boundary: no offload either way.
+        var prepared = try server.prepareAppWrite(&.{"staged"});
+        try std.testing.expect(server.ktlsTxParams() == null);
+        try std.testing.expect(server.ktlsRxParams() == null);
+        prepared.abort();
+        try std.testing.expect(server.ktlsTxParams() != null);
+
+        // RFC 8449: a client record_size_limit below 2^14 keeps TX in userspace
+        // (the kernel always fills to 2^14) but does not affect RX.
+        server.peer_record_size_limit = 4096;
+        try std.testing.expect(server.ktlsTxParams() == null);
+        try std.testing.expect(server.ktlsRxParams() != null);
+        server.peer_record_size_limit = tls_record.max_plaintext_len;
+        // A negotiated receive limit below 2^14 keeps RX in userspace.
+        server.client_offered_record_size_limit = true;
+        server.receive_record_size_limit = 1024;
+        try std.testing.expect(server.ktlsRxParams() == null);
+        try std.testing.expect(server.ktlsTxParams() != null);
+        server.receive_record_size_limit = tls_record.record_size_limit_max12;
+        try std.testing.expect(server.ktlsRxParams() != null);
+        server.client_offered_record_size_limit = false;
+
+        // RFC 5246 §6.1: sequence numbers never wrap; an exhausted direction is refused.
+        const saved_w = server.app_write_seq;
+        server.app_write_seq = std.math.maxInt(u64);
+        try std.testing.expect(server.ktlsTxParams() == null);
+        server.app_write_seq = saved_w;
+        const saved_r = server.app_read_seq;
+        server.app_read_seq = std.math.maxInt(u64);
+        try std.testing.expect(server.ktlsRxParams() == null);
+        server.app_read_seq = saved_r;
+
+        // A failed session never hands keys to the kernel.
+        server.read_failed = true;
+        try std.testing.expect(server.ktlsTxParams() == null);
+        try std.testing.expect(server.ktlsRxParams() == null);
+    }
+}
+
+test "TLS 1.2 kTLS params survive a Helix resume with identical material" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors, .now_unix_seconds = 1_735_689_600 });
+    defer client.deinit();
+    const ch = try client.start();
+    defer allocator.free(ch);
+    const sf = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sf);
+    const cf = switch (try client.feed(sf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(cf);
+    const sfin = switch (try server.feed(cf)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.BadHandshake,
+    };
+    defer allocator.free(sfin);
+    _ = try client.feed(sfin);
+
+    var st = try server.exportResume();
+    defer st.keys.wipe();
+    var resumed = try Server.resumeConnected(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key }, st);
+    defer resumed.deinit();
+    const a = server.ktlsTxParams().?;
+    const b = resumed.ktlsTxParams().?;
+    try std.testing.expectEqual(a.cipher, b.cipher);
+    try std.testing.expectEqualSlices(u8, a.key, b.key);
+    try std.testing.expectEqualSlices(u8, a.fixed_iv, b.fixed_iv);
+    try std.testing.expectEqual(a.seq, b.seq);
+    const ar = server.ktlsRxParams().?;
+    const br = resumed.ktlsRxParams().?;
+    try std.testing.expectEqualSlices(u8, ar.key, br.key);
+    try std.testing.expectEqualSlices(u8, ar.fixed_iv, br.fixed_iv);
+    try std.testing.expectEqual(ar.seq, br.seq);
 }
 
 // F6 regression: `buildServerFlight` used to wrap the WHOLE first flight

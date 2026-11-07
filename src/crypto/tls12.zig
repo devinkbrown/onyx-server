@@ -422,7 +422,7 @@ pub fn sealRecordAlloc(
     var aad = makeAad(seq, content_type, @intCast(plaintext.len));
     const ciphertext = out[record_header_len + explicit_len ..][0..plaintext.len];
     const tag_out = out[record_header_len + explicit_len + plaintext.len ..][0..tag_len];
-    if (explicit_len != 0) std.mem.writeInt(u64, out[record_header_len..][0..8], seq, .big);
+    if (explicit_len != 0) out[record_header_len..][0..8].* = gcmExplicitNonce(seq);
 
     switch (suite.aead()) {
         .aes_128_gcm => {
@@ -516,6 +516,19 @@ pub fn openRecordAlloc(
         },
     }
     return .{ .content_type = parsed.content_type, .plaintext = plaintext };
+}
+
+/// The 8-byte GCM explicit nonce (RFC 5288 §3 `GCMNonce.nonce_explicit`) this
+/// engine sends for record sequence `seq`: exactly `seq` big-endian, as RFC 5288
+/// §3 recommends. Kernel-TLS handoff (Linux `tls12_crypto_info_aes_gcm_*`)
+/// depends on this invariant: the kernel writes its `iv` field as the explicit
+/// nonce and increments it together with `rec_seq` after every record, so
+/// installing `iv = rec_seq = seq` keeps the kernel on the same `salt ‖ seq`
+/// nonce line and no nonce is ever reused across the userspace→kernel cut.
+pub fn gcmExplicitNonce(seq: u64) [8]u8 {
+    var out: [8]u8 = undefined;
+    std.mem.writeInt(u64, &out, seq, .big);
+    return out;
 }
 
 fn makeNonce(suite: CipherSuite, fixed_iv: [12]u8, seq: u64) [12]u8 {
@@ -789,4 +802,30 @@ test "TLS 1.2 exporter refuses key-schedule labels, empty labels and oversized c
     try std.testing.expectError(error.InputTooLarge, exportKeyingMaterial(.sha256, &ms, &cr, &sr, "EXPERIMENTAL-x", &big, &out));
     // The maximum encodable context length is accepted.
     try exportKeyingMaterial(.sha256, &ms, &cr, &sr, "EXPERIMENTAL-x", big[0..std.math.maxInt(u16)], &out);
+}
+
+test "TLS 1.2 GCM explicit nonce is the record sequence (kTLS handoff invariant)" {
+    // The kernel's TLS 1.2 GCM TX path emits `iv` as the explicit nonce and
+    // increments it with `rec_seq`; a kTLS handoff at sequence N installs
+    // iv = rec_seq = N. That is only collision-free if every record this engine
+    // sealed under the key used explicit nonce == its sequence number.
+    const allocator = std.testing.allocator;
+    var keys: DirectionKeys = .{};
+    for (keys.key[0..32], 0..) |*b, i| b.* = @intCast(i);
+    keys.iv[0..4].* = .{ 0xde, 0xad, 0xbe, 0xef };
+    const suites = [_]CipherSuite{ .tls_ecdhe_ecdsa_with_aes_128_gcm_sha256, .tls_ecdhe_rsa_with_aes_256_gcm_sha384 };
+    for (suites) |suite| {
+        for ([_]u64{ 0, 1, 0x0102030405060708, std.math.maxInt(u64) - 1 }) |seq| {
+            const rec = try sealRecordAlloc(allocator, suite, &keys, seq, .application_data, "x");
+            defer allocator.free(rec);
+            var be: [8]u8 = undefined;
+            std.mem.writeInt(u64, &be, seq, .big);
+            try std.testing.expectEqualSlices(u8, &be, &gcmExplicitNonce(seq));
+            try std.testing.expectEqualSlices(u8, &be, rec[record_header_len..][0..8]);
+        }
+    }
+    // ChaCha20-Poly1305 (RFC 7905 §2) carries no explicit nonce at all.
+    const rec = try sealRecordAlloc(allocator, .tls_ecdhe_rsa_with_chacha20_poly1305_sha256, &keys, 5, .application_data, "x");
+    defer allocator.free(rec);
+    try std.testing.expectEqual(record_header_len + 1 + 16, rec.len);
 }
