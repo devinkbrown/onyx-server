@@ -21,7 +21,31 @@ substitutes for this table.
 | **WebTransport** | UDP `:4433` | UDP `:4433` |
 | **Operational log** | `/home/kain/onyx-server-run/onyx-server.log` (`0600`) | journal for `onyx-server.service` |
 
-## Verified fleet baseline (2026-11-07, 0.11.0)
+## Verified fleet baseline (2026-11-07, 0.11.3)
+
+| Evidence | eshmaki.me | ircx.us |
+|---|---|---|
+| Service state | OpenRC `started` | systemd `active` |
+| Running image | `0.11.3+44574d95513b` | `0.11.3+44574d95513b` |
+| Executable SHA-256 | `877fe313b470416b27031680846ba4af70039fb796bb31503dda70251aa57e02` | same |
+| Process ID at acceptance | `27078` | `2980332` |
+| `links_active` / `peers_up` / `partitioned` | `1 / 1 / 0` | `1 / 1 / 0` |
+| `[geo] news_insecure_tls` | `false` | `false` |
+
+0.11.1, 0.11.2 and 0.11.3 each went live on both nodes by Helix reload alone
+(ircx.us first), with held TLS 1.3 and TLS 1.2 probes surviving every swap and
+both PIDs kept. Each release rebuilt byte-for-byte. 0.11.3 was deployed on the
+operator's request after the focused registration tests; the full suite last
+passed on `08c155a8` (12,159 passed) before the 0.11.2/0.11.3 registration
+changes. Acceptance after 0.11.3: mesh health and cross-node TLS chat pass; a
+second `guest` gets `433` and keeps its connection; a `guest` reconnecting
+inside the nick-delay window gets `437` and is renamed to `guest-xxxx`; the
+Onyx web client stays connected; `onyx_guest_presence_unpublished_no_id` and
+`onyx_helix_continuity_remote_visible_blocked` read 0 on both nodes. Config
+backups from the news flip: `onyx-server.local.toml.bak-pre-news-verify-20261107`
+on both nodes.
+
+## Previous baseline (2026-11-07, 0.11.0)
 
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
