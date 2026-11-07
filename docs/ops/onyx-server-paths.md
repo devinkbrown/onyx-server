@@ -179,10 +179,11 @@ Hot rollback procedure (one node at a time):
    offloaded.
    Do **not** set `enable_tls12 = false` for this step. A successor with TLS
    1.2 disabled has no TLS 1.2 config, so it cannot resume any carried TLS 1.2
-   row. It rejects the whole handoff and drops every client on the node. The
-   predecessor does not check the target's config, so nothing refuses the
-   UPGRADE first. The same happens if `0.10.4` boots with TLS 1.2 disabled
-   while TLS 1.2 rows are carried. Keep `enable_tls12 = true` through every
+   row. This build's predecessor reads the target config before exec and
+   refuses such an UPGRADE ("target config sets [tls] enable_tls12 = false
+   but N TLS 1.2 session(s) are attached"), keeping every connection. A
+   `0.10.4` predecessor has no such check: its successor would reject the whole
+   handoff and drop every client on the node. Keep `enable_tls12 = true` through every
    Helix step while TLS 1.2 clients are connected.
 2. Wait until `onyx_tls_ktls12_active` on `:9130/metrics` reaches `0`. You can
    also ask the remaining TLS 1.2 clients to reconnect, or disconnect them.

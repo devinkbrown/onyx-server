@@ -5591,6 +5591,11 @@ pub const LinuxServer = struct {
     /// a form this target adopts, or refuses UPGRADE before exec. Native
     /// same-image handoffs never probe and keep `.current`.
     helix_target_state_caps: helix_live.TargetStateCaps = .current,
+    /// Set by `validateExecutionUpgradeConfigLocked` when the target config
+    /// turns `[tls] enable_tls12` off. Such a successor has no TLS 1.2 engine
+    /// config, so `resumeFrom` fails every carried TLS 1.2 row and the whole
+    /// adopt aborts (InvalidInheritedHandoff). The seal refuses before exec.
+    helix_target_tls12_disabled: bool = false,
     /// Reactor-0 monotonic retry guard for automatic Windows descriptor-ID
     /// rollover. The successor starts fresh after Helix imports only live IDs.
     windows_descriptor_rollover_retry_after_ms: i64 = 0,
@@ -39285,6 +39290,7 @@ pub const LinuxServer = struct {
     /// Called under World's exclusive lane at execution, including SIGUSR2.
     /// Re-read disk rather than trusting an earlier command-admission check.
     fn validateExecutionUpgradeConfigLocked(self: *LinuxServer) !void {
+        self.helix_target_tls12_disabled = false;
         const path = self.config.config_path orelse return;
         const io = self.config.crypto_io orelse return error.MissingCryptoIo;
         const text = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(config_format.max_config_bytes));
@@ -39304,6 +39310,7 @@ pub const LinuxServer = struct {
         if (!session_group_retired_policy.same(parsed.mesh.retired_session_group_fences, self.config.retired_session_group_fences)) return error.ChangedRetiredSessionFencePolicy;
         if (config_format.listenerChangeError(self.configuredListenerSet(), config_format.listenerSetFromConfig(parsed)) != null) return error.ChangedUpgradeListeners;
         try self.validateProspectiveSessionReplicaAuthority(parsed);
+        self.helix_target_tls12_disabled = !parsed.tls.enable_tls12;
     }
 
     /// Session replica dirty flags, pending Store staging, local channel
@@ -40815,6 +40822,7 @@ pub const LinuxServer = struct {
         /// state) that keep the cut incomplete so UPGRADE refuses before exec.
         tls_rollback_downgraded: usize = 0,
         tls_rollback_refused: usize = 0,
+        tls12_disabled_refused: usize = 0,
     };
 
     /// Seal ONE reactor shard's connections for a Helix UPGRADE: every carried
@@ -41011,6 +41019,11 @@ pub const LinuxServer = struct {
                 // could use) and refuse UPGRADE before exec for any row that
                 // still has no exact v3 form.
                 var tls_row = tlsCaptureSnapshot(e.value, &capture);
+                if (self.helix_target_tls12_disabled and tls_row.state.engine == .tls12) {
+                    counts.tls12_disabled_refused += 1;
+                    skip = "target config disables TLS 1.2 ([tls] enable_tls12 = false); a carried TLS 1.2 session cannot be adopted";
+                    continue;
+                }
                 if (!self.helix_target_state_caps.tls_session_v4 and !tls_snapshot.representableAsV3(tls_row)) {
                     tls_row = tls_snapshot.forV3Target(tls_row) orelse {
                         counts.tls_rollback_refused += 1;
@@ -42678,6 +42691,16 @@ pub const LinuxServer = struct {
         }
         if (seal_counts.tls_rollback_downgraded != 0)
             srvLog("onyx-server: UPGRADE — {d} TLS 1.2 session(s) sealed as tls_session v3 for a rollback target (RFC 9266 binding dropped; SCRAM -PLUS unavailable on them after the swap)\n", .{seal_counts.tls_rollback_downgraded});
+        if (seal_counts.tls12_disabled_refused != 0) {
+            restoreCloexec(carried_fds[0..carried_fd_count]);
+            var rb: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&rb, "UPGRADE refused: target config sets [tls] enable_tls12 = false but {d} TLS 1.2 session(s) are attached; keep TLS 1.2 on until they disconnect, or cold restart", .{seal_counts.tls12_disabled_refused}) catch
+                "UPGRADE refused: target config disables TLS 1.2 while TLS 1.2 sessions are attached";
+            srvLog("onyx-server: {s}\n", .{msg});
+            self.deferredUpgradeNotice(request, msg);
+            self.publishOperEvent(.oper_action, .critical, "UPGRADE refused: target config disables TLS 1.2 with live TLS 1.2 sessions") catch {};
+            return error.UpgradeTargetIncompatible;
+        }
         if (seal_counts.tls_rollback_refused != 0) {
             restoreCloexec(carried_fds[0..carried_fd_count]);
             var rb: [320]u8 = undefined;
@@ -186338,6 +186361,29 @@ fn release_0_10_4_adoptsTlsSession(piece: helix_live.StatePiece) bool {
     if (!std.meta.eql(canonical, header)) return false;
     const row = tls_snapshot.decode(piece.bytes, 3) catch return false;
     return tls_snapshot.representableAsV3(row);
+}
+
+test "Helix UPGRADE: a target config with enable_tls12 = false refuses the seal while a TLS 1.2 session is attached" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    var fixture = try HelixRollbackTls12Fixture.create(null);
+    defer fixture.deinit();
+    fixture.server.helix_target_state_caps = .current;
+    fixture.server.helix_target_tls12_disabled = true;
+    {
+        var seal: HelixRollbackSeal = .{};
+        defer seal.deinit();
+        seal.run(fixture.server);
+        try std.testing.expectEqual(@as(usize, 1), seal.counts.tls12_disabled_refused);
+        try std.testing.expect(seal.tlsPiece() == null);
+    }
+    try std.testing.expect(setCloexec(fixture.connection().fd, true));
+    fixture.server.helix_target_tls12_disabled = false;
+    var seal: HelixRollbackSeal = .{};
+    defer seal.deinit();
+    seal.run(fixture.server);
+    try std.testing.expectEqual(@as(usize, 0), seal.counts.tls12_disabled_refused);
+    try std.testing.expect(seal.tlsPiece() != null);
 }
 
 test "Helix rollback: a target without tls-session-v4 gets exact v3 TLS 1.2 rows; a current target keeps v4" {
