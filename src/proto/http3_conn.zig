@@ -1950,6 +1950,8 @@ fn mintCert(out: *[1024]u8, kp: Ed25519.KeyPair) ![]const u8 {
 }
 
 const server_params: quic_transport_params.TransportParameters = .{
+    // RFC 9000 §7.3: the QUIC client authenticates both connection-id params.
+    .original_destination_connection_id = &test_initial_dcid,
     .initial_source_connection_id = &test_server_cid,
     .max_idle_timeout = 30_000,
     .initial_max_data = 1 << 20,

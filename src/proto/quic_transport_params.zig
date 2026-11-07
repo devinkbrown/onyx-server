@@ -74,6 +74,9 @@ pub const Error = error{
     Malformed,
     /// A builder ran out of room in the caller-provided buffer.
     NoSpaceLeft,
+    /// The same parameter id appeared more than once in one extension body
+    /// (RFC 9000 §18.1 — the receiver closes with TRANSPORT_PARAMETER_ERROR).
+    DuplicateParameter,
 };
 
 /// A decoded set of the transport parameters this server cares about. Fields
@@ -219,13 +222,26 @@ fn takeVarInt(body: []const u8, pos: *usize) Error!u64 {
 /// Unknown ids are skipped (RFC 9000 §18.1). Integer-typed parameters whose
 /// value bytes are not a single canonical varint, or whose length disagrees
 /// with that varint's width, are rejected. Byte-string parameters alias `body`.
+///
+/// A repeated parameter id is rejected with `error.DuplicateParameter`
+/// (RFC 9000 §18.1) rather than letting the last value silently win. Every id
+/// defined by RFC 9000/9221 lies below 64 and is tracked exactly; large
+/// unknown ids (e.g. GREASE `31 * N + 27`) are ignored without duplicate
+/// tracking, since their values are never interpreted.
 pub fn decode(body: []const u8) Error!TransportParameters {
     var params: TransportParameters = .{};
+    var seen: u64 = 0;
     var pos: usize = 0;
     while (pos < body.len) {
-        const id = ParamId.fromInt(try takeVarInt(body, &pos));
+        const raw_id = try takeVarInt(body, &pos);
+        const id = ParamId.fromInt(raw_id);
         const len = try takeVarInt(body, &pos);
         if (len > body.len - pos) return Error.Truncated;
+        if (raw_id < 64) {
+            const bit = @as(u64, 1) << @intCast(raw_id);
+            if (seen & bit != 0) return Error.DuplicateParameter;
+            seen |= bit;
+        }
         const value = body[pos .. pos + len];
         pos += len;
 
@@ -414,6 +430,63 @@ test "transport_param flag parameter must be zero length" {
     try quic_frame.appendVarInt(&buf, allocator, 1);
     try buf.append(allocator, 0x00);
     try testing.expectError(Error.Malformed, decode(buf.items));
+}
+
+fn appendRawParam(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, id: u64, value: []const u8) !void {
+    try quic_frame.appendVarInt(buf, allocator, id);
+    try quic_frame.appendVarInt(buf, allocator, value.len);
+    try buf.appendSlice(allocator, value);
+}
+
+test "transport_param decode rejects a duplicated integer parameter" {
+    const allocator = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try appendRawParam(&buf, allocator, ParamId.initial_max_data.toInt(), &.{0x07});
+    try appendRawParam(&buf, allocator, ParamId.max_idle_timeout.toInt(), &.{0x01});
+    try appendRawParam(&buf, allocator, ParamId.initial_max_data.toInt(), &.{0x09});
+    try testing.expectError(Error.DuplicateParameter, decode(buf.items));
+}
+
+test "transport_param decode rejects a duplicated connection id parameter" {
+    const allocator = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try appendRawParam(&buf, allocator, ParamId.original_destination_connection_id.toInt(), &.{ 1, 2, 3, 4 });
+    try appendRawParam(&buf, allocator, ParamId.original_destination_connection_id.toInt(), &.{ 5, 6, 7, 8 });
+    try testing.expectError(Error.DuplicateParameter, decode(buf.items));
+}
+
+test "transport_param decode rejects a duplicated flag or unmodeled low id" {
+    const allocator = testing.allocator;
+    var flag: std.ArrayList(u8) = .empty;
+    defer flag.deinit(allocator);
+    try appendRawParam(&flag, allocator, ParamId.disable_active_migration.toInt(), &.{});
+    try appendRawParam(&flag, allocator, ParamId.disable_active_migration.toInt(), &.{});
+    try testing.expectError(Error.DuplicateParameter, decode(flag.items));
+
+    // stateless_reset_token is not decoded into a field but is still a defined
+    // id; sending it twice is a duplicate.
+    var token: std.ArrayList(u8) = .empty;
+    defer token.deinit(allocator);
+    const t: [16]u8 = @splat(0x5a);
+    try appendRawParam(&token, allocator, ParamId.stateless_reset_token.toInt(), &t);
+    try appendRawParam(&token, allocator, ParamId.stateless_reset_token.toInt(), &t);
+    try testing.expectError(Error.DuplicateParameter, decode(token.items));
+}
+
+test "transport_param decode still accepts distinct ids and repeated GREASE ids" {
+    const allocator = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    // Two GREASE records (31*N+27) with the same large id are ignored.
+    try appendRawParam(&buf, allocator, 31 * 5 + 27, &.{0xee});
+    try appendRawParam(&buf, allocator, ParamId.initial_max_data.toInt(), &.{0x07});
+    try appendRawParam(&buf, allocator, 31 * 5 + 27, &.{0xee});
+    try appendRawParam(&buf, allocator, ParamId.max_datagram_frame_size.toInt(), &.{0x10});
+    const out = try decode(buf.items);
+    try testing.expectEqual(@as(?u64, 7), out.initial_max_data);
+    try testing.expectEqual(@as(?u64, 16), out.max_datagram_frame_size);
 }
 
 test {
