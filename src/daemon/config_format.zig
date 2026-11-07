@@ -233,8 +233,15 @@ pub const Config = struct {
     /// wttr.in + the bundled RSS feeds in a background thread.
     pub const Geo = struct {
         enabled: bool = false,
-        /// Skip TLS verification for public read-only news feeds.
-        news_insecure_tls: bool = true,
+        /// Skip TLS verification for public read-only news feeds. Explicit
+        /// operator escape hatch; off by default and warned at boot.
+        news_insecure_tls: bool = false,
+        /// PEM CA bundle whose certificates are the trust anchors for the live
+        /// news fetch. Null = `ca_bundle.default_path`. An unusable bundle
+        /// disables the live fetch; it never falls back to insecure.
+        news_ca_bundle: ?[]const u8 = null,
+        /// Read bound for `news_ca_bundle` (64 KiB..64 MiB).
+        news_ca_bundle_max_bytes: u64 = 4 << 20,
         /// Min ms between bot replies per channel (anti-flood). 0 = disabled.
         cmd_cooldown_ms: u32 = 3000,
         /// Fallback `!weather` location when a user has no GeoIP/`location` meta.
@@ -1073,6 +1080,7 @@ pub const Config = struct {
         if (self.news.source) |v| allocator.free(v);
         if (self.geo.default_location) |v| allocator.free(v);
         if (self.geo.news_cache_dir) |v| allocator.free(v);
+        if (self.geo.news_ca_bundle) |v| allocator.free(v);
         if (self.oper.grants_path) |v| allocator.free(v);
         if (self.oper.event_history_path) |v| allocator.free(v);
         if (self.trace.file) |v| allocator.free(v);
@@ -1333,6 +1341,9 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.geo.cmd_cooldown_ms = @intCast(try uintField(doc, "geo.cmd_cooldown_ms", cfg.geo.cmd_cooldown_ms, 0, 600000));
     try setOpt(allocator, resolver, doc.getString("geo.default_location"), &cfg.geo.default_location);
     try setOpt(allocator, resolver, doc.getString("geo.news_cache_dir"), &cfg.geo.news_cache_dir);
+    try setOpt(allocator, resolver, doc.getString("geo.news_ca_bundle"), &cfg.geo.news_ca_bundle);
+    if (cfg.geo.news_ca_bundle) |v| if (v.len == 0) return error.ParseError;
+    cfg.geo.news_ca_bundle_max_bytes = try uintField(doc, "geo.news_ca_bundle_max_bytes", cfg.geo.news_ca_bundle_max_bytes, 64 * 1024, 64 * 1024 * 1024);
 
     // [oper]
     try setOpt(allocator, resolver, doc.getString("oper.grants_path"), &cfg.oper.grants_path);
@@ -5247,6 +5258,40 @@ test "parseToml: [acme] section projects onto Config" {
     try testing.expectEqual(@as(u32, 32), cfg.acme.http01_listen_backlog);
     try testing.expectEqual(@as(u32, 500), cfg.acme.http01_accept_poll_ms);
     try testing.expectEqual(@as(u32, 10), cfg.acme.http01_conn_read_timeout_sec);
+}
+
+test "parseToml: [geo] news TLS defaults verify and the CA bundle is configurable" {
+    const allocator = testing.allocator;
+    {
+        var cfg = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n[geo]\nenabled = true\n", .{});
+        defer cfg.deinit(allocator);
+        try testing.expect(!cfg.geo.news_insecure_tls);
+        try testing.expectEqual(@as(?[]const u8, null), cfg.geo.news_ca_bundle);
+        try testing.expectEqual(@as(u64, 4 << 20), cfg.geo.news_ca_bundle_max_bytes);
+    }
+    {
+        var cfg = try parseToml(allocator,
+            \\[node]
+            \\id = 1
+            \\[listen]
+            \\irc = 6680
+            \\[geo]
+            \\news_insecure_tls = true
+            \\news_ca_bundle = "/etc/onyx/news-ca.pem"
+            \\news_ca_bundle_max_bytes = 1048576
+            \\
+        , .{});
+        defer cfg.deinit(allocator);
+        try testing.expect(cfg.geo.news_insecure_tls);
+        try testing.expectEqualStrings("/etc/onyx/news-ca.pem", cfg.geo.news_ca_bundle.?);
+        try testing.expectEqual(@as(u64, 1048576), cfg.geo.news_ca_bundle_max_bytes);
+    }
+    const bad = [_][]const u8{
+        "[node]\nid = 1\n[listen]\nirc = 6680\n[geo]\nnews_ca_bundle = \"\"\n",
+        "[node]\nid = 1\n[listen]\nirc = 6680\n[geo]\nnews_ca_bundle_max_bytes = 1024\n",
+        "[node]\nid = 1\n[listen]\nirc = 6680\n[geo]\nnews_ca_bundle_max_bytes = 134217728\n",
+    };
+    for (bad) |text| try testing.expectError(error.ParseError, parseToml(allocator, text, .{}));
 }
 
 test "parseToml: [acme] omitted keeps renewal disabled defaults and validates ranges" {

@@ -17,18 +17,18 @@ const acme_runner = @import("acme_runner.zig");
 const http01 = @import("acme_http01_server.zig");
 const listener = @import("acme_http01_listener.zig");
 const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
-const pem = @import("../proto/pem.zig");
+const ca_bundle_mod = @import("ca_bundle.zig");
 const toml = @import("../proto/toml.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const staging_directory = "https://acme-staging-v02.api.letsencrypt.org/directory";
 pub const prod_directory = "https://acme-v02.api.letsencrypt.org/directory";
-pub const default_ca_bundle = "/etc/ssl/certs/ca-certificates.crt";
+pub const default_ca_bundle = ca_bundle_mod.default_path;
 /// Fixed loopback port nginx proxies the ACME challenge path to.
 pub const default_challenge_port: u16 = 14402;
 /// Max bytes read from the CA-bundle file (defense against a runaway/huge file).
-pub const default_ca_bundle_max_bytes: usize = 4 << 20;
+pub const default_ca_bundle_max_bytes: usize = ca_bundle_mod.default_max_bytes;
 
 pub const Options = struct {
     domain: []const u8,
@@ -208,34 +208,9 @@ fn deriveKeyPath(allocator: Allocator, cert_path: []const u8) ![]u8 {
 }
 
 /// Decode every `CERTIFICATE` PEM block in `text` into owned DER, in order.
-pub fn loadTrustAnchors(allocator: Allocator, text: []const u8) !std.ArrayList([]u8) {
-    const begin = "-----BEGIN CERTIFICATE-----";
-    const end = "-----END CERTIFICATE-----";
-
-    var anchors: std.ArrayList([]u8) = .empty;
-    errdefer freeTrustAnchors(allocator, &anchors);
-
-    var scratch: [8192]u8 = undefined;
-    var off: usize = 0;
-    while (std.mem.indexOfPos(u8, text, off, begin)) |b| {
-        const e = std.mem.indexOfPos(u8, text, b, end) orelse break;
-        const block = text[b .. e + end.len];
-        const der = pem.decode(block, "CERTIFICATE", &scratch) catch {
-            off = e + end.len;
-            continue; // skip an oversize/malformed root, keep the rest
-        };
-        const owned = try allocator.dupe(u8, der);
-        errdefer allocator.free(owned);
-        try anchors.append(allocator, owned);
-        off = e + end.len;
-    }
-    return anchors;
-}
-
-fn freeTrustAnchors(allocator: Allocator, anchors: *std.ArrayList([]u8)) void {
-    for (anchors.items) |a| allocator.free(a);
-    anchors.deinit(allocator);
-}
+/// Shared with the geo news fetcher; see `ca_bundle.zig`.
+pub const loadTrustAnchors = ca_bundle_mod.loadTrustAnchors;
+const freeTrustAnchors = ca_bundle_mod.freeTrustAnchors;
 
 // ---------------------------------------------------------------------------
 // Tests
