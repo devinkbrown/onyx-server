@@ -21,17 +21,23 @@ substitutes for this table.
 | **WebTransport** | UDP `:4433` | UDP `:4433` |
 | **Operational log** | `/home/kain/onyx-server-run/onyx-server.log` (`0600`) | journal for `onyx-server.service` |
 
-## Verified fleet baseline (2026-11-06)
+## Verified fleet baseline (2026-11-07)
 
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.10.3+04beb65db4a0` | `0.10.3+04beb65db4a0` |
-| Executable SHA-256 | `fda55aaa57d9b84e070ed52b5d7bf80fd0ba47c4cd56039656bb676bfa847983` | same |
+| Running image | `0.10.4+e202c6cf…` | `0.10.4+e202c6cf…` |
+| Executable SHA-256 | `b9fcf90d5c7b0ae17a9e6f373df32c5d7c76476f36f744b8a72a10e3eeca0143` | same |
 | Process ID at acceptance | `9223` | `2980332` |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
+
+0.10.4 (`e202c6cf`) went live by Helix reload alone, with no cold restart.
+Both nodes kept their PID (9223 and 2980332), and the issuer epochs stayed at
+11 and 12. Each node held a TLS client across the reload. The mesh health and
+cross-node chat smokes passed afterwards. The release rebuilt byte-for-byte.
+The 0.10.3 binary is kept as `onyx-server.0.10.3-fda55aaa`.
 
 0.10.3 (`04beb65d`) carries the durable mesh presence store across Helix.
 Both nodes were cold-restarted onto it, eshmaki.me first, because 0.10.2

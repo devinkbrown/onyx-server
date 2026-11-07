@@ -70,10 +70,10 @@ After toolkit changes:
 
 Metrics: `:9130/metrics` — `links_active` = established Mooring; `tcp_active` = TCP only.  
 Health: `MESH_SSH_PEER=trev@ircx.us python3 tools/mesh_health_smoke.py http://127.0.0.1:9130/metrics`  
-As verified on 2026-11-06, both nodes run `0.10.3+04beb65db4a0` with artifact SHA-256
-`fda55aaa57d9b84e070ed52b5d7bf80fd0ba47c4cd56039656bb676bfa847983` and report
+As verified on 2026-11-07, both nodes run `0.10.4+e202c6cf` with artifact SHA-256
+`b9fcf90d5c7b0ae17a9e6f373df32c5d7c76476f36f744b8a72a10e3eeca0143` and report
 `links_active=1`, `peers_up=1`, and `partitioned=0`. The source manifest is
-`0.10.3` (`build.zig.zon`) and this image is deployed with `[tls] ktls="txrx"`
+`0.10.4` (`build.zig.zon`) and this image is deployed with `[tls] ktls="txrx"`
 on both nodes. Details and refresh commands:
 `docs/ops/onyx-server-paths.md`, `docs/ops/mesh-metrics-deploy-checklist.md`, and
 skill `onyx-server-mesh-ops`.
