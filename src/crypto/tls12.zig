@@ -32,6 +32,7 @@ pub const Error = error{
     BufferTooSmall,
     CiphertextTooLong,
     InputTooLarge,
+    InvalidExporterLabel,
     PlaintextTooLong,
     RecordOverflow,
     SequenceExhausted,
@@ -543,6 +544,89 @@ fn makeAad(seq: u64, content_type: ContentType, plaintext_len: u16) [13]u8 {
     return aad;
 }
 
+/// RFC 5705 exporter labels that would collide with the TLS 1.2 key schedule
+/// itself (RFC 5705 section 4: "labels ... MUST NOT" reuse PRF labels already
+/// used by TLS). Exporting under one of these could reproduce Finished
+/// verify_data or key-block material, so they are refused outright.
+const exporter_reserved_labels = [_][]const u8{
+    "client finished",
+    "server finished",
+    "master secret",
+    "extended master secret",
+    "key expansion",
+};
+
+/// RFC 5705 TLS 1.2 keying-material exporter:
+///   PRF(master_secret, label, client_random || server_random
+///       [|| uint16 context_length || context])
+/// `context == null` is the RFC 5705 "no context" form; a non-null (possibly
+/// empty) slice is the "context provided" form, which is a DIFFERENT output
+/// because the two-byte length is part of the seed. Callers must pass the
+/// RFC 7627 extended master secret here (the session-hash-bound secret) so the
+/// exported value is unique to this handshake (no triple-handshake
+/// synchronisation); enforcing that is the engine's job, not this primitive's.
+pub fn exportKeyingMaterial(
+    alg: HashAlg,
+    master_secret: *const [master_secret_len]u8,
+    client_random: *const [32]u8,
+    server_random: *const [32]u8,
+    label: []const u8,
+    context: ?[]const u8,
+    out: []u8,
+) Error!void {
+    if (label.len == 0) return error.InvalidExporterLabel;
+    for (exporter_reserved_labels) |reserved| {
+        if (std.mem.eql(u8, label, reserved)) return error.InvalidExporterLabel;
+    }
+    var ctx_len_buf: [2]u8 = undefined;
+    var parts_buf: [6][]const u8 = undefined;
+    var n: usize = 0;
+    parts_buf[n] = label;
+    n += 1;
+    parts_buf[n] = client_random;
+    n += 1;
+    parts_buf[n] = server_random;
+    n += 1;
+    if (context) |ctx| {
+        if (ctx.len > std.math.maxInt(u16)) return error.InputTooLarge;
+        std.mem.writeInt(u16, &ctx_len_buf, @intCast(ctx.len), .big);
+        parts_buf[n] = &ctx_len_buf;
+        n += 1;
+        parts_buf[n] = ctx;
+        n += 1;
+    }
+    switch (alg) {
+        .sha256 => pHashParts(HmacSha256, master_secret, parts_buf[0..n], out),
+        .sha384 => pHashParts(HmacSha384, master_secret, parts_buf[0..n], out),
+    }
+}
+
+/// P_hash (RFC 5246 section 5) over a seed given as concatenated parts. Unlike
+/// `pHash` it streams the seed through HMAC, so the exporter's label/context
+/// are not limited by a fixed seed buffer.
+fn pHashParts(comptime Hmac: type, secret: []const u8, seed_parts: []const []const u8, out: []u8) void {
+    var a: [Hmac.mac_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &a);
+    {
+        var h = Hmac.init(secret);
+        for (seed_parts) |part| h.update(part);
+        h.final(&a);
+    }
+    var done: usize = 0;
+    while (done < out.len) {
+        var block: [Hmac.mac_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &block);
+        var h = Hmac.init(secret);
+        h.update(&a);
+        for (seed_parts) |part| h.update(part);
+        h.final(&block);
+        const take = @min(block.len, out.len - done);
+        @memcpy(out[done .. done + take], block[0..take]);
+        done += take;
+        Hmac.create(&a, &a, secret);
+    }
+}
+
 pub fn constantTimeEq(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     var diff: u8 = 0;
@@ -646,4 +730,63 @@ test "TLS 1.2 AEAD record round trips GCM and ChaCha" {
         try std.testing.expectEqual(ContentType.application_data, opened.content_type);
         try std.testing.expectEqualSlices(u8, "hello tls12", opened.plaintext);
     }
+}
+
+test "TLS 1.2 RFC 5705 exporter matches an independent P_hash implementation" {
+    // Expected values computed with an INDEPENDENT P_SHA256/P_SHA384
+    // implementation (Python stdlib hmac/hashlib), not this module's PRF:
+    //   PRF(ms, label, client_random || server_random [|| u16 len || ctx]).
+    var ms: [master_secret_len]u8 = undefined;
+    for (&ms, 0..) |*b, i| b.* = @intCast(i); // 0x00..0x2f
+    var cr: [32]u8 = undefined;
+    for (&cr, 0..) |*b, i| b.* = @intCast(0x40 + i);
+    var sr: [32]u8 = undefined;
+    for (&sr, 0..) |*b, i| b.* = @intCast(0x60 + i);
+
+    // "context provided" with a zero-length context: the 0x0000 length is in
+    // the seed (RFC 9266 tls-exporter shape).
+    const expected_ctx_empty = [_]u8{
+        0xc4, 0x6f, 0x91, 0xfe, 0x7e, 0xfa, 0xa1, 0x29, 0xcc, 0x69, 0xfe, 0xdc, 0xb3, 0xf3, 0x6d, 0xf3,
+        0x54, 0x15, 0x23, 0xe6, 0xa4, 0x93, 0x6d, 0x0e, 0x4a, 0x3e, 0x33, 0x33, 0x5f, 0x2f, 0x78, 0xae,
+    };
+    var got: [32]u8 = undefined;
+    try exportKeyingMaterial(.sha256, &ms, &cr, &sr, "EXPORTER-Channel-Binding", "", &got);
+    try std.testing.expectEqualSlices(u8, &expected_ctx_empty, &got);
+
+    // "no context": a different seed and therefore a different value.
+    const expected_no_ctx = [_]u8{
+        0xbb, 0xf6, 0x62, 0x17, 0x55, 0xbb, 0x7e, 0x52, 0x3d, 0xa7, 0x0f, 0xda, 0xc8, 0xef, 0x24, 0xcb,
+        0x75, 0xc7, 0x0c, 0xc8, 0x98, 0x96, 0xaa, 0x01, 0x7c, 0xbf, 0x48, 0x03, 0x51, 0xdf, 0xf8, 0xba,
+    };
+    try exportKeyingMaterial(.sha256, &ms, &cr, &sr, "EXPORTER-Channel-Binding", null, &got);
+    try std.testing.expectEqualSlices(u8, &expected_no_ctx, &got);
+
+    // SHA-384 PRF, non-empty context, output spanning more than one HMAC block.
+    const expected384 = [_]u8{
+        0x16, 0x2b, 0xd5, 0x90, 0x6c, 0xb1, 0x3d, 0x10, 0x42, 0xf5, 0xfd, 0xfb, 0x2f, 0xd5, 0x57, 0x58,
+        0xb9, 0x72, 0xdd, 0x16, 0xe8, 0x5f, 0xc0, 0x87, 0x5d, 0x2f, 0xb7, 0x8f, 0x52, 0x0d, 0x98, 0x00,
+        0x9c, 0x23, 0x65, 0x56, 0x9b, 0xda, 0x4e, 0x93,
+    };
+    var got384: [40]u8 = undefined;
+    try exportKeyingMaterial(.sha384, &ms, &cr, &sr, "EXPERIMENTAL-onyx", "onyx", &got384);
+    try std.testing.expectEqualSlices(u8, &expected384, &got384);
+
+    // The streamed P_hash agrees with the fixed-buffer PRF on the same seed.
+    var via_prf: [32]u8 = undefined;
+    try prf(.sha256, &ms, "EXPORTER-Channel-Binding", &(cr ++ sr ++ [_]u8{ 0, 0 }), &via_prf);
+    try std.testing.expectEqualSlices(u8, &expected_ctx_empty, &via_prf);
+}
+
+test "TLS 1.2 exporter refuses key-schedule labels, empty labels and oversized context" {
+    const ms: [master_secret_len]u8 = @splat(0x11);
+    const cr: [32]u8 = @splat(0x22);
+    const sr: [32]u8 = @splat(0x33);
+    var out: [32]u8 = undefined;
+    for ([_][]const u8{ "", "client finished", "server finished", "master secret", "extended master secret", "key expansion" }) |label| {
+        try std.testing.expectError(error.InvalidExporterLabel, exportKeyingMaterial(.sha256, &ms, &cr, &sr, label, null, &out));
+    }
+    const big: [std.math.maxInt(u16) + 1]u8 = @splat(0);
+    try std.testing.expectError(error.InputTooLarge, exportKeyingMaterial(.sha256, &ms, &cr, &sr, "EXPERIMENTAL-x", &big, &out));
+    // The maximum encodable context length is accepted.
+    try exportKeyingMaterial(.sha256, &ms, &cr, &sr, "EXPERIMENTAL-x", big[0..std.math.maxInt(u16)], &out);
 }

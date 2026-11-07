@@ -245,6 +245,9 @@ pub const Client = struct {
     record_size_limit_negotiated: bool = false,
     read_failed: bool = false,
     alert_taken: bool = false,
+    /// Set only when the handshake (full or abbreviated) completed with the
+    /// RFC 7627 extended master secret; gates the RFC 5705 exporter.
+    exporter_ready: bool = false,
 
     // ---- RFC 5077 stateless session resumption (opt-in) ----
     /// When true the ClientHello advertises an (empty) SessionTicket extension so
@@ -488,6 +491,7 @@ pub const Client = struct {
                     self.app_read_seq = self.hs_read_seq;
                     self.app_write_seq = self.hs_write_seq;
                     self.state = .connected;
+                    self.exporter_ready = self.ems_negotiated;
                     return .{ .bytes_to_send = reply };
                 },
                 .wait_server_finished => {
@@ -512,6 +516,7 @@ pub const Client = struct {
                     self.app_read_seq = self.hs_read_seq;
                     self.app_write_seq = self.hs_write_seq;
                     self.state = .connected;
+                    self.exporter_ready = self.ems_negotiated;
                     return .need_more;
                 },
                 else => return error.BadState,
@@ -525,6 +530,33 @@ pub const Client = struct {
 
     pub fn pendingBytes(self: *const Client) []const u8 {
         return self.recv_buf.items;
+    }
+
+    /// RFC 5705 TLS 1.2 keying-material exporter, "context provided" form;
+    /// the client-side twin of `tls12_server.Server.exportKeyingMaterial`
+    /// (same label/context/out yields the same bytes on both ends). Fails
+    /// closed with `BadState` unless the handshake completed with the RFC 7627
+    /// extended master secret.
+    pub fn exportKeyingMaterial(self: *const Client, label: []const u8, context: []const u8, out: []u8) Error!void {
+        const suite = try self.exporterSuite();
+        try tls12.exportKeyingMaterial(suite.hashAlg(), &self.master_secret, &self.client_random, &self.server_random, label, context, out);
+    }
+
+    /// RFC 5705 exporter, "no context" form.
+    pub fn exportKeyingMaterialNoContext(self: *const Client, label: []const u8, out: []u8) Error!void {
+        const suite = try self.exporterSuite();
+        try tls12.exportKeyingMaterial(suite.hashAlg(), &self.master_secret, &self.client_random, &self.server_random, label, null, out);
+    }
+
+    /// RFC 9266 tls-exporter channel binding (TLS 1.2 + EMS only).
+    pub fn channelBindingTlsExporter(self: *const Client, out: *[32]u8) Error!void {
+        try self.exportKeyingMaterial("EXPORTER-Channel-Binding", "", out[0..]);
+    }
+
+    fn exporterSuite(self: *const Client) Error!tls12.CipherSuite {
+        if (self.read_failed or self.state != .connected) return error.BadState;
+        if (!self.exporter_ready or !self.ems_negotiated) return error.BadState;
+        return self.selected_suite orelse error.BadState;
     }
 
     pub fn selectedAlpn(self: *const Client) ?[]const u8 {
@@ -1351,6 +1383,8 @@ fn parseCertificateChain(allocator: Allocator, body: []const u8) Error![][]u8 {
     var certs = Cursor.init(list);
     while (certs.remaining() != 0) {
         const der = try certs.take(try certs.readU24());
+        // RFC 5246 ASN.1Cert<1..2^24-1>: a zero-length entry is malformed.
+        if (der.len == 0) return error.BadCertificate;
         try out.append(allocator, try allocator.dupe(u8, der));
     }
     return out.toOwnedSlice(allocator);
@@ -2682,4 +2716,20 @@ test "TLS record limit: output custody TLS12 Finished OOM preserves pre-CCS epoc
         return;
     }
     return error.TestUnexpectedResult;
+}
+
+test "A9 TLS 1.2 client: server certificate_list entries are fully framed and non-empty" {
+    const allocator = std.testing.allocator;
+    // Two well-formed entries parse into a two-element chain.
+    const ok = [_]u8{ 0x00, 0x00, 0x0a, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x00, 0x02, 0x30, 0x00 };
+    const chain = try parseCertificateChain(allocator, &ok);
+    defer freeChain(allocator, chain);
+    try std.testing.expectEqual(@as(usize, 2), chain.len);
+
+    // A zero-length entry (ASN.1Cert<1..2^24-1>) after the leaf is refused.
+    try std.testing.expectError(error.BadCertificate, parseCertificateChain(allocator, &[_]u8{ 0x00, 0x00, 0x08, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x00, 0x00 }));
+    // A zero-length leaf is refused too.
+    try std.testing.expectError(error.BadCertificate, parseCertificateChain(allocator, &[_]u8{ 0x00, 0x00, 0x03, 0x00, 0x00, 0x00 }));
+    // Trailing bytes that do not form a whole entry are malformed.
+    try std.testing.expectError(error.BadHandshake, parseCertificateChain(allocator, &[_]u8{ 0x00, 0x00, 0x07, 0x00, 0x00, 0x02, 0x30, 0x00, 0x00, 0x01 }));
 }
