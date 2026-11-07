@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! `onyx-server acme-issue` entry: assemble the clean-room ACME stack into a single
-//! out-of-band issuance run. Generates distinct ES256 (ECDSA P-256) account and
-//! certificate keys, loads trust anchors from a CA bundle, starts the loopback
-//! HTTP-01 listener (which nginx proxies `/.well-known/acme-challenge/` to), and
-//! drives `acme_runner.issue`.
+//! out-of-band issuance run. Loads (or creates once, 0600) the persistent ES256
+//! (ECDSA P-256) ACME account key, generates a fresh, distinct certificate key,
+//! loads trust anchors from a CA bundle, answers http-01 through the loopback
+//! listener (which nginx proxies `/.well-known/acme-challenge/` to) or dns-01
+//! through an operator hook, and drives `acme_runner.issue`. tls-alpn-01 needs
+//! the daemon's TLS listener and is only available to in-daemon renewal.
 //!
 //! Defaults target Let's Encrypt STAGING (the chosen dry-run posture). It never
 //! touches certbot or /etc/letsencrypt; the chain is written to a kain-owned path.
@@ -42,6 +44,15 @@ pub const Options = struct {
     debug: bool = false,
     /// Max bytes read from the CA-bundle file.
     ca_bundle_max_bytes: usize = default_ca_bundle_max_bytes,
+    /// Persistent account key path. Null => `acme-account.key.pem` beside the
+    /// certificate key.
+    account_key_path: ?[]const u8 = null,
+    /// http-01 (default) or dns-01.
+    challenge: acme_runner.ChallengeType = .http_01,
+    /// dns-01 operator hook (absolute path); required for dns-01.
+    dns_hook: ?[]const u8 = null,
+    dns_hook_timeout_ms: u32 = acme_runner.default_dns_hook_timeout_ms,
+    dns_propagation_delay_ms: u32 = acme_runner.default_dns_propagation_delay_ms,
 };
 
 /// Overlay `[acme]` config onto `opts`, leaving any key absent from the document
@@ -69,6 +80,12 @@ pub fn applyToml(opts: *Options, doc: *const toml.Document) void {
     if (doc.getUint("acme.ca_bundle_max_bytes")) |v| {
         if (v != 0) opts.ca_bundle_max_bytes = @intCast(v);
     }
+    if (opts.account_key_path == null) {
+        if (doc.getString("acme.account_key_path")) |v| opts.account_key_path = v;
+    }
+    if (opts.dns_hook == null) {
+        if (doc.getString("acme.dns_hook")) |v| opts.dns_hook = v;
+    }
 }
 
 /// Print a one-line usage summary for the acme-issue subcommand.
@@ -82,6 +99,11 @@ pub fn usage() void {
         \\  --ca-bundle <path>     trust anchors PEM (default: {s})
         \\  --contact <mailto:..>  ACME account contact (optional)
         \\  --port <n>             loopback HTTP-01 port nginx proxies to (default: {d})
+        \\  --account-key <path>   persistent ACME account key (default: acme-account.key.pem
+        \\                         beside the cert key; created once, mode 0600)
+        \\  --challenge <type>     http-01 (default) or dns-01
+        \\  --dns-hook <path>      dns-01: absolute path of an executable run as
+        \\                         `<hook> add|del <fqdn> <txt>` (required for dns-01)
         \\
     , .{ default_ca_bundle, default_challenge_port });
 }
@@ -97,6 +119,9 @@ pub fn parseArgs(args: []const []const u8) ?Options {
     var key_out: ?[]const u8 = null;
     var port: u16 = default_challenge_port;
     var debug = false;
+    var account_key: ?[]const u8 = null;
+    var challenge: acme_runner.ChallengeType = .http_01;
+    var dns_hook: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -123,12 +148,30 @@ pub fn parseArgs(args: []const []const u8) ?Options {
         } else if (std.mem.eql(u8, a, "--port") and i + 1 < args.len) {
             i += 1;
             port = std.fmt.parseInt(u16, args[i], 10) catch return null;
+        } else if (std.mem.eql(u8, a, "--account-key") and i + 1 < args.len) {
+            i += 1;
+            account_key = args[i];
+        } else if (std.mem.eql(u8, a, "--challenge") and i + 1 < args.len) {
+            i += 1;
+            challenge = acme_runner.ChallengeType.fromString(args[i]) orelse return null;
+        } else if (std.mem.eql(u8, a, "--dns-hook") and i + 1 < args.len) {
+            i += 1;
+            dns_hook = args[i];
         } else {
             return null;
         }
     }
 
     if (domain == null or out == null) return null;
+    switch (challenge) {
+        .http_01 => {},
+        .dns_01 => {
+            const hook = dns_hook orelse return null;
+            if (!std.fs.path.isAbsolute(hook)) return null;
+        },
+        // Needs the daemon's TLS listener to serve acme-tls/1.
+        .tls_alpn_01 => return null,
+    }
     return .{
         .domain = domain.?,
         .directory_url = directory,
@@ -138,6 +181,9 @@ pub fn parseArgs(args: []const []const u8) ?Options {
         .challenge_port = port,
         .key_out_path = key_out,
         .debug = debug,
+        .account_key_path = account_key,
+        .challenge = challenge,
+        .dns_hook = dns_hook,
     };
 }
 
@@ -152,19 +198,39 @@ pub fn runIssue(allocator: Allocator, io: std.Io, opts: Options) !bool {
     if (anchors.items.len == 0) return error.NoTrustAnchors;
     dlog.log("acme: loaded {d} trust anchors from {s}\n", .{ anchors.items.len, opts.ca_bundle_path });
 
-    // --- Keys: ES256 / ECDSA P-256 (the alg Let's Encrypt accepts). The account
-    // and certificate keys MUST differ (LE rejects a CSR keyed to the account).
-    // Fresh per run; staging accounts are disposable. ---
-    const account_key = ecdsa_p256.KeyPair.generate(io);
-    const cert_key = ecdsa_p256.KeyPair.generate(io);
+    // Key path: explicit --key-out, else derive (<cert without .pem>.key.pem).
+    const derived_key = try deriveKeyPath(allocator, opts.cert_out_path);
+    defer allocator.free(derived_key);
+    const key_out = opts.key_out_path orelse derived_key;
+
+    // --- Keys: ES256 / ECDSA P-256 (the alg Let's Encrypt accepts). The
+    // account key is persisted and reused (RFC 8555 §7.3.1: newAccount with a
+    // known key returns the existing account); the certificate key is fresh
+    // per run and MUST differ (LE rejects a CSR keyed to the account). ---
+    const derived_account = try acme_runner.defaultAccountKeyPath(allocator, key_out);
+    defer allocator.free(derived_account);
+    const account_path = opts.account_key_path orelse derived_account;
+    try acme_runner.checkAccountKeyPath(account_path, opts.cert_out_path, key_out);
+    var account = try acme_runner.loadOrCreateAccountKey(io, std.Io.Dir.cwd(), account_path);
+    defer account.wipe();
+    dlog.log("acme: account key {s} ({s})\n", .{ account_path, if (account.created) "created; registering new account" else "loaded" });
+    var cert_key = ecdsa_p256.KeyPair.generate(io);
+    defer ecdsa_p256.wipeKeyPair(&cert_key);
 
     // --- Loopback HTTP-01 listener (nginx proxies the challenge path here) ---
     var store = http01.TokenStore.init(allocator);
     defer store.deinit();
-    var server = try listener.ChallengeServer.init(&store, opts.challenge_port);
-    try server.spawn();
-    defer server.shutdown();
-    dlog.log("acme: HTTP-01 listener on 127.0.0.1:{d}\n", .{server.port});
+    var server: ?listener.ChallengeServer = null;
+    defer if (server) |*s| s.shutdown();
+    if (opts.challenge == .http_01) {
+        server = try listener.ChallengeServer.init(&store, opts.challenge_port);
+        // spawn() shuts the listener down itself on failure.
+        server.?.spawn() catch |err| {
+            server = null;
+            return err;
+        };
+        dlog.log("acme: HTTP-01 listener on 127.0.0.1:{d}\n", .{server.?.port});
+    }
 
     // --- Drive issuance ---
     const domains = [_][]const u8{opts.domain};
@@ -174,11 +240,6 @@ pub fn runIssue(allocator: Allocator, io: std.Io, opts: Options) !bool {
         break :blk contacts_storage[0..1];
     } else &.{};
 
-    // Key path: explicit --key-out, else derive (<cert without .pem>.key.pem).
-    const derived_key = try deriveKeyPath(allocator, opts.cert_out_path);
-    defer allocator.free(derived_key);
-    const key_out = opts.key_out_path orelse derived_key;
-
     const result = try acme_runner.issue(allocator, io, .{
         .directory_url = opts.directory_url,
         .domains = &domains,
@@ -187,7 +248,10 @@ pub fn runIssue(allocator: Allocator, io: std.Io, opts: Options) !bool {
         .cert_out_path = opts.cert_out_path,
         .key_out_path = key_out,
         .debug = opts.debug,
-    }, account_key, cert_key, &store, null);
+        .challenge = opts.challenge,
+        .dns_hook = if (opts.dns_hook) |h| .{ .path = h, .timeout_ms = opts.dns_hook_timeout_ms } else null,
+        .dns_propagation_delay_ms = opts.dns_propagation_delay_ms,
+    }, account.key_pair, cert_key, if (opts.challenge == .http_01) &store else null, null);
 
     if (result.cert_written) {
         dlog.log("acme: SUCCESS — wrote chain {s}\n              and key {s}\n", .{ opts.cert_out_path, key_out });
@@ -252,6 +316,23 @@ test "parseArgs requires domain and out, toggles prod" {
 
     const prod = parseArgs(&.{ "--domain", "eshmaki.me", "--out", "/p/c.pem", "--prod" }).?;
     try std.testing.expectEqualStrings(prod_directory, prod.directory_url);
+}
+
+test "parseArgs: account key, dns-01 hook, and refused tls-alpn-01" {
+    const base = [_][]const u8{ "--domain", "irc.example.test", "--out", "/p/c.pem" };
+    const plain = parseArgs(&base).?;
+    try std.testing.expectEqual(acme_runner.ChallengeType.http_01, plain.challenge);
+    try std.testing.expect(plain.account_key_path == null);
+
+    const dns = parseArgs(&(base ++ [_][]const u8{ "--challenge", "dns-01", "--dns-hook", "/usr/local/bin/hook", "--account-key", "/p/acct.pem" })).?;
+    try std.testing.expectEqual(acme_runner.ChallengeType.dns_01, dns.challenge);
+    try std.testing.expectEqualStrings("/usr/local/bin/hook", dns.dns_hook.?);
+    try std.testing.expectEqualStrings("/p/acct.pem", dns.account_key_path.?);
+
+    try std.testing.expect(parseArgs(&(base ++ [_][]const u8{ "--challenge", "dns-01" })) == null); // no hook
+    try std.testing.expect(parseArgs(&(base ++ [_][]const u8{ "--challenge", "dns-01", "--dns-hook", "hook" })) == null); // relative
+    try std.testing.expect(parseArgs(&(base ++ [_][]const u8{ "--challenge", "tls-alpn-01" })) == null);
+    try std.testing.expect(parseArgs(&(base ++ [_][]const u8{ "--challenge", "bogus" })) == null);
 }
 
 test "deriveKeyPath swaps .pem for .key.pem, else appends .key" {

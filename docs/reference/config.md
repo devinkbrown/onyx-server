@@ -760,6 +760,38 @@ Automatic in-daemon TLS certificate renewal on Linux, OpenBSD, and Windows. A ba
 | `http01_listen_backlog` | integer | `16` | `1..1024` | TCP listen backlog for the loopback HTTP-01 listener. |
 | `http01_accept_poll` | duration string | `"250ms"` | `50ms..5s` | Accept-loop wake interval used to re-check shutdown. |
 | `http01_conn_read_timeout` | duration string | `"5s"` | `1s..60s` | Per-challenge-connection read timeout. Whole seconds only. |
+| `challenge` | string | `"http-01"` | `"http-01"`, `"dns-01"`, `"tls-alpn-01"` | Which ACME challenge type to answer. Any other value is a parse error. |
+| `account_key_path` | string or null | unset (`acme-account.key.pem` in the directory of `[tls].key_path`) | file path, not equal to `[tls].cert_path` or `[tls].key_path` | Persistent ACME account key (P-256, SEC1 PEM). See "Account key" below. |
+| `dns_hook` | string or null | unset | absolute path | `dns-01` only (required for it): executable that publishes and removes the TXT record. See "dns-01 hook" below. |
+| `dns_hook_timeout` | duration string | `"60s"` | `1s..10m` | Wall-clock limit for one hook run. When it runs out the hook is killed with SIGKILL and issuance fails. |
+| `dns_propagation_delay` | duration string | `"30s"` | `1ms..1h` | How long to wait after a successful `add` before asking the CA to validate. |
+
+### Account key
+
+The ACME account key is separate from the certificate key. On the first renewal it is generated, written with mode `0600` (owner read/write only), and reused for every later renewal. Each renewal still gets a fresh certificate key. Startup refuses an `account_key_path` that names the certificate chain or the certificate key.
+
+Migration: earlier releases made a throwaway account key for every issuance and never saved it. Because no old key survives, an RFC 8555 §7.3.5 key change (which the old key has to sign) is impossible. When the file is missing, the daemon writes a new key before it contacts the CA and registers a new account (RFC 8555 §7.3). Every later run sends `newAccount` with the same key, and the CA returns the existing account (RFC 8555 §7.3.1). Existing deployments therefore need no action. A key file that exists but is malformed, unreadable, or readable by group or other makes the renewal fail. The daemon never replaces that file, because replacing it would orphan the registered account. Fix the file by hand (for example `chmod 600`).
+
+### dns-01 hook
+
+With `challenge = "dns-01"` the daemon runs the hook directly through `execve`. No shell is involved, so nothing in the arguments is interpolated:
+
+```text
+<dns_hook> add _acme-challenge.<domain> <txt-value>
+<dns_hook> del _acme-challenge.<domain> <txt-value>
+```
+
+- `<txt-value>` is `base64url(SHA-256(key authorization))` (RFC 8555 §8.4): exactly 43 characters from `A-Z a-z 0-9 - _`. It can start with `-`, so read the arguments by position and never parse them as options.
+- The daemon checks the record name against strict hostname syntax before it spawns the hook.
+- The hook's stdin and stdout are `/dev/null`. Its stderr goes to the daemon log.
+- The hook's environment contains only `PATH`. Read DNS API credentials from a file the hook owns.
+- A non-zero exit or a timeout aborts the issuance before the CA is asked to validate.
+- `del` runs for every record that `add` attempted, whether the issuance succeeds or fails. A failed `del` is logged so you can remove the record by hand.
+- dns-01 hooks run on Linux only.
+
+### tls-alpn-01
+
+With `challenge = "tls-alpn-01"` (RFC 8737) the CA connects to port 443 of the domain. It offers only the ALPN protocol `acme-tls/1`. The daemon's TLS listener must answer on that public port, either directly or through a TCP (layer-4) passthrough; a TLS-terminating proxy cannot answer this challenge. During an issuance the renewal worker publishes a self-signed P-256 challenge certificate. That certificate holds the domain as its only subjectAltName and a critical `id-pe-acmeIdentifier` extension containing `SHA-256(key authorization)`. The listener presents the certificate only to a ClientHello that carries SNI for that domain and an ALPN list of exactly `acme-tls/1`. Every other client gets the normal certificate. The challenge certificate is withdrawn when the authorization settles. The HTTP-01 loopback listener is not started for `dns-01` or `tls-alpn-01`.
 
 ## `[ocsp]`
 

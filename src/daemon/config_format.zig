@@ -929,6 +929,17 @@ pub const Config = struct {
         http01_listen_backlog: u32 = acme_http01_listener.default_listen_backlog,
         http01_accept_poll_ms: u32 = acme_http01_listener.default_accept_poll_ms,
         http01_conn_read_timeout_sec: u32 = acme_http01_listener.default_conn_read_timeout_sec,
+        // Fields below were added after the version-1 companion digest; keep
+        // them last and listed in `acme_renewal.post_v1_acme_fields`.
+        /// Persistent ACME account key (SEC1 PEM, 0600). Null derives
+        /// `acme-account.key.pem` beside `[tls].key_path`.
+        account_key_path: ?[]const u8 = null,
+        /// Challenge type answered: http-01 (default), dns-01, tls-alpn-01.
+        challenge: acme_runner.ChallengeType = .http_01,
+        /// dns-01 operator hook executable (absolute path; required for dns-01).
+        dns_hook: ?[]const u8 = null,
+        dns_hook_timeout_ms: u32 = acme_runner.default_dns_hook_timeout_ms,
+        dns_propagation_delay_ms: u32 = acme_runner.default_dns_propagation_delay_ms,
     };
 
     /// Server-side OCSP stapling. When `enabled` and the `[tls]` leaf carries an
@@ -1168,6 +1179,8 @@ pub const Config = struct {
         allocator.free(self.webpush.vapid_key_path);
         if (self.acme.domain) |value| allocator.free(value);
         if (self.acme.contact) |value| allocator.free(value);
+        if (self.acme.account_key_path) |value| allocator.free(value);
+        if (self.acme.dns_hook) |value| allocator.free(value);
         // Basis text is heap-owned only when non-empty (the default is a literal).
         if (self.resources.basis.name.len != 0) allocator.free(self.resources.basis.name);
         if (self.resources.basis.harness.len != 0) allocator.free(self.resources.basis.harness);
@@ -1839,6 +1852,32 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
         if (ms < 1000 or ms > 60_000 or ms % 1000 != 0) return error.ParseError;
         cfg.acme.http01_conn_read_timeout_sec = @intCast(ms / 1000);
     }
+    if (doc.getString("acme.challenge")) |s| {
+        cfg.acme.challenge = acme_runner.ChallengeType.fromString(s) orelse return error.ParseError;
+    }
+    try setOpt(allocator, resolver, doc.getString("acme.account_key_path"), &cfg.acme.account_key_path);
+    if (cfg.acme.account_key_path) |p| {
+        // The account key must never alias the certificate chain or key file.
+        if (p.len == 0) return error.ParseError;
+        if (cfg.tls.cert_path) |c| if (std.mem.eql(u8, p, c)) return error.ParseError;
+        if (cfg.tls.key_path) |k| if (std.mem.eql(u8, p, k)) return error.ParseError;
+    }
+    try setOpt(allocator, resolver, doc.getString("acme.dns_hook"), &cfg.acme.dns_hook);
+    if (cfg.acme.dns_hook) |h| {
+        // exec'd directly (no shell, no PATH search): must be absolute.
+        if (!std.fs.path.isAbsolute(h)) return error.ParseError;
+    }
+    if (doc.getString("acme.dns_hook_timeout")) |s| {
+        const ms = try durationMs(s);
+        if (ms < 1000 or ms > 600_000) return error.ParseError;
+        cfg.acme.dns_hook_timeout_ms = @intCast(ms);
+    }
+    if (doc.getString("acme.dns_propagation_delay")) |s| {
+        const ms = try durationMs(s);
+        if (ms > 3_600_000) return error.ParseError;
+        cfg.acme.dns_propagation_delay_ms = @intCast(ms);
+    }
+    if (cfg.acme.challenge == .dns_01 and cfg.acme.dns_hook == null) return error.ParseError;
 
     // [ocsp]
     if (doc.getBool("ocsp.enabled")) |b| cfg.ocsp.enabled = b;
@@ -5247,6 +5286,70 @@ test "parseToml: [acme] section projects onto Config" {
     try testing.expectEqual(@as(u32, 32), cfg.acme.http01_listen_backlog);
     try testing.expectEqual(@as(u32, 500), cfg.acme.http01_accept_poll_ms);
     try testing.expectEqual(@as(u32, 10), cfg.acme.http01_conn_read_timeout_sec);
+}
+
+test "parseToml: [acme] challenge, account key and dns-01 hook keys" {
+    const allocator = testing.allocator;
+    const head =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[tls]
+        \\enabled = true
+        \\cert_path = "/etc/onyx/tls/cert.pem"
+        \\key_path = "/etc/onyx/tls/key.pem"
+        \\[acme]
+        \\
+    ;
+    {
+        var cfg = try parseToml(allocator, head ++
+            \\challenge = "dns-01"
+            \\account_key_path = "/etc/onyx/tls/acct.pem"
+            \\dns_hook = "/usr/local/libexec/onyx-dns-hook"
+            \\dns_hook_timeout = "2m"
+            \\dns_propagation_delay = "90s"
+            \\
+        , .{});
+        defer cfg.deinit(allocator);
+        try testing.expectEqual(acme_runner.ChallengeType.dns_01, cfg.acme.challenge);
+        try testing.expectEqualStrings("/etc/onyx/tls/acct.pem", cfg.acme.account_key_path.?);
+        try testing.expectEqualStrings("/usr/local/libexec/onyx-dns-hook", cfg.acme.dns_hook.?);
+        try testing.expectEqual(@as(u32, 120_000), cfg.acme.dns_hook_timeout_ms);
+        try testing.expectEqual(@as(u32, 90_000), cfg.acme.dns_propagation_delay_ms);
+    }
+    {
+        var cfg = try parseToml(allocator, head ++ "challenge = \"tls-alpn-01\"\n", .{});
+        defer cfg.deinit(allocator);
+        try testing.expectEqual(acme_runner.ChallengeType.tls_alpn_01, cfg.acme.challenge);
+        try testing.expectEqual(@as(?[]const u8, null), cfg.acme.account_key_path);
+    }
+    // Defaults.
+    {
+        var cfg = try parseToml(allocator, head, .{});
+        defer cfg.deinit(allocator);
+        try testing.expectEqual(acme_runner.ChallengeType.http_01, cfg.acme.challenge);
+        try testing.expectEqual(@as(?[]const u8, null), cfg.acme.dns_hook);
+        try testing.expectEqual(acme_runner.default_dns_hook_timeout_ms, cfg.acme.dns_hook_timeout_ms);
+        try testing.expectEqual(acme_runner.default_dns_propagation_delay_ms, cfg.acme.dns_propagation_delay_ms);
+    }
+    // Fail closed.
+    const bad = [_][]const u8{
+        "challenge = \"tls-sni-01\"\n",
+        "challenge = \"dns-01\"\n", // no hook
+        "challenge = \"dns-01\"\ndns_hook = \"hook.sh\"\n", // relative
+        "account_key_path = \"/etc/onyx/tls/key.pem\"\n", // aliases [tls].key_path
+        "account_key_path = \"/etc/onyx/tls/cert.pem\"\n", // aliases [tls].cert_path
+        "account_key_path = \"\"\n",
+        "dns_hook_timeout = \"500ms\"\n",
+        "dns_hook_timeout = \"11m\"\n",
+        "dns_propagation_delay = \"2h\"\n",
+    };
+    for (bad) |tail| {
+        const text = try std.mem.concat(allocator, u8, &.{ head, tail });
+        defer allocator.free(text);
+        try testing.expectError(error.ParseError, parseToml(allocator, text, .{}));
+    }
 }
 
 test "parseToml: [acme] omitted keeps renewal disabled defaults and validates ranges" {

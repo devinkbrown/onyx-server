@@ -31,6 +31,9 @@ const dns_address_lookup = @import("dns_address_lookup.zig");
 const toml = @import("../proto/toml.zig");
 const http_fetch = @import("http_fetch.zig");
 const os_runtime = @import("os_runtime.zig");
+const ec_pkcs = @import("../proto/ec_pkcs.zig");
+const acme_challenge = @import("../proto/acme_challenge.zig");
+const platform = @import("../substrate/platform.zig");
 
 const Allocator = std.mem.Allocator;
 const linux = std.os.linux;
@@ -373,8 +376,9 @@ pub const HttpsTransport = struct {
 };
 
 // ---------------------------------------------------------------------------
-// ES256 signer adapter (ECDSA P-256; account key == issued-cert key, per
-// acme_client). Let's Encrypt accepts ES256/ES384/ES512/RS256, not EdDSA.
+// ES256 signer adapter (ECDSA P-256). Used for both the persistent account key
+// and the per-issuance certificate key, which are always distinct key pairs.
+// Let's Encrypt accepts ES256/ES384/ES512/RS256, not EdDSA.
 // ---------------------------------------------------------------------------
 
 pub const Es256Signer = struct {
@@ -407,6 +411,9 @@ pub const Es256Signer = struct {
 // Top-level issuance driver
 // ---------------------------------------------------------------------------
 
+/// Challenge types the runner can answer (re-exported for config parsing).
+pub const ChallengeType = acme.ChallengeType;
+
 pub const IssueConfig = struct {
     directory_url: []const u8,
     domains: []const []const u8,
@@ -430,6 +437,17 @@ pub const IssueConfig = struct {
     resolv_conf_max_bytes: usize = default_resolv_conf_max_bytes,
     /// UDP port the built-in resolver uses for DNS A-record lookups.
     dns_port: u16 = default_dns_port,
+    /// Challenge type answered for every authorization.
+    challenge: ChallengeType = .http_01,
+    /// dns-01: the operator hook (required when `challenge == .dns_01`).
+    dns_hook: ?DnsHook = null,
+    /// dns-01: wait after `hook add` before the CA is told to validate.
+    dns_propagation_delay_ms: u32 = default_dns_propagation_delay_ms,
+    /// dns-01: optional propagation probe polled within the delay.
+    txt_probe: ?TxtProbe = null,
+    /// tls-alpn-01: the store the TLS listener serves `acme-tls/1` from
+    /// (required when `challenge == .tls_alpn_01`).
+    tls_alpn01_store: ?*TlsAlpn01Store = null,
 };
 
 /// Overlay `[acme]` config onto `cfg`, leaving any absent key at its current
@@ -460,9 +478,14 @@ pub const IssueResult = struct {
     cert_written: bool,
 };
 
-/// Run a full issuance. `token_store` MUST already be wired to a live HTTP-01
-/// responder reachable at `http://<domain>/.well-known/acme-challenge/<token>`
-/// (see [acme_http01_server]); this driver only populates/clears it.
+/// Run a full issuance. For http-01, `token_store` MUST already be wired to a
+/// live HTTP-01 responder reachable at
+/// `http://<domain>/.well-known/acme-challenge/<token>` (see
+/// [acme_http01_server]); this driver only populates/clears it. For dns-01,
+/// `cfg.dns_hook` publishes the TXT record; for tls-alpn-01,
+/// `cfg.tls_alpn01_store` must be the store the TLS listener consults. The
+/// account key must be the persisted one (`loadOrCreateAccountKey`) and the
+/// certificate key a different, fresh key.
 ///
 /// `resolver` turns ACME endpoint hostnames into IPs. Pass `null` to use the
 /// built-in blocking resolver (reads /etc/resolv.conf, queries via our own
@@ -474,7 +497,7 @@ pub fn issue(
     cfg: IssueConfig,
     account_key: ecdsa_p256.KeyPair,
     cert_key: ecdsa_p256.KeyPair,
-    token_store: *http01.TokenStore,
+    token_store: ?*http01.TokenStore,
     resolver: ?Resolver,
 ) !IssueResult {
     var sys = SystemResolver{
@@ -500,28 +523,563 @@ pub fn issue(
         .contacts = cfg.contacts,
         .signer = account_es.signer(),
         .cert_signer = cert_es.signer(),
+        .challenge = cfg.challenge,
     });
     defer client.deinit();
 
-    var cert_written = false;
-    var steps: usize = 0;
-    while (steps < cfg.max_steps) : (steps += 1) {
-        const progress = try client.step(http_transport.transport());
-        for (progress.effects) |effect| switch (effect) {
-            .serve_http01 => |c| try token_store.put(c.token, c.key_authorization),
-            .write_cert => |c| {
-                try writeCertAtomic(io, std.Io.Dir.cwd(), cfg.cert_out_path, c.pem);
-                if (cfg.key_out_path) |kp| {
-                    var pem_buf: [512]u8 = undefined;
-                    const key_pem = try ecPrivateKeyPem(cert_key, &pem_buf);
-                    try writeKeyAtomic(io, std.Io.Dir.cwd(), kp, key_pem);
-                }
-                cert_written = true;
-            },
+    var hook_provisioner: HookProvisioner = undefined;
+    var sink = EffectSink{
+        .allocator = allocator,
+        .io = io,
+        .dir = std.Io.Dir.cwd(),
+        .cert_out_path = cfg.cert_out_path,
+        .key_out_path = cfg.key_out_path,
+        .cert_key = cert_key,
+        .token_store = token_store,
+        .dns_propagation_delay_ms = cfg.dns_propagation_delay_ms,
+        .txt_probe = cfg.txt_probe,
+        .tls_alpn01 = cfg.tls_alpn01_store,
+    };
+    switch (cfg.challenge) {
+        .http_01 => if (token_store == null) return error.Http01Unavailable,
+        .dns_01 => {
+            const hook = cfg.dns_hook orelse return error.Dns01Unavailable;
+            hook_provisioner = .{ .allocator = allocator, .io = io, .hook = hook };
+            sink.dns = hook_provisioner.provisioner();
+        },
+        .tls_alpn_01 => if (cfg.tls_alpn01_store == null) return error.TlsAlpn01Unavailable,
+    }
+    return runSteps(&client, http_transport.transport(), &sink, cfg.max_steps);
+}
+
+// ---------------------------------------------------------------------------
+// Persistent ACME account key (RFC 8555 §7.3)
+// ---------------------------------------------------------------------------
+
+/// File name of the default account key, placed in the directory of the TLS
+/// certificate key (`[tls].key_path`), which already holds private material
+/// (and on Windows must be a private directory).
+pub const default_account_key_name = "acme-account.key.pem";
+
+/// Maximum bytes read from an account key file (a SEC1 P-256 PEM is ~230).
+const max_account_key_file_bytes: usize = 4096;
+
+pub const AccountKeyError = error{
+    /// The key file is readable by group or other (POSIX mode & 0o077 != 0).
+    InsecureAccountKeyPermissions,
+    /// The file is not a SEC1 / PKCS#8 P-256 private key PEM.
+    InvalidAccountKey,
+    /// The account key path aliases the certificate chain or certificate key.
+    AccountKeyPathConflict,
+};
+
+pub const AccountKey = struct {
+    key_pair: ecdsa_p256.KeyPair,
+    /// True when this call generated and persisted a fresh key (first run or a
+    /// migrated deployment): the next newAccount registers a new account.
+    created: bool,
+
+    pub fn wipe(self: *AccountKey) void {
+        ecdsa_p256.wipeKeyPair(&self.key_pair);
+    }
+};
+
+/// Default account key path: `<dirname(cert_key_path)>/acme-account.key.pem`.
+/// Caller owns the result.
+pub fn defaultAccountKeyPath(allocator: Allocator, cert_key_path: []const u8) Allocator.Error![]u8 {
+    const dir = std.fs.path.dirname(cert_key_path) orelse return allocator.dupe(u8, default_account_key_name);
+    return std.fs.path.join(allocator, &.{ dir, default_account_key_name });
+}
+
+/// Refuse an account key path that would overwrite (or be overwritten by) the
+/// issued chain or certificate key: the two keys MUST stay separate files.
+pub fn checkAccountKeyPath(account_key_path: []const u8, cert_path: []const u8, cert_key_path: ?[]const u8) AccountKeyError!void {
+    if (account_key_path.len == 0) return error.AccountKeyPathConflict;
+    if (std.mem.eql(u8, account_key_path, cert_path)) return error.AccountKeyPathConflict;
+    if (cert_key_path) |k| if (std.mem.eql(u8, account_key_path, k)) return error.AccountKeyPathConflict;
+}
+
+/// Load the persisted ACME account key at `path`, or generate one, persist it
+/// owner-only (0600) and return it with `created = true`.
+///
+/// Migration (deployments from before this file existed): earlier releases
+/// generated a throwaway account key on every issuance and never stored it, so
+/// no previous account key survives to sign an RFC 8555 §7.3.5 keyChange
+/// (whose outer JWS must be signed by the OLD key). A missing file therefore
+/// means "register": the key is generated and written BEFORE contacting the
+/// CA, and the following newAccount creates the account (RFC 8555 §7.3). Every
+/// later run re-sends newAccount with the same key, which the CA answers with
+/// the existing account URL (RFC 8555 §7.3.1: "200 (OK) and ... the URL of
+/// that account in the Location header field"), so issuance is idempotent and
+/// no orphan accounts accumulate.
+///
+/// Fail closed: an existing but unreadable, malformed, or group/world-readable
+/// file is an error — never silently replaced, since replacing it would orphan
+/// the registered account.
+pub fn loadOrCreateAccountKey(io: std.Io, dir: std.Io.Dir, path: []const u8) !AccountKey {
+    if (loadAccountKey(io, dir, path)) |kp| {
+        return .{ .key_pair = kp, .created = false };
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    var kp = ecdsa_p256.KeyPair.generate(io);
+    errdefer ecdsa_p256.wipeKeyPair(&kp);
+    var pem_buf: [512]u8 = undefined;
+    defer std.crypto.secureZero(u8, &pem_buf);
+    const text = try ecPrivateKeyPem(kp, &pem_buf);
+    writeKeyExclusive(io, dir, path, text) catch |err| switch (err) {
+        // Another writer created it first: use theirs so both agree.
+        error.PathAlreadyExists => {
+            ecdsa_p256.wipeKeyPair(&kp);
+            return .{ .key_pair = try loadAccountKey(io, dir, path), .created = false };
+        },
+        else => return err,
+    };
+    return .{ .key_pair = kp, .created = true };
+}
+
+/// Read and parse a persisted account key (SEC1 `EC PRIVATE KEY` or PKCS#8
+/// `PRIVATE KEY`, P-256 only), refusing group/other-accessible files on POSIX.
+pub fn loadAccountKey(io: std.Io, dir: std.Io.Dir, path: []const u8) !ecdsa_p256.KeyPair {
+    var file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    if (comptime std.posix.mode_t != u0 and builtin.os.tag != .windows) {
+        // Checked on the opened descriptor: no stat/open race.
+        const st = try file.stat(io);
+        if (st.permissions.toMode() & 0o077 != 0) return error.InsecureAccountKeyPermissions;
+    }
+    var file_buf: [max_account_key_file_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &file_buf);
+    var reader = file.reader(io, &.{});
+    const n = reader.interface.readSliceShort(&file_buf) catch return error.InvalidAccountKey;
+    if (n == file_buf.len) return error.InvalidAccountKey; // oversize: not a P-256 key
+    const text = file_buf[0..n];
+    var der_buf: [max_account_key_file_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &der_buf);
+    const der = pem.decode(text, "EC PRIVATE KEY", &der_buf) catch
+        pem.decode(text, "PRIVATE KEY", &der_buf) catch return error.InvalidAccountKey;
+    var scalar = ec_pkcs.parseScalar(der) catch return error.InvalidAccountKey;
+    defer std.crypto.secureZero(u8, &scalar);
+    const sk = ecdsa_p256.SecretKey.fromBytes(scalar) catch return error.InvalidAccountKey;
+    return ecdsa_p256.KeyPair.fromSecretKey(sk) catch return error.InvalidAccountKey;
+}
+
+/// Create `path` exclusively with owner-only permissions (fsync + link), so a
+/// concurrent creator can never be overwritten.
+fn writeKeyExclusive(io: std.Io, dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) {
+        // The Windows private-DACL publisher replaces; account key creation is
+        // single-writer there (the renewal thread or the CLI).
+        dir.access(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return writeKeyAtomicWindows(io, dir, path, data),
+            else => return err,
         };
-        if (progress.done) {
-            return .{ .state = progress.state, .cert_written = cert_written };
+        return error.PathAlreadyExists;
+    }
+    var atomic = try dir.createFileAtomic(io, path, .{ .replace = false, .permissions = key_file_perms });
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, data);
+    try atomic.file.sync(io);
+    try atomic.link(io);
+}
+
+// ---------------------------------------------------------------------------
+// dns-01 operator hook (RFC 8555 §8.4)
+// ---------------------------------------------------------------------------
+
+/// Default wall-clock bound on one hook invocation.
+pub const default_dns_hook_timeout_ms: u32 = 60_000;
+/// Default wait after a successful `add` before telling the CA to validate.
+pub const default_dns_propagation_delay_ms: u32 = 30_000;
+/// The only environment a hook sees (no daemon secrets leak into it).
+const hook_path_env = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+pub const HookAction = enum { add, del };
+
+pub const HookError = error{
+    /// The hook path is not absolute, or an argument failed validation.
+    InvalidHookArgument,
+    /// The hook could not be started (missing, not executable, ...).
+    HookSpawnFailed,
+    /// The hook did not exit within `timeout_ms`; it was SIGKILLed.
+    HookTimeout,
+    /// The hook exited non-zero or was killed by a signal.
+    HookFailed,
+    /// dns-01 hooks are supported on Linux only.
+    Unsupported,
+} || Allocator.Error;
+
+/// An operator executable invoked as `<path> add <fqdn> <txt>` to publish and
+/// `<path> del <fqdn> <txt>` to remove a dns-01 TXT record. The argv is passed
+/// to execve directly — no shell, no interpolation — and both values are
+/// validated before spawn: the name is LDH (never starts with `-`), the TXT
+/// value is exactly 43 base64url characters (it MAY start with `-`, so hooks
+/// must read their arguments positionally, never as options). stdin/stdout are /dev/null, stderr is inherited
+/// (hook diagnostics land in the daemon log), and the environment is only
+/// `PATH`; hooks read credentials from their own files.
+pub const DnsHook = struct {
+    path: []const u8,
+    timeout_ms: u32 = default_dns_hook_timeout_ms,
+
+    pub fn run(self: DnsHook, allocator: Allocator, io: std.Io, action: HookAction, fqdn: []const u8, txt: []const u8) HookError!void {
+        if (!std.fs.path.isAbsolute(self.path)) return error.InvalidHookArgument;
+        if (!acme_challenge.isValidDnsName(fqdn)) return error.InvalidHookArgument;
+        // RFC 8555 §8.4: the value is base64url(SHA-256(keyAuth)) — exactly
+        // 43 unpadded base64url characters, nothing else is ever passed.
+        if (txt.len != acme_challenge.dns01TxtValueLen() or !acme_challenge.validateToken(txt)) return error.InvalidHookArgument;
+        if (comptime builtin.os.tag != .linux) return error.Unsupported;
+
+        const argv = [_][]const u8{ self.path, @tagName(action), fqdn, txt };
+        var env = std.process.Environ.Map.init(allocator);
+        defer env.deinit();
+        try env.put("PATH", hook_path_env);
+
+        var child = std.process.spawn(io, .{
+            .argv = &argv,
+            .environ_map = &env,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .inherit,
+        }) catch return error.HookSpawnFailed;
+        // Idempotent after `wait`; on any early return it SIGKILLs and reaps.
+        defer child.kill(io);
+
+        const pid = child.id orelse return error.HookSpawnFailed;
+        const deadline = platform.monotonicMillis() +| @as(i64, self.timeout_ms);
+        while (true) {
+            var status: linux.siginfo_t = std.mem.zeroes(linux.siginfo_t);
+            switch (posix.errno(linux.waitid(.PID, pid, &status, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT, null))) {
+                .SUCCESS => if (status.fields.common.first.piduid.pid != 0) break,
+                .INTR => continue,
+                else => return error.HookFailed,
+            }
+            const now = platform.monotonicMillis();
+            if (now >= deadline) {
+                _ = linux.kill(pid, .KILL);
+                return error.HookTimeout;
+            }
+            std.Io.sleep(io, .fromMilliseconds(@min(deadline - now, 10)), .awake) catch return error.HookFailed;
         }
+        const term = child.wait(io) catch return error.HookFailed;
+        if (!term.success()) return error.HookFailed;
+    }
+};
+
+/// Publish/remove a dns-01 TXT record. Production uses `DnsHook`; tests inject.
+pub const Dns01Provisioner = struct {
+    ctx: *anyopaque,
+    runFn: *const fn (ctx: *anyopaque, action: HookAction, fqdn: []const u8, txt: []const u8) anyerror!void,
+
+    fn run(self: Dns01Provisioner, action: HookAction, fqdn: []const u8, txt: []const u8) anyerror!void {
+        return self.runFn(self.ctx, action, fqdn, txt);
+    }
+};
+
+/// Optional propagation check: returns true once `fqdn` serves `txt`.
+pub const TxtProbe = struct {
+    ctx: *anyopaque,
+    probeFn: *const fn (ctx: *anyopaque, fqdn: []const u8, txt: []const u8) bool,
+};
+
+/// Bridges `DnsHook` to `Dns01Provisioner`.
+pub const HookProvisioner = struct {
+    allocator: Allocator,
+    io: std.Io,
+    hook: DnsHook,
+
+    pub fn provisioner(self: *HookProvisioner) Dns01Provisioner {
+        return .{ .ctx = self, .runFn = runThunk };
+    }
+
+    fn runThunk(ctx: *anyopaque, action: HookAction, fqdn: []const u8, txt: []const u8) anyerror!void {
+        const self: *HookProvisioner = @ptrCast(@alignCast(ctx));
+        return self.hook.run(self.allocator, self.io, action, fqdn, txt);
+    }
+};
+
+/// Wait for a freshly published TXT record to be visible before the CA is
+/// told to validate. Without a probe this is a fixed `delay_ms` sleep; with a
+/// probe it polls every `poll_ms` until the probe sees the value, failing with
+/// `error.DnsPropagationTimeout` after `delay_ms` (fail closed: never trigger
+/// validation against a record known not to be there).
+pub fn waitForPropagation(io: std.Io, fqdn: []const u8, txt: []const u8, delay_ms: u32, poll_ms: u32, probe: ?TxtProbe) !void {
+    const p = probe orelse {
+        std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch {};
+        return;
+    };
+    const deadline = platform.monotonicMillis() +| @as(i64, delay_ms);
+    while (true) {
+        if (p.probeFn(p.ctx, fqdn, txt)) return;
+        const now = platform.monotonicMillis();
+        if (now >= deadline) return error.DnsPropagationTimeout;
+        std.Io.sleep(io, .fromMilliseconds(@min(deadline - now, @max(poll_ms, 1))), .awake) catch {};
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tls-alpn-01 certificate store (RFC 8737)
+// ---------------------------------------------------------------------------
+
+/// Thread-safe, allocation-free registry of live TLS-ALPN-01 challenge
+/// certificates, keyed by identifier (case-insensitive). The renewal thread
+/// `put`s an entry before telling the CA to validate and `remove`s it when the
+/// authorization settles; the TLS listener calls `selectForClientHello` on a
+/// new connection's first record and, on a hit, completes that handshake with
+/// the leased certificate/key and ALPN `acme-tls/1` only, then closes (RFC 8737
+/// §4: no application data is exchanged).
+pub const TlsAlpn01Store = struct {
+    pub const max_entries = 8;
+
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: [max_entries]Entry = @splat(.{}),
+
+    const Entry = struct {
+        used: bool = false,
+        name_len: u16 = 0,
+        name: [acme_challenge.max_dns_name_len]u8 = undefined,
+        cert_len: u16 = 0,
+        cert: [acme_challenge.max_tls_alpn01_cert_len]u8 = undefined,
+        key_pair: ecdsa_p256.KeyPair = undefined,
+    };
+
+    /// A by-value copy the listener owns for the life of one handshake, so a
+    /// concurrent `remove` can never free bytes a handshake is still using.
+    pub const Lease = struct {
+        cert_len: u16,
+        cert: [acme_challenge.max_tls_alpn01_cert_len]u8,
+        key_pair: ecdsa_p256.KeyPair,
+
+        pub fn certDer(self: *const Lease) []const u8 {
+            return self.cert[0..self.cert_len];
+        }
+
+        pub fn wipe(self: *Lease) void {
+            ecdsa_p256.wipeKeyPair(&self.key_pair);
+        }
+    };
+
+    pub const PutError = error{ InvalidDomain, CertificateTooLarge, StoreFull };
+
+    fn lock(self: *TlsAlpn01Store) void {
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+    }
+
+    /// Install (or replace) the challenge certificate for `domain`.
+    pub fn put(self: *TlsAlpn01Store, domain: []const u8, cert_der: []const u8, key_pair: ecdsa_p256.KeyPair) PutError!void {
+        if (!acme_challenge.isValidDnsName(domain)) return error.InvalidDomain;
+        if (cert_der.len > acme_challenge.max_tls_alpn01_cert_len) return error.CertificateTooLarge;
+        self.lock();
+        defer self.mutex.unlock();
+        const slot = self.find(domain) orelse for (&self.entries) |*e| {
+            if (!e.used) break e;
+        } else return error.StoreFull;
+        slot.used = true;
+        slot.name_len = @intCast(domain.len);
+        @memcpy(slot.name[0..domain.len], domain);
+        slot.cert_len = @intCast(cert_der.len);
+        @memcpy(slot.cert[0..cert_der.len], cert_der);
+        slot.key_pair = key_pair;
+    }
+
+    /// Remove the entry for `domain` (wiping its key). No-op when absent.
+    pub fn remove(self: *TlsAlpn01Store, domain: []const u8) void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.find(domain)) |e| {
+            ecdsa_p256.wipeKeyPair(&e.key_pair);
+            e.* = .{};
+        }
+    }
+
+    /// Copy out the entry matching SNI `server_name`, if any.
+    pub fn lookup(self: *TlsAlpn01Store, server_name: []const u8) ?Lease {
+        self.lock();
+        defer self.mutex.unlock();
+        const e = self.find(server_name) orelse return null;
+        var lease: Lease = .{ .cert_len = e.cert_len, .cert = undefined, .key_pair = e.key_pair };
+        @memcpy(lease.cert[0..e.cert_len], e.cert[0..e.cert_len]);
+        return lease;
+    }
+
+    /// The listener hook: if `first_record` is a TLS-ALPN-01 validation
+    /// ClientHello (SNI + ALPN exactly `acme-tls/1`, see
+    /// `acme_challenge.peekAcmeTlsHello`) for a name with a live challenge,
+    /// return its lease. Null means "handle the connection normally".
+    pub fn selectForClientHello(self: *TlsAlpn01Store, first_record: []const u8) ?Lease {
+        if (self.isEmpty()) return null;
+        const hello = acme_challenge.peekAcmeTlsHello(first_record) orelse return null;
+        return self.lookup(hello.server_name);
+    }
+
+    pub fn isEmpty(self: *TlsAlpn01Store) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        for (self.entries) |e| if (e.used) return false;
+        return true;
+    }
+
+    fn find(self: *TlsAlpn01Store, name: []const u8) ?*Entry {
+        for (&self.entries) |*e| {
+            if (e.used and std.ascii.eqlIgnoreCase(e.name[0..e.name_len], name)) return e;
+        }
+        return null;
+    }
+};
+
+/// Validity of a TLS-ALPN-01 certificate around `now`: the CA validates
+/// within minutes, a small backdate absorbs validator clock skew.
+const tls_alpn01_backdate_s: i64 = 24 * 60 * 60;
+const tls_alpn01_lifetime_s: i64 = 7 * 24 * 60 * 60;
+
+/// Mint the RFC 8737 challenge certificate for `domain` with a fresh
+/// ephemeral key. The serial is derived from the public key (unique per key;
+/// no RNG needed beyond key generation).
+pub fn mintTlsAlpn01(io: std.Io, out: []u8, domain: []const u8, key_authorization: []const u8, now_unix: i64) !struct { der: []const u8, key_pair: ecdsa_p256.KeyPair } {
+    var kp = ecdsa_p256.KeyPair.generate(io);
+    errdefer ecdsa_p256.wipeKeyPair(&kp);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&kp.public_key.toUncompressedSec1(), &digest, .{});
+    const der = try acme_challenge.buildTlsAlpn01Certificate(out, .{
+        .domain = domain,
+        .key_authorization = key_authorization,
+        .key_pair = kp,
+        .serial = digest[0..16].*,
+        .not_before = @max(now_unix - tls_alpn01_backdate_s, 0),
+        .not_after = now_unix + tls_alpn01_lifetime_s,
+    });
+    return .{ .der = der, .key_pair = kp };
+}
+
+// ---------------------------------------------------------------------------
+// Effect handling + step loop
+// ---------------------------------------------------------------------------
+
+/// Acts on `acme_client` effects for one issuance and remembers every
+/// provisioned challenge response so `cleanup` can withdraw it whatever the
+/// outcome (http-01 tokens, dns-01 TXT records via `del`, tls-alpn-01 certs).
+pub const EffectSink = struct {
+    allocator: Allocator,
+    io: std.Io,
+    /// Directory the cert/key paths resolve against (`cwd` in production).
+    dir: std.Io.Dir,
+    cert_out_path: []const u8,
+    key_out_path: ?[]const u8,
+    cert_key: ecdsa_p256.KeyPair,
+    token_store: ?*http01.TokenStore = null,
+    dns: ?Dns01Provisioner = null,
+    dns_propagation_delay_ms: u32 = default_dns_propagation_delay_ms,
+    dns_poll_ms: u32 = 2_000,
+    txt_probe: ?TxtProbe = null,
+    tls_alpn01: ?*TlsAlpn01Store = null,
+    cert_written: bool = false,
+
+    tokens: Pending(256) = .{},
+    dns_records: Pending(acme_challenge.dns01_label.len + acme_challenge.max_dns_name_len + 1 + 64) = .{},
+    alpn_names: Pending(acme_challenge.max_dns_name_len) = .{},
+
+    pub fn handle(self: *EffectSink, effect: acme.Effect) !void {
+        switch (effect) {
+            .serve_http01 => |c| {
+                const store = self.token_store orelse return error.Http01Unavailable;
+                try self.tokens.add(c.token);
+                try store.put(c.token, c.key_authorization);
+            },
+            .provision_dns01 => |c| {
+                const dns = self.dns orelse return error.Dns01Unavailable;
+                var rec_buf: [acme_challenge.dns01_label.len + acme_challenge.max_dns_name_len + 1 + 64]u8 = undefined;
+                const rec = std.fmt.bufPrint(&rec_buf, "{s} {s}", .{ c.fqdn, c.txt_value }) catch return error.InvalidHookArgument;
+                // Remember before running so a hook that half-applied and then
+                // failed is still sent `del`.
+                try self.dns_records.add(rec);
+                try dns.run(.add, c.fqdn, c.txt_value);
+                try waitForPropagation(self.io, c.fqdn, c.txt_value, self.dns_propagation_delay_ms, self.dns_poll_ms, self.txt_probe);
+            },
+            .provision_tls_alpn01 => |c| {
+                const store = self.tls_alpn01 orelse return error.TlsAlpn01Unavailable;
+                var cert_buf: [acme_challenge.max_tls_alpn01_cert_len]u8 = undefined;
+                var minted = try mintTlsAlpn01(self.io, &cert_buf, c.domain, c.key_authorization, wallClockSeconds());
+                defer ecdsa_p256.wipeKeyPair(&minted.key_pair);
+                try self.alpn_names.add(c.domain);
+                try store.put(c.domain, minted.der, minted.key_pair);
+            },
+            .write_cert => |c| {
+                try writeCertAtomic(self.io, self.dir, self.cert_out_path, c.pem);
+                if (self.key_out_path) |kp| {
+                    var pem_buf: [512]u8 = undefined;
+                    defer std.crypto.secureZero(u8, &pem_buf);
+                    const key_pem = try ecPrivateKeyPem(self.cert_key, &pem_buf);
+                    try writeKeyAtomic(self.io, self.dir, kp, key_pem);
+                }
+                self.cert_written = true;
+            },
+        }
+    }
+
+    /// Withdraw every provisioned response. Best effort: a failing `del` hook
+    /// is logged, never masks the issuance result.
+    pub fn cleanup(self: *EffectSink) void {
+        if (self.token_store) |store| {
+            for (self.tokens.slice()) |t| _ = store.remove(t.text());
+        }
+        if (self.dns) |dns| {
+            for (self.dns_records.slice()) |r| {
+                const rec = r.text();
+                const sp = std.mem.indexOfScalar(u8, rec, ' ') orelse continue;
+                dns.run(.del, rec[0..sp], rec[sp + 1 ..]) catch |err| {
+                    dlog.log("acme: dns-01 hook del {s} failed ({s}); remove the TXT record manually\n", .{ rec[0..sp], @errorName(err) });
+                };
+            }
+        }
+        if (self.tls_alpn01) |store| {
+            for (self.alpn_names.slice()) |n| store.remove(n.text());
+        }
+        self.tokens = .{};
+        self.dns_records = .{};
+        self.alpn_names = .{};
+    }
+};
+
+/// Fixed-capacity list of short strings (one entry per authorization).
+fn Pending(comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+        const max = 16;
+        items: [max]Item = undefined,
+        len: usize = 0,
+
+        const Item = struct {
+            buf: [cap]u8 = undefined,
+            n: usize = 0,
+            fn text(self: *const Item) []const u8 {
+                return self.buf[0..self.n];
+            }
+        };
+
+        fn add(self: *Self, s: []const u8) error{TooManyAuthorizations}!void {
+            if (self.len == max or s.len > cap) return error.TooManyAuthorizations;
+            self.items[self.len] = .{};
+            @memcpy(self.items[self.len].buf[0..s.len], s);
+            self.items[self.len].n = s.len;
+            self.len += 1;
+        }
+
+        fn slice(self: *const Self) []const Item {
+            return self.items[0..self.len];
+        }
+    };
+}
+
+/// Step `client` to completion, routing every effect through `sink`. The
+/// sink's provisioned responses are withdrawn on every exit path.
+pub fn runSteps(client: *acme.Acme, transport: acme.Transport, sink: *EffectSink, max_steps: usize) !IssueResult {
+    defer sink.cleanup();
+    var steps: usize = 0;
+    while (steps < max_steps) : (steps += 1) {
+        const progress = try client.step(transport);
+        for (progress.effects) |effect| try sink.handle(effect);
+        if (progress.done) return .{ .state = progress.state, .cert_written = sink.cert_written };
     }
     return error.TooManySteps;
 }
@@ -1599,4 +2157,466 @@ test "TLS client fatal transport: acme_runner socket writer preserves control cu
     // Unix-socketpair proof; no `socketpair` on Windows.
     if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     try tls_client_failure.testFatalTransportProof(true, writeAll);
+}
+
+// ---------------------------------------------------------------------------
+// Account key, dns-01 hook, tls-alpn-01 store, effect sink
+// ---------------------------------------------------------------------------
+
+test "account key is generated once, persisted 0600, reloaded, and distinct from the cert key" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var first = try loadOrCreateAccountKey(io, tmp.dir, "acct.pem");
+    defer first.wipe();
+    try std.testing.expect(first.created);
+    const st = try tmp.dir.statFile(io, "acct.pem", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0), st.permissions.toMode() & 0o077);
+
+    var second = try loadOrCreateAccountKey(io, tmp.dir, "acct.pem");
+    defer second.wipe();
+    try std.testing.expect(!second.created);
+    try std.testing.expectEqualSlices(u8, &first.key_pair.public_key.toUncompressedSec1(), &second.key_pair.public_key.toUncompressedSec1());
+    try std.testing.expectEqualSlices(u8, &first.key_pair.secret_key.toBytes(), &second.key_pair.secret_key.toBytes());
+
+    // A per-issuance certificate key is a different key pair.
+    const cert_key = ecdsa_p256.KeyPair.generate(io);
+    try std.testing.expect(!std.mem.eql(u8, &cert_key.public_key.toUncompressedSec1(), &first.key_pair.public_key.toUncompressedSec1()));
+
+    // The persisted form is the SEC1 PEM the TLS loader also reads.
+    var buf: [1024]u8 = undefined;
+    const text = try tmp.dir.readFile(io, "acct.pem", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, text, "-----BEGIN EC PRIVATE KEY-----"));
+}
+
+test "account key load fails closed on group-readable or malformed files and never replaces them" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var made = try loadOrCreateAccountKey(io, tmp.dir, "acct.pem");
+    made.wipe();
+    {
+        const f = try tmp.dir.openFile(io, "acct.pem", .{});
+        defer f.close(io);
+        try f.setPermissions(io, .fromMode(0o640));
+    }
+    try std.testing.expectError(error.InsecureAccountKeyPermissions, loadOrCreateAccountKey(io, tmp.dir, "acct.pem"));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "junk.pem", .data = "not a key\n", .flags = .{ .permissions = .fromMode(0o600) } });
+    try std.testing.expectError(error.InvalidAccountKey, loadOrCreateAccountKey(io, tmp.dir, "junk.pem"));
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("not a key\n", try tmp.dir.readFile(io, "junk.pem", &buf));
+}
+
+test "account key path defaults next to the TLS key and may not alias cert or key" {
+    const a = std.testing.allocator;
+    const p = try defaultAccountKeyPath(a, "/etc/onyx/tls/server.key");
+    defer a.free(p);
+    try std.testing.expectEqualStrings("/etc/onyx/tls/acme-account.key.pem", p);
+    const bare = try defaultAccountKeyPath(a, "server.key");
+    defer a.free(bare);
+    try std.testing.expectEqualStrings("acme-account.key.pem", bare);
+
+    try checkAccountKeyPath("/k/acct.pem", "/k/cert.pem", "/k/key.pem");
+    try std.testing.expectError(error.AccountKeyPathConflict, checkAccountKeyPath("/k/key.pem", "/k/cert.pem", "/k/key.pem"));
+    try std.testing.expectError(error.AccountKeyPathConflict, checkAccountKeyPath("/k/cert.pem", "/k/cert.pem", null));
+    try std.testing.expectError(error.AccountKeyPathConflict, checkAccountKeyPath("", "/k/cert.pem", null));
+}
+
+const TestHookDir = struct {
+    tmp: std.testing.TmpDir,
+    root: [:0]u8,
+
+    fn init(script: []const u8) !TestHookDir {
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+        errdefer std.testing.allocator.free(root);
+        var body_buf: [1024]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "#!/bin/sh\n{s}\n", .{script});
+        const f = try tmp.dir.createFile(io, "hook", .{ .permissions = .fromMode(0o700) });
+        defer f.close(io);
+        try f.writeStreamingAll(io, body);
+        return .{ .tmp = tmp, .root = root };
+    }
+
+    fn hookPath(self: *const TestHookDir, buf: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}/hook", .{self.root});
+    }
+
+    fn deinit(self: *TestHookDir) void {
+        std.testing.allocator.free(self.root);
+        self.tmp.cleanup();
+    }
+};
+
+test "dns hook is exec'd with argv [path, add|del, fqdn, txt] and a PATH-only environment" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    // The script records "$0"-relative argv and whether HOME leaked through.
+    var hd = try TestHookDir.init("d=$(dirname \"$0\"); printf '%s\\n' \"$#\" \"$1\" \"$2\" \"$3\" \"${HOME-unset}\" \"$PATH\" >> \"$d/calls\"");
+    defer hd.deinit();
+    var path_buf: [512]u8 = undefined;
+    const hook = DnsHook{ .path = try hd.hookPath(&path_buf), .timeout_ms = 10_000 };
+
+    const txt = "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0";
+    try hook.run(std.testing.allocator, io, .add, "_acme-challenge.irc.example.test", txt);
+    try hook.run(std.testing.allocator, io, .del, "_acme-challenge.irc.example.test", txt);
+
+    var buf: [1024]u8 = undefined;
+    const calls = try hd.tmp.dir.readFile(io, "calls", &buf);
+    try std.testing.expectEqualStrings(
+        "3\nadd\n_acme-challenge.irc.example.test\n" ++ txt ++ "\nunset\n" ++ hook_path_env ++ "\n" ++
+            "3\ndel\n_acme-challenge.irc.example.test\n" ++ txt ++ "\nunset\n" ++ hook_path_env ++ "\n",
+        calls,
+    );
+}
+
+test "dns hook rejects relative paths and unsafe arguments without spawning" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var hd = try TestHookDir.init("touch \"$(dirname \"$0\")/ran\"");
+    defer hd.deinit();
+    var path_buf: [512]u8 = undefined;
+    const hook = DnsHook{ .path = try hd.hookPath(&path_buf) };
+    const a = std.testing.allocator;
+    const txt = "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0";
+    try std.testing.expectError(error.InvalidHookArgument, (DnsHook{ .path = "hook" }).run(a, io, .add, "a.test", txt));
+    try std.testing.expectError(error.InvalidHookArgument, hook.run(a, io, .add, "-rf", txt));
+    try std.testing.expectError(error.InvalidHookArgument, hook.run(a, io, .add, "a.test", "$(id)LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxA"));
+    try std.testing.expectError(error.InvalidHookArgument, hook.run(a, io, .add, "a.test;id", txt));
+    try std.testing.expectError(error.InvalidHookArgument, hook.run(a, io, .add, "a.test", "abc")); // not 43 chars
+    try std.testing.expectError(error.FileNotFound, hd.tmp.dir.access(io, "ran", .{}));
+}
+
+test "dns hook non-zero exit, missing executable, and timeout fail closed" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const txt = "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0";
+
+    var failing = try TestHookDir.init("exit 3");
+    defer failing.deinit();
+    var p1: [512]u8 = undefined;
+    try std.testing.expectError(error.HookFailed, (DnsHook{ .path = try failing.hookPath(&p1) }).run(a, io, .add, "a.test", txt));
+
+    try std.testing.expectError(error.HookSpawnFailed, (DnsHook{ .path = "/nonexistent/onyx-acme-hook" }).run(a, io, .add, "a.test", txt));
+
+    var slow = try TestHookDir.init("exec sleep 30");
+    defer slow.deinit();
+    var p2: [512]u8 = undefined;
+    const start = platform.monotonicMillis();
+    try std.testing.expectError(error.HookTimeout, (DnsHook{ .path = try slow.hookPath(&p2), .timeout_ms = 200 }).run(a, io, .add, "a.test", txt));
+    const elapsed = platform.monotonicMillis() - start;
+    try std.testing.expect(elapsed >= 200);
+    try std.testing.expect(elapsed < 5_000); // killed, not waited out
+}
+
+test "waitForPropagation polls the probe and times out closed" {
+    const Probe = struct {
+        hits_needed: usize,
+        calls: usize = 0,
+        fn probe(ctx: *anyopaque, fqdn: []const u8, txt: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(std.mem.eql(u8, fqdn, "_acme-challenge.a.test") and std.mem.eql(u8, txt, "v"));
+            self.calls += 1;
+            return self.calls >= self.hits_needed;
+        }
+    };
+    var ok = Probe{ .hits_needed = 3 };
+    try waitForPropagation(std.testing.io, "_acme-challenge.a.test", "v", 5_000, 1, .{ .ctx = &ok, .probeFn = Probe.probe });
+    try std.testing.expectEqual(@as(usize, 3), ok.calls);
+
+    var never = Probe{ .hits_needed = std.math.maxInt(usize) };
+    try std.testing.expectError(error.DnsPropagationTimeout, waitForPropagation(std.testing.io, "_acme-challenge.a.test", "v", 50, 5, .{ .ctx = &never, .probeFn = Probe.probe }));
+    try std.testing.expect(never.calls >= 2);
+}
+
+test "TlsAlpn01Store put/lookup/remove is case-insensitive, bounded, and serves only acme-tls/1 hellos" {
+    var store: TlsAlpn01Store = .{};
+    const kp = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x21)));
+    try std.testing.expect(store.isEmpty());
+    try store.put("irc.example.test", "CERT-A", kp);
+    try store.put("IRC.example.test", "CERT-B", kp); // replaces
+    var lease = store.lookup("irc.EXAMPLE.test") orelse return error.TestUnexpectedResult;
+    defer lease.wipe();
+    try std.testing.expectEqualStrings("CERT-B", lease.certDer());
+    try std.testing.expect(store.lookup("other.test") == null);
+    try std.testing.expectError(error.InvalidDomain, store.put("*.example.test", "C", kp));
+    var big: [acme_challenge.max_tls_alpn01_cert_len + 1]u8 = undefined;
+    try std.testing.expectError(error.CertificateTooLarge, store.put("x.test", &big, kp));
+
+    var name_buf: [16]u8 = undefined;
+    for (1..TlsAlpn01Store.max_entries) |i| try store.put(try std.fmt.bufPrint(&name_buf, "n{d}.test", .{i}), "C", kp);
+    try std.testing.expectError(error.StoreFull, store.put("overflow.test", "C", kp));
+
+    store.remove("IRC.EXAMPLE.TEST");
+    try std.testing.expect(store.lookup("irc.example.test") == null);
+    for (1..TlsAlpn01Store.max_entries) |i| store.remove(try std.fmt.bufPrint(&name_buf, "n{d}.test", .{i}));
+    try std.testing.expect(store.isEmpty());
+    // An empty store never inspects the record.
+    try std.testing.expect(store.selectForClientHello(&.{ 22, 3, 1, 0, 0 }) == null);
+}
+
+/// Minimal canned CA for EffectSink/runSteps tests. `on_post` observes every
+/// POST so a test can assert provisioning happened before validation.
+const SinkMock = struct {
+    const Entry = struct { url: []const u8, status: u16 = 200, body: []const u8, location: ?[]const u8 = null, used: bool = false };
+    entries: []Entry,
+    observer: ?*anyopaque = null,
+    on_post: ?*const fn (observer: *anyopaque, url: []const u8) void = null,
+
+    fn next(self: *SinkMock, url: []const u8) acme.HttpResponse {
+        var last: ?*Entry = null;
+        for (self.entries) |*e| {
+            if (!std.mem.eql(u8, e.url, url)) continue;
+            last = e;
+            if (!e.used) {
+                e.used = true;
+                return .{ .status = e.status, .body = e.body, .nonce = "n", .location = e.location };
+            }
+        }
+        if (last) |e| return .{ .status = e.status, .body = e.body, .nonce = "n", .location = e.location };
+        return .{ .status = 404, .body = "{}", .nonce = "n" };
+    }
+    fn getThunk(ctx: *anyopaque, url: []const u8) anyerror!acme.HttpResponse {
+        const self: *SinkMock = @ptrCast(@alignCast(ctx));
+        return self.next(url);
+    }
+    fn postThunk(ctx: *anyopaque, url: []const u8, _: []const u8) anyerror!acme.HttpResponse {
+        const self: *SinkMock = @ptrCast(@alignCast(ctx));
+        if (self.on_post) |f| f(self.observer.?, url);
+        return self.next(url);
+    }
+    fn transport(self: *SinkMock) acme.Transport {
+        return .{ .ctx = self, .getFn = getThunk, .postJwsFn = postThunk };
+    }
+};
+
+fn sinkFlow(comptime chal_type: []const u8, comptime chal_url: []const u8) [11]SinkMock.Entry {
+    const authz = "{\"status\":\"pending\",\"identifier\":{\"type\":\"dns\",\"value\":\"irc.example.test\"}," ++
+        "\"challenges\":[{\"type\":\"" ++ chal_type ++ "\",\"url\":\"" ++ chal_url ++ "\",\"token\":\"tok1\",\"status\":\"pending\"}]}";
+    const authz_valid = "{\"status\":\"valid\",\"identifier\":{\"type\":\"dns\",\"value\":\"irc.example.test\"},\"challenges\":[]}";
+    const order = "{\"status\":\"pending\",\"identifiers\":[{\"type\":\"dns\",\"value\":\"irc.example.test\"}]," ++
+        "\"authorizations\":[\"https://ca/authz/1\"],\"finalize\":\"https://ca/fin\"}";
+    const order_valid = "{\"status\":\"valid\",\"identifiers\":[{\"type\":\"dns\",\"value\":\"irc.example.test\"}]," ++
+        "\"authorizations\":[\"https://ca/authz/1\"],\"finalize\":\"https://ca/fin\",\"certificate\":\"https://ca/cert\"}";
+    return .{
+        .{ .url = "https://ca/dir", .body = "{\"newNonce\":\"https://ca/nonce\",\"newAccount\":\"https://ca/acct\",\"newOrder\":\"https://ca/order\",\"revokeCert\":\"https://ca/r\",\"keyChange\":\"https://ca/k\"}" },
+        .{ .url = "https://ca/nonce", .body = "" },
+        .{ .url = "https://ca/acct", .status = 201, .body = "{}", .location = "https://ca/acct/1" },
+        .{ .url = "https://ca/order", .status = 201, .body = order, .location = "https://ca/order/1" },
+        .{ .url = "https://ca/authz/1", .body = authz },
+        .{ .url = chal_url, .body = "{}" },
+        .{ .url = "https://ca/authz/1", .body = authz_valid },
+        .{ .url = "https://ca/fin", .body = order },
+        .{ .url = "https://ca/order/1", .body = order_valid },
+        .{ .url = "https://ca/cert", .body = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n" },
+        .{ .url = "unused", .body = "" },
+    };
+}
+
+test "runSteps dns-01: hook add + propagation before validation, del after, cert written" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const Recorder = struct {
+        log: [4][96]u8 = undefined,
+        lens: [4]usize = @splat(0),
+        n: usize = 0,
+        add_before_post: bool = false,
+        fn run(ctx: *anyopaque, action: HookAction, fqdn: []const u8, txt: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const line = try std.fmt.bufPrint(&self.log[self.n], "{s} {s} {s}", .{ @tagName(action), fqdn, txt });
+            self.lens[self.n] = line.len;
+            self.n += 1;
+        }
+        fn onPost(ctx: *anyopaque, url: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, url, "https://ca/chal/d")) self.add_before_post = self.n == 1;
+        }
+    };
+    var rec = Recorder{};
+    var entries = sinkFlow("dns-01", "https://ca/chal/d");
+    var mock = SinkMock{ .entries = &entries, .observer = &rec, .on_post = Recorder.onPost };
+
+    const account = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x31)));
+    const cert_key = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x32)));
+    var account_es = Es256Signer.init(account);
+    var cert_es = Es256Signer.init(cert_key);
+    var client = acme.Acme.init(std.testing.allocator, .{
+        .directory_url = "https://ca/dir",
+        .domains = &.{"irc.example.test"},
+        .signer = account_es.signer(),
+        .cert_signer = cert_es.signer(),
+        .challenge = .dns_01,
+    });
+    defer client.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var sink = EffectSink{
+        .allocator = std.testing.allocator,
+        .io = io,
+        .dir = tmp.dir,
+        .cert_out_path = "chain.pem",
+        .key_out_path = "key.pem",
+        .cert_key = cert_key,
+        .dns = .{ .ctx = &rec, .runFn = Recorder.run },
+        .dns_propagation_delay_ms = 1,
+    };
+    const result = try runSteps(&client, mock.transport(), &sink, 64);
+    try std.testing.expectEqual(acme.State.done, result.state);
+    try std.testing.expect(result.cert_written);
+    try std.testing.expect(rec.add_before_post);
+    try std.testing.expectEqual(@as(usize, 2), rec.n);
+
+    // TXT value = base64url(SHA-256("tok1." ++ JWK thumbprint of the ACCOUNT key)).
+    const sec1 = account.public_key.toUncompressedSec1();
+    var thumb_digest: [32]u8 = undefined;
+    @import("../proto/acme_jwk.zig").thumbprintEc(sec1[1..33].*, sec1[33..65].*, &thumb_digest);
+    var thumb_buf: [64]u8 = undefined;
+    const thumb = std.base64.url_safe_no_pad.Encoder.encode(&thumb_buf, &thumb_digest);
+    var ka_buf: [128]u8 = undefined;
+    const ka = try acme_challenge.keyAuthorization("tok1", thumb, &ka_buf);
+    var txt_buf: [64]u8 = undefined;
+    const txt = try acme_challenge.dns01TxtValue(ka, &txt_buf);
+    var want: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, "add _acme-challenge.irc.example.test {s}", .{txt}), rec.log[0][0..rec.lens[0]]);
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, "del _acme-challenge.irc.example.test {s}", .{txt}), rec.log[1][0..rec.lens[1]]);
+
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, try tmp.dir.readFile(io, "chain.pem", &buf), "-----BEGIN CERTIFICATE-----"));
+    const st = try tmp.dir.statFile(io, "key.pem", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0), st.permissions.toMode() & 0o077);
+}
+
+test "runSteps dns-01: a failing hook add still gets del and aborts before validation" {
+    const Failing = struct {
+        adds: usize = 0,
+        dels: usize = 0,
+        fn run(ctx: *anyopaque, action: HookAction, _: []const u8, _: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (action) {
+                .add => {
+                    self.adds += 1;
+                    return error.HookFailed;
+                },
+                .del => self.dels += 1,
+            }
+        }
+    };
+    var hook = Failing{};
+    var entries = sinkFlow("dns-01", "https://ca/chal/d");
+    var mock = SinkMock{ .entries = &entries };
+    const account = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x41)));
+    const cert_key = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x42)));
+    var account_es = Es256Signer.init(account);
+    var cert_es = Es256Signer.init(cert_key);
+    var client = acme.Acme.init(std.testing.allocator, .{
+        .directory_url = "https://ca/dir",
+        .domains = &.{"irc.example.test"},
+        .signer = account_es.signer(),
+        .cert_signer = cert_es.signer(),
+        .challenge = .dns_01,
+    });
+    defer client.deinit();
+    var sink = EffectSink{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .cert_out_path = "/nonexistent/never-written.pem",
+        .key_out_path = null,
+        .cert_key = cert_key,
+        .dns = .{ .ctx = &hook, .runFn = Failing.run },
+    };
+    try std.testing.expectError(error.HookFailed, runSteps(&client, mock.transport(), &sink, 64));
+    try std.testing.expectEqual(@as(usize, 1), hook.adds);
+    try std.testing.expectEqual(@as(usize, 1), hook.dels);
+    try std.testing.expect(!entries[5].used); // challenge never POSTed
+}
+
+test "runSteps tls-alpn-01: challenge cert is live in the store during validation and gone after" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var store: TlsAlpn01Store = .{};
+    const Observer = struct {
+        store: *TlsAlpn01Store,
+        live_at_post: bool = false,
+        cert_ok: bool = false,
+        fn onPost(ctx: *anyopaque, url: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!std.mem.eql(u8, url, "https://ca/chal/t")) return;
+            var lease = self.store.lookup("irc.example.test") orelse return;
+            defer lease.wipe();
+            self.live_at_post = true;
+            // The leased certificate's SPKI is the leased key (what the TLS
+            // engine checks in leafKeyKindMatches / CertificateVerify).
+            const sec1 = lease.key_pair.public_key.toUncompressedSec1();
+            self.cert_ok = std.mem.indexOf(u8, lease.certDer(), &sec1) != null and
+                std.mem.indexOf(u8, lease.certDer(), &acme_challenge.id_pe_acme_identifier_oid) != null;
+        }
+    };
+    var obs = Observer{ .store = &store };
+    var entries = sinkFlow("tls-alpn-01", "https://ca/chal/t");
+    var mock = SinkMock{ .entries = &entries, .observer = &obs, .on_post = Observer.onPost };
+    const account = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x51)));
+    const cert_key = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x52)));
+    var account_es = Es256Signer.init(account);
+    var cert_es = Es256Signer.init(cert_key);
+    var client = acme.Acme.init(std.testing.allocator, .{
+        .directory_url = "https://ca/dir",
+        .domains = &.{"irc.example.test"},
+        .signer = account_es.signer(),
+        .cert_signer = cert_es.signer(),
+        .challenge = .tls_alpn_01,
+    });
+    defer client.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var sink = EffectSink{
+        .allocator = std.testing.allocator,
+        .io = io,
+        .dir = tmp.dir,
+        .cert_out_path = "chain.pem",
+        .key_out_path = null,
+        .cert_key = cert_key,
+        .tls_alpn01 = &store,
+    };
+    const result = try runSteps(&client, mock.transport(), &sink, 64);
+    try std.testing.expect(result.cert_written);
+    try std.testing.expect(obs.live_at_post);
+    try std.testing.expect(obs.cert_ok);
+    try std.testing.expect(store.isEmpty());
+}
+
+test "runSteps fails closed when the configured challenge has no provisioner" {
+    var entries = sinkFlow("dns-01", "https://ca/chal/d");
+    var mock = SinkMock{ .entries = &entries };
+    const account = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x61)));
+    const cert_key = try ecdsa_p256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x62)));
+    var account_es = Es256Signer.init(account);
+    var cert_es = Es256Signer.init(cert_key);
+    var client = acme.Acme.init(std.testing.allocator, .{
+        .directory_url = "https://ca/dir",
+        .domains = &.{"irc.example.test"},
+        .signer = account_es.signer(),
+        .cert_signer = cert_es.signer(),
+        .challenge = .dns_01,
+    });
+    defer client.deinit();
+    var sink = EffectSink{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .cert_out_path = "/nonexistent/x.pem",
+        .key_out_path = null,
+        .cert_key = cert_key,
+    };
+    try std.testing.expectError(error.Dns01Unavailable, runSteps(&client, mock.transport(), &sink, 64));
+    try std.testing.expect(!entries[5].used);
 }
