@@ -42,6 +42,9 @@ const named_group_secp256r1: u16 = 0x0017;
 const sig_ecdsa_secp256r1_sha256: u16 = 0x0403;
 const sig_rsa_pkcs1_sha256: u16 = 0x0401;
 const sig_rsa_pkcs1_sha384: u16 = 0x0501;
+/// TLS 1.2 SignatureAndHashAlgorithm {sha384, ecdsa} (RFC 5246 §7.4.1.4.1,
+/// RFC 8422 §5.4). Advertised in signature_algorithms, so it must verify.
+const sig_ecdsa_sha384: u16 = 0x0503;
 
 /// RFC 5077 SessionTicket extension type.
 const ext_session_ticket: u16 = 0x0023;
@@ -107,6 +110,12 @@ pub const Error = tls12.Error || ecdh_p256.EcdhError || ecdsa_p256.DerError ||
     NeedMore,
     NoServerCertificate,
     ProtocolVersion,
+    /// RFC 5246 §7.2.1: the server sent close_notify — a clean end of its
+    /// write side, not a failure. The read side is closed (later `decrypt`
+    /// calls return this again) but not failed, and our write side stays
+    /// usable until the caller sends `closeNotify`. A transport EOF without it
+    /// is a possible truncation the application framing must judge.
+    EndOfStream,
     TlsAlert,
     UnknownCa,
     UnsupportedCipherSuite,
@@ -244,6 +253,8 @@ pub const Client = struct {
     receive_record_size_limit: u16 = tls_record.record_size_limit_max12,
     record_size_limit_negotiated: bool = false,
     read_failed: bool = false,
+    /// RFC 5246 §7.2.1: set once the server's close_notify was authenticated.
+    read_closed: bool = false,
     alert_taken: bool = false,
     /// RFC 5246 §7.2.1: set once `closeNotify` produced our close_notify; the
     /// write side is then closed and nothing further is sealed.
@@ -670,6 +681,8 @@ pub const Client = struct {
     pub fn takeAlert(self: *Client, failure: Error) ?[]u8 {
         // RFC 5246 §7.2.1: nothing follows our close_notify on the write side.
         if (self.alert_taken or self.write_closed) return null;
+        // A peer close_notify is a clean closure, never answered with a fatal alert.
+        if (failure == error.EndOfStream) return null;
         const body = tls_record.fatalAlertBytes(failure) orelse return null;
         self.read_failed = true;
         self.alert_taken = true;
@@ -690,7 +703,7 @@ pub const Client = struct {
     /// other fatal alert has been transmitted, each party is required to send
     /// a close_notify alert before closing the write side of the connection",
     /// including in reply to the peer's close_notify (surfaced by `decrypt`
-    /// as `error.TlsAlert`). Afterwards `encrypt`, `takeAlert` and a second
+    /// as `error.EndOfStream`). Afterwards `encrypt`, `takeAlert` and a second
     /// `closeNotify` are refused. `BadState` before the handshake completes or
     /// after a fatal alert was taken; OOM leaves the client unchanged.
     pub fn closeNotify(self: *Client) Error![]u8 {
@@ -704,10 +717,19 @@ pub const Client = struct {
         return record;
     }
 
+    /// RFC 5246 §7.2.1: an authenticated close_notify returns
+    /// `error.EndOfStream` (clean EOF; read side closed, not failed) and later
+    /// calls return it again without consuming input. Any other alert is
+    /// `error.TlsAlert` and fails the read side.
     pub fn decrypt(self: *Client, record: []const u8) Error![]u8 {
         if (self.read_failed or self.state != .connected) return error.BadState;
+        if (self.read_closed) return error.EndOfStream;
         return self.decryptCandidate(record) catch |err| {
-            if (err != error.OutOfMemory) self.read_failed = true;
+            if (err == error.EndOfStream) {
+                self.read_closed = true;
+            } else if (err != error.OutOfMemory) {
+                self.read_failed = true;
+            }
             return err;
         };
     }
@@ -720,7 +742,12 @@ pub const Client = struct {
         if (opened.plaintext.len > tls_record.max_plaintext_len or (self.record_size_limit_negotiated and opened.plaintext.len > self.receive_record_size_limit)) return error.RecordOverflow;
         self.app_read_seq += 1;
         if (opened.content_type == .alert) {
-            _ = tls_alert.parse(opened.plaintext) catch return error.BadRecord;
+            const alert = tls_alert.parse(opened.plaintext) catch return error.BadRecord;
+            // RFC 5246 §7.2.1: close_notify is the clean closure signal; any
+            // other alert (warning or fatal) stays an error for the caller.
+            if (alert.description == .close_notify) {
+                return error.EndOfStream;
+            }
             return error.TlsAlert;
         }
         if (opened.content_type != .application_data) return error.BadHandshake;
@@ -1020,7 +1047,9 @@ pub const Client = struct {
             const path = try verifyChainToTrustAnchorsPath(chain, self.trust_anchors, self.server_name, self.now_unix_seconds);
             if (self.windows_chain_policy) {
                 if (builtin.os.tag != .windows) return error.BadCertificate;
-                try windows_chain_policy.verify(chain, self.server_name);
+                // Windows judges the path the Zig verifier built (leaf, chosen
+                // issuers, anchor), not the raw presented bag.
+                try windows_chain_policy.verify(&path, self.server_name);
             }
             // OCSP/CRL use the leaf's issuer on the validated path, which may
             // be out of wire order or the external anchor itself.
@@ -1289,7 +1318,7 @@ fn writeSignatureAlgorithmsExtension(allocator: Allocator, out: *std.ArrayList(u
     std.mem.writeInt(u16, body[2..4], sig_ecdsa_secp256r1_sha256, .big);
     std.mem.writeInt(u16, body[4..6], sig_rsa_pkcs1_sha256, .big);
     std.mem.writeInt(u16, body[6..8], sig_rsa_pkcs1_sha384, .big);
-    std.mem.writeInt(u16, body[8..10], 0x0503, .big);
+    std.mem.writeInt(u16, body[8..10], sig_ecdsa_sha384, .big);
     try writeExtension(allocator, out, 0x000d, &body);
 }
 
@@ -1429,6 +1458,18 @@ fn verifySignature(key: LeafPublicKey, scheme: u16, msg: []const u8, sig: []cons
             };
             const decoded = try ecdsa_p256.signatureFromDer(sig);
             if (!ecdsa_p256.verify(decoded, msg, pk)) return error.BadSignature;
+        },
+        sig_ecdsa_sha384 => {
+            // TLS 1.2 does not bind the curve to the hash: a P-256 key signs
+            // SHA-384(msg) truncated to 256 bits (SEC 1 v2 §4.1.4 step 3).
+            const pk = switch (key) {
+                .ecdsa_p256 => |pk| pk,
+                else => return error.UnsupportedPublicKey,
+            };
+            const decoded = try ecdsa_p256.signatureFromDer(sig);
+            var digest: [48]u8 = undefined;
+            std.crypto.hash.sha2.Sha384.hash(msg, &digest, .{});
+            if (!ecdsa_p256.verifyPrehashed(decoded, digest[0..ecdsa_p256.prehash_len].*, pk)) return error.BadSignature;
         },
         sig_rsa_pkcs1_sha256 => {
             const pk = switch (key) {
@@ -2805,4 +2846,48 @@ test "TLS 1.2 client closeNotify seals warning close_notify and closes the write
     oom.allocator = a;
     try std.testing.expect(!oom.write_closed);
     a.free(try oom.closeNotify());
+}
+
+test "TLS 1.2 client verifies the {sha384,ecdsa} ServerKeyExchange scheme it advertises (RFC 5246 §7.4.1.4.1)" {
+    const kp = try ecdsa_p256.KeyPair.generateDeterministic(@as([ecdsa_p256.KeyPair.seed_length]u8, @splat(0x63)));
+    const msg = "client_random || server_random || params";
+    const E384 = std.crypto.sign.ecdsa.Ecdsa(std.crypto.ecc.P256, std.crypto.hash.sha2.Sha384);
+    const std_kp = try E384.KeyPair.fromSecretKey(try E384.SecretKey.fromBytes(kp.secret_key.bytes));
+    const sig = try std_kp.sign(msg, null);
+    var der_buf: [E384.Signature.der_encoded_length_max]u8 = undefined;
+    const der = sig.toDer(&der_buf);
+    // Before the fix 0x0503 was offered but rejected as unsupported.
+    try verifySignature(.{ .ecdsa_p256 = kp.public_key }, sig_ecdsa_sha384, msg, der);
+    try std.testing.expectError(error.BadSignature, verifySignature(.{ .ecdsa_p256 = kp.public_key }, sig_ecdsa_secp256r1_sha256, msg, der));
+    try std.testing.expectError(error.BadSignature, verifySignature(.{ .ecdsa_p256 = kp.public_key }, sig_ecdsa_sha384, "tampered", der));
+}
+
+test "TLS 1.2 client: a peer close_notify is a clean EndOfStream, not a failure (RFC 5246 §7.2.1)" {
+    const a = std.testing.allocator;
+    var client = try recordLimitConnectedClient12(a);
+    defer client.deinit();
+    const suite = client.selected_suite.?;
+    const close = try tls12.sealRecordAlloc(a, suite, &client.keys.server_write, 0, .alert, &.{ 1, 0 });
+    defer a.free(close);
+    // Before the fix this was error.TlsAlert with read_failed set.
+    try std.testing.expectError(error.EndOfStream, client.decrypt(close));
+    try std.testing.expect(!client.read_failed);
+    try std.testing.expect(client.read_closed);
+    const late = try tls12.sealRecordAlloc(a, suite, &client.keys.server_write, 1, .application_data, "late");
+    defer a.free(late);
+    try std.testing.expectError(error.EndOfStream, client.decrypt(late));
+    try std.testing.expectEqual(@as(u64, 1), client.app_read_seq);
+    try std.testing.expect(client.takeAlert(error.EndOfStream) == null);
+    a.free(try client.encrypt("bye"));
+    a.free(try client.closeNotify());
+
+    // A warning alert other than close_notify, and a fatal alert, stay errors.
+    for ([_][2]u8{ .{ 1, 90 }, .{ 2, 40 } }) |body| {
+        var other = try recordLimitConnectedClient12(a);
+        defer other.deinit();
+        const rec = try tls12.sealRecordAlloc(a, suite, &other.keys.server_write, 0, .alert, &body);
+        defer a.free(rec);
+        try std.testing.expectError(error.TlsAlert, other.decrypt(rec));
+        try std.testing.expect(other.read_failed);
+    }
 }

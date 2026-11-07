@@ -158,6 +158,14 @@ pub const Error = error{
     NeedMore,
     OutputTooSmall,
     ProtocolVersion,
+    /// RFC 8446 §6.1: the server sent close_notify — a clean end of its write
+    /// side, NOT a failure. The read side is closed (later records are refused
+    /// with this same error; "any data received after a closure alert has been
+    /// received MUST be ignored"), but `read_failed` is not set and the write
+    /// side stays usable until the caller sends its own `closeNotify`. A
+    /// transport EOF without this signal is a possible truncation (§6.1) and
+    /// must be judged by the application's own framing.
+    EndOfStream,
     TlsAlert,
     TranscriptOverflow,
     UnknownCa,
@@ -594,6 +602,9 @@ pub const Client = struct {
     record_size_limit_negotiated: bool = false,
     pre_extensions_max_inner_len: usize = 0,
     read_failed: bool = false,
+    /// RFC 8446 §6.1: set once the server's close_notify was authenticated.
+    /// `decryptApp` then returns `error.EndOfStream` without opening anything.
+    read_closed: bool = false,
     alert_taken: bool = false,
     /// RFC 8446 §6.1: set once `closeNotify` produced our close_notify; the
     /// write side is then closed and nothing further is sealed.
@@ -1218,6 +1229,9 @@ pub const Client = struct {
     pub fn takeAlert(self: *Client, failure: Error) ?[]u8 {
         // RFC 8446 §6.1: nothing follows our close_notify on the write side.
         if (self.alert_taken or self.write_closed) return null;
+        // A peer close_notify is a clean closure, never answered with a fatal
+        // alert (the reply is our own `closeNotify`).
+        if (failure == error.EndOfStream) return null;
         const body = tls_record.fatalAlertBytes(failure) orelse return null;
         self.read_failed = true;
         self.alert_taken = true;
@@ -1245,7 +1259,7 @@ pub const Client = struct {
     /// close_notify alert sealed under the current application traffic key.
     /// "Each party MUST send a close_notify alert before closing its write
     /// side of the connection" — also in response to the peer's close_notify
-    /// (which `decryptApp` reports as `error.TlsAlert` with `last_alert`
+    /// (which `decryptApp` reports as `error.EndOfStream`, with `last_alert`
     /// `.close_notify`). Afterwards `encrypt`, `takeAlert` and a second
     /// `closeNotify` are refused, and a peer KeyUpdate request is no longer
     /// answered. Fails with `BadState` before our Finished is owned or after a
@@ -1285,10 +1299,19 @@ pub const Client = struct {
 
     /// One authenticated record. OOM before admission leaves nonce, fragments,
     /// ticket, key epochs and pending replies unchanged; protocol errors are fatal.
+    /// RFC 8446 §6.1: an authenticated close_notify returns `error.EndOfStream`
+    /// (clean EOF; the read side is closed but not failed) and every later call
+    /// returns it again without consuming input. Any other alert is
+    /// `error.TlsAlert` and fails the read side.
     pub fn decryptApp(self: *Client, record: []const u8) Error!AppRead {
         if (self.read_failed or self.state != .connected) return error.BadState;
+        if (self.read_closed) return error.EndOfStream;
         return self.decryptAppCandidate(record) catch |err| {
-            if (err != error.OutOfMemory) self.read_failed = true;
+            if (err == error.EndOfStream) {
+                self.read_closed = true;
+            } else if (err != error.OutOfMemory) {
+                self.read_failed = true;
+            }
             return err;
         };
     }
@@ -1306,7 +1329,17 @@ pub const Client = struct {
                 return .{ .application_data = opened.content };
             },
             .alert => {
-                self.last_alert = tls_alert.parse(opened.content) catch return error.BadRecord;
+                const alert = tls_alert.parse(opened.content) catch return error.BadRecord;
+                self.last_alert = alert;
+                // RFC 8446 §6.1: close_notify (level ignored, §6) is a clean
+                // closure — unless it splits a fragmented post-handshake
+                // message, which RFC 8446 §5.1 forbids interleaving with any
+                // other record type (unexpected_message).
+                if (alert.description == .close_notify) {
+                    if (self.post_handshake_recv.items.len != 0) return error.BadHandshake;
+                    self.app_read_seq = seq + 1;
+                    return error.EndOfStream;
+                }
                 return error.TlsAlert;
             },
             .handshake => {
@@ -2788,7 +2821,9 @@ pub const Client = struct {
             leaf_issuer_der = path.leafIssuer();
             if (self.windows_chain_policy) {
                 if (builtin.os.tag != .windows) return error.BadCertificate;
-                try windows_chain_policy.verify(chain, self.effectiveVerifyName());
+                // Windows judges the path the Zig verifier built (leaf, chosen
+                // issuers, anchor), not the raw presented bag.
+                try windows_chain_policy.verify(&path, self.effectiveVerifyName());
             }
         }
         {
@@ -9356,4 +9391,55 @@ test "TLS 1.3 client closeNotify OOM leaves the client unchanged" {
     }
     const wire = try client.closeNotify();
     a.free(wire);
+}
+
+test "TLS 1.3 client: a peer close_notify is a clean EndOfStream, not a failure (RFC 8446 §6.1)" {
+    const a = std.testing.allocator;
+    var client = try recordLimitConnectedClient(a, 16385);
+    defer client.deinit();
+    const data = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &client.server_app_keys, 0, .application_data, "body");
+    defer a.free(data);
+    const got = try client.decryptApp(data);
+    a.free(got.application_data);
+    // close_notify (warning level; TLS 1.3 ignores the level).
+    const close = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &client.server_app_keys, 1, .alert, &.{ 1, 0 });
+    defer a.free(close);
+    // Before the fix this was error.TlsAlert with read_failed set.
+    try std.testing.expectError(error.EndOfStream, client.decryptApp(close));
+    try std.testing.expect(!client.read_failed);
+    try std.testing.expect(client.read_closed);
+    try std.testing.expectEqual(tls_alert.AlertDescription.close_notify, client.last_alert.?.description);
+    try std.testing.expectEqual(@as(u64, 2), client.app_read_seq);
+    // Data after the closure alert is ignored: nothing more is opened.
+    const late = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &client.server_app_keys, 2, .application_data, "late");
+    defer a.free(late);
+    try std.testing.expectError(error.EndOfStream, client.decryptApp(late));
+    try std.testing.expectEqual(@as(u64, 2), client.app_read_seq);
+    // A clean close is never answered with a fatal alert...
+    try std.testing.expect(client.takeAlert(error.EndOfStream) == null);
+    // ...the write side stays usable, and our own close_notify follows.
+    a.free(try client.encrypt("bye"));
+    const ours = try client.closeNotify();
+    a.free(ours);
+
+    // A fatal alert is still an error that fails the read side.
+    var fatal = try recordLimitConnectedClient(a, 16385);
+    defer fatal.deinit();
+    const bad = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &fatal.server_app_keys, 0, .alert, &.{ 2, 40 });
+    defer a.free(bad);
+    try std.testing.expectError(error.TlsAlert, fatal.decryptApp(bad));
+    try std.testing.expect(fatal.read_failed);
+    try std.testing.expect(!fatal.read_closed);
+
+    // A close_notify splitting a fragmented post-handshake message is an
+    // interleaving violation (RFC 8446 §5.1), not a clean EOF.
+    var split = try recordLimitConnectedClient(a, 16385);
+    defer split.deinit();
+    const prefix = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &split.server_app_keys, 0, .handshake, &.{ 24, 0, 0 });
+    defer a.free(prefix);
+    _ = try split.decryptApp(prefix);
+    const mid = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &split.server_app_keys, 1, .alert, &.{ 1, 0 });
+    defer a.free(mid);
+    try std.testing.expectError(error.BadHandshake, split.decryptApp(mid));
+    try std.testing.expect(split.read_failed);
 }

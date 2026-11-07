@@ -32,10 +32,74 @@ pub const tcp_tls_mode_sw: i32 = 1;
 pub const crypto_aes_nist_gcm_16: i32 = 25;
 pub const crypto_chacha20_poly1305: i32 = 41;
 pub const tls_major_ver_one: u8 = 3;
+pub const tls_minor_ver_two: u8 = 3;
 pub const tls_minor_ver_three: u8 = 4;
 pub const tls_1_3_iv_len: i32 = 12;
+/// `TLS_AEAD_GCM_LEN`: a TLS 1.2 AES-GCM session carries only the 4-byte
+/// implicit salt (RFC 5288 §3 `GCMNonce.salt`); the 8-byte explicit nonce
+/// travels in each record, and FreeBSD's ktls_frame writes it as the record
+/// sequence number — the same value this engine's TLS 1.2 sender pins.
+pub const tls_1_2_gcm_iv_len: i32 = 4;
+/// `TLS_CHACHA20_IV_LEN`: TLS 1.2 ChaCha20-Poly1305 uses the full 12-byte IV
+/// with the RFC 8446-style XOR nonce (RFC 7905 §2), same as TLS 1.3.
+pub const tls_chacha20_iv_len: i32 = 12;
 
 pub const TlsDirection = enum { tx, rx };
+pub const TlsVersion = enum { tls12, tls13 };
+
+/// Map live traffic material to the userspace `struct tls_enable` FreeBSD's
+/// `ktls_create_session` accepts, validating it the way the kernel does:
+///
+///   * TLS 1.3 (`tls_vminor` 4): the 12-byte static IV for both AEADs.
+///   * TLS 1.2 (`tls_vminor` 3), mirroring the Linux `ktls.tls12CryptoInfo`
+///     split: AES-GCM passes only the 4-byte implicit salt (the key-block
+///     `client/server_write_IV`, RFC 5288 §3); ChaCha20-Poly1305 the full
+///     12-byte fixed IV (RFC 7905 §2).
+///
+/// AES-GCM keys are 16 or 32 bytes, ChaCha20-Poly1305 keys 32. `rec_seq` is
+/// the big-endian next record sequence number (`be64dec` in the kernel). The
+/// returned struct borrows `key` and `iv`. Pure: no syscall, any host.
+pub fn buildTlsEnable(version: TlsVersion, cipher_algorithm: i32, key: []const u8, iv: []const u8, rec_seq: [8]u8) Error!TlsEnable {
+    const want_iv: i32 = switch (cipher_algorithm) {
+        crypto_aes_nist_gcm_16 => switch (version) {
+            .tls12 => tls_1_2_gcm_iv_len,
+            .tls13 => tls_1_3_iv_len,
+        },
+        crypto_chacha20_poly1305 => tls_chacha20_iv_len,
+        else => return error.MissingOp,
+    };
+    if (iv.len != @as(usize, @intCast(want_iv))) return error.MissingOp;
+    const key_ok = switch (cipher_algorithm) {
+        crypto_aes_nist_gcm_16 => key.len == 16 or key.len == 32,
+        crypto_chacha20_poly1305 => key.len == 32,
+        else => false,
+    };
+    if (!key_ok) return error.MissingOp;
+    return .{
+        .cipher_key = key.ptr,
+        .iv = iv.ptr,
+        .auth_key = null,
+        .cipher_algorithm = cipher_algorithm,
+        .cipher_key_len = @intCast(key.len),
+        .iv_len = want_iv,
+        .auth_algorithm = 0,
+        .auth_key_len = 0,
+        .flags = 0,
+        .tls_vmajor = tls_major_ver_one,
+        .tls_vminor = switch (version) {
+            .tls12 => tls_minor_ver_two,
+            .tls13 => tls_minor_ver_three,
+        },
+        .rec_seq = rec_seq,
+    };
+}
+
+/// The big-endian `rec_seq` field for record sequence `seq`.
+pub fn recSeqBytes(seq: u64) [8]u8 {
+    var out: [8]u8 = undefined;
+    std.mem.writeInt(u64, &out, seq, .big);
+    return out;
+}
 
 /// Userspace `struct tls_enable` from FreeBSD 14 `sys/ktls.h`.
 pub const TlsEnable = extern struct {
@@ -60,6 +124,7 @@ comptime {
 }
 
 pub const kernel_tls_anchor: *const @TypeOf(enableKernelTls) = &enableKernelTls;
+pub const kernel_tls12_anchor: *const @TypeOf(enableKernelTls12) = &enableKernelTls12;
 pub const sys_cap_enter: u32 = 516;
 pub const sys_cap_getmode: u32 = 517;
 pub const sys_cap_rights_limit: u32 = 533;
@@ -212,29 +277,35 @@ pub fn enableKernelTls(
     iv: []const u8,
     rec_seq: [8]u8,
 ) Error!void {
+    return installKernelTls(fd, direction, .tls13, cipher_algorithm, key, iv, rec_seq);
+}
+
+/// TLS 1.2 counterpart of `enableKernelTls`. `fixed_iv` is the key-block
+/// write IV: 4 bytes (salt) for AES-GCM, 12 bytes for ChaCha20-Poly1305; see
+/// `buildTlsEnable`. Off FreeBSD, or on any kernel refusal, `MissingOp`.
+pub fn enableKernelTls12(
+    fd: i32,
+    direction: TlsDirection,
+    cipher_algorithm: i32,
+    key: []const u8,
+    fixed_iv: []const u8,
+    rec_seq: [8]u8,
+) Error!void {
+    return installKernelTls(fd, direction, .tls12, cipher_algorithm, key, fixed_iv, rec_seq);
+}
+
+fn installKernelTls(
+    fd: i32,
+    direction: TlsDirection,
+    version: TlsVersion,
+    cipher_algorithm: i32,
+    key: []const u8,
+    iv: []const u8,
+    rec_seq: [8]u8,
+) Error!void {
     if (fd < 0) return error.MissingOp;
-    if (iv.len != tls_1_3_iv_len) return error.MissingOp;
-    const key_ok = switch (cipher_algorithm) {
-        crypto_aes_nist_gcm_16 => key.len == 16 or key.len == 32,
-        crypto_chacha20_poly1305 => key.len == 32,
-        else => false,
-    };
-    if (!key_ok) return error.MissingOp;
+    var enable = try buildTlsEnable(version, cipher_algorithm, key, iv, rec_seq);
     if (comptime builtin.os.tag != .freebsd) return error.MissingOp;
-    var enable = TlsEnable{
-        .cipher_key = key.ptr,
-        .iv = iv.ptr,
-        .auth_key = null,
-        .cipher_algorithm = cipher_algorithm,
-        .cipher_key_len = @intCast(key.len),
-        .iv_len = tls_1_3_iv_len,
-        .auth_algorithm = 0,
-        .auth_key_len = 0,
-        .flags = 0,
-        .tls_vmajor = tls_major_ver_one,
-        .tls_vminor = tls_minor_ver_three,
-        .rec_seq = rec_seq,
-    };
     const opt: i32 = switch (direction) {
         .tx => tcp_txtls_enable,
         .rx => tcp_rxtls_enable,
@@ -562,4 +633,52 @@ test "GAP-X3 FreeBSD kernel TLS fails closed off FreeBSD" {
     std.mem.doNotOptimizeAway(kernel_tls_anchor);
 
     std.debug.print("GAP-X3 branch=freebsd kernel TLS uses TCP_TXTLS_ENABLE and struct tls_enable; this host did not execute setsockopt; windows RIO stays unmet\n", .{});
+}
+
+test "FreeBSD kernel TLS 1.2 mapping: AES-GCM salt-only IV, ChaCha20 full IV (RFC 5288 §3, RFC 7905 §2)" {
+    const key16: [16]u8 = @splat(0x11);
+    const key32: [32]u8 = @splat(0x22);
+    const salt: [4]u8 = .{ 0xa1, 0xa2, 0xa3, 0xa4 };
+    const iv12: [12]u8 = @splat(0x33);
+    const seq = recSeqBytes(0x0102030405060708);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &seq);
+
+    const gcm = try buildTlsEnable(.tls12, crypto_aes_nist_gcm_16, &key16, &salt, seq);
+    try std.testing.expectEqual(@as(i32, 4), gcm.iv_len);
+    try std.testing.expectEqual(@as(?[*]const u8, &salt), gcm.iv);
+    try std.testing.expectEqual(@as(?[*]const u8, &key16), gcm.cipher_key);
+    try std.testing.expectEqual(@as(i32, 16), gcm.cipher_key_len);
+    try std.testing.expectEqual(@as(u8, 3), gcm.tls_vmajor);
+    try std.testing.expectEqual(@as(u8, 3), gcm.tls_vminor); // TLS_MINOR_VER_TWO
+    try std.testing.expectEqual(@as(i32, 0), gcm.auth_algorithm);
+    try std.testing.expectEqual(@as(?[*]const u8, null), gcm.auth_key);
+    try std.testing.expectEqualSlices(u8, &seq, &gcm.rec_seq);
+    const gcm256 = try buildTlsEnable(.tls12, crypto_aes_nist_gcm_16, &key32, &salt, seq);
+    try std.testing.expectEqual(@as(i32, 32), gcm256.cipher_key_len);
+
+    const chacha = try buildTlsEnable(.tls12, crypto_chacha20_poly1305, &key32, &iv12, seq);
+    try std.testing.expectEqual(@as(i32, 12), chacha.iv_len);
+    try std.testing.expectEqual(@as(u8, 3), chacha.tls_vminor);
+
+    // TLS 1.3 keeps the 12-byte static IV for AES-GCM.
+    const gcm13 = try buildTlsEnable(.tls13, crypto_aes_nist_gcm_16, &key16, &iv12, seq);
+    try std.testing.expectEqual(@as(i32, 12), gcm13.iv_len);
+    try std.testing.expectEqual(@as(u8, 4), gcm13.tls_vminor);
+
+    // Wrong IV geometry for the version, bad keys, and unknown ciphers fail.
+    try std.testing.expectError(error.MissingOp, buildTlsEnable(.tls12, crypto_aes_nist_gcm_16, &key16, &iv12, seq));
+    try std.testing.expectError(error.MissingOp, buildTlsEnable(.tls13, crypto_aes_nist_gcm_16, &key16, &salt, seq));
+    try std.testing.expectError(error.MissingOp, buildTlsEnable(.tls12, crypto_chacha20_poly1305, &key32, &salt, seq));
+    try std.testing.expectError(error.MissingOp, buildTlsEnable(.tls12, crypto_chacha20_poly1305, &key16, &iv12, seq));
+    try std.testing.expectError(error.MissingOp, buildTlsEnable(.tls12, crypto_aes_nist_gcm_16, key32[0..24], &salt, seq));
+    try std.testing.expectError(error.MissingOp, buildTlsEnable(.tls12, 0, &key16, &salt, seq));
+
+    // The syscall wrapper validates first, then fails closed off FreeBSD.
+    try std.testing.expectError(error.MissingOp, enableKernelTls12(-1, .tx, crypto_aes_nist_gcm_16, &key16, &salt, seq));
+    try std.testing.expectError(error.MissingOp, enableKernelTls12(0, .rx, crypto_aes_nist_gcm_16, &key16, &iv12, seq));
+    if (comptime builtin.os.tag != .freebsd) {
+        try std.testing.expectError(error.MissingOp, enableKernelTls12(0, .tx, crypto_aes_nist_gcm_16, &key16, &salt, seq));
+        try std.testing.expectError(error.MissingOp, enableKernelTls12(0, .rx, crypto_chacha20_poly1305, &key32, &iv12, seq));
+    }
+    std.mem.doNotOptimizeAway(kernel_tls12_anchor);
 }

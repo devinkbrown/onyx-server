@@ -148,8 +148,10 @@ pub const LinkInfo = struct {
     /// This certificate's own SubjectPublicKeyInfo (the full SEQUENCE).
     spki_der: []const u8,
 
+    /// RFC 5280 §3.2: self-issued when the subject and issuer names match
+    /// under the §7.1 name comparison (`namesEqual`).
     pub fn isSelfIssued(self: LinkInfo) bool {
-        return std.mem.eql(u8, self.subject_der, self.issuer_der);
+        return namesEqual(self.subject_der, self.issuer_der);
     }
 
     pub fn hasSignature(self: LinkInfo) bool {
@@ -232,7 +234,7 @@ pub fn verifySimpleChain(chain_der: []const []const u8) Error!void {
     for (chain_der[1..]) |issuer_der| {
         const issuer = try linkInfo(issuer_der);
         try requireSignature(issuer);
-        if (!std.mem.eql(u8, previous.issuer_der, issuer.subject_der)) {
+        if (!namesEqual(previous.issuer_der, issuer.subject_der)) {
             return error.IssuerMismatch;
         }
         // The child's signature must verify under the issuer's public key.
@@ -506,6 +508,157 @@ pub fn buildServerPath(chain: []const []const u8, anchors: []const []const u8, s
     return search.first_err orelse error.UnknownCa;
 }
 
+/// Most AttributeTypeAndValue entries compared in one (multi-valued) RDN.
+/// Real names carry one; a larger RDN fails the normalized comparison
+/// closed (it can still match byte-for-byte).
+pub const max_rdn_attributes = 8;
+
+/// RFC 5280 §7.1 Name comparison for issuer/subject chaining. Two DER Names
+/// match when byte-identical, or when they have the same RDN sequence and
+/// each RDN the same set of attributes (any order within the SET) whose
+/// types are identical OIDs and whose values match:
+///
+///   * PrintableString / UTF8String (in any combination): RFC 4518 string
+///     preparation, "lite" — for all-ASCII values, case-insensitive with
+///     insignificant space handling (§2.6.1: leading/trailing space dropped,
+///     inner runs collapsed to one space; TAB/LF/VT/FF/CR map to SPACE per
+///     §2.2). A value with any non-ASCII byte is compared exactly.
+///   * any other string type: tag and value byte-identical (§7.1 allows
+///     treating differently-typed values as different strings).
+///
+/// No allocation; every loop is bounded by the input length and
+/// `max_rdn_attributes`. Malformed DER never matches (fail closed).
+pub fn namesEqual(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    return namesEqualNormalized(a, b) catch false;
+}
+
+fn namesEqualNormalized(a: []const u8, b: []const u8) x509.Error!bool {
+    var top_a = x509.DerReader.init(a);
+    const seq_a = try top_a.readExpected(x509.Tag.sequence);
+    try top_a.expectEmpty();
+    var top_b = x509.DerReader.init(b);
+    const seq_b = try top_b.readExpected(x509.Tag.sequence);
+    try top_b.expectEmpty();
+    var rdns_a = try top_a.child(seq_a);
+    var rdns_b = try top_b.child(seq_b);
+    while (rdns_a.hasRemaining()) {
+        if (!rdns_b.hasRemaining()) return false;
+        const set_a = try rdns_a.readExpected(der_set_tag);
+        const set_b = try rdns_b.readExpected(der_set_tag);
+        if (!try rdnsEqual(try rdns_a.child(set_a), try rdns_b.child(set_b))) return false;
+    }
+    return !rdns_b.hasRemaining();
+}
+
+const der_set_tag: u8 = 0x31;
+
+fn rdnsEqual(set_a: x509.DerReader, set_b: x509.DerReader) x509.Error!bool {
+    var avas_a: [max_rdn_attributes]x509.Tlv = undefined;
+    var avas_b: [max_rdn_attributes]x509.Tlv = undefined;
+    const n_a = try collectAvas(set_a, &avas_a);
+    const n_b = try collectAvas(set_b, &avas_b);
+    if (n_a != n_b) return false;
+    var taken: [max_rdn_attributes]bool = @splat(false);
+    outer: for (avas_a[0..n_a]) |ava_a| {
+        for (avas_b[0..n_b], 0..) |ava_b, j| {
+            if (taken[j]) continue;
+            if (try avasEqual(set_a, ava_a, set_b, ava_b)) {
+                taken[j] = true;
+                continue :outer;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+/// RelativeDistinguishedName ::= SET SIZE (1..MAX) OF AttributeTypeAndValue.
+fn collectAvas(set: x509.DerReader, out: *[max_rdn_attributes]x509.Tlv) x509.Error!usize {
+    var r = set;
+    var n: usize = 0;
+    while (r.hasRemaining()) {
+        if (n == out.len) return error.Oversize;
+        out[n] = try r.readExpected(x509.Tag.sequence);
+        n += 1;
+    }
+    if (n == 0) return error.Truncated;
+    return n;
+}
+
+/// AttributeTypeAndValue ::= SEQUENCE { type OID, value ANY }.
+fn avasEqual(parent_a: x509.DerReader, a: x509.Tlv, parent_b: x509.DerReader, b: x509.Tlv) x509.Error!bool {
+    var ra = try parent_a.child(a);
+    var rb = try parent_b.child(b);
+    const oid_a = try ra.readExpected(x509.Tag.oid);
+    const val_a = try ra.readTlv();
+    try ra.expectEmpty();
+    const oid_b = try rb.readExpected(x509.Tag.oid);
+    const val_b = try rb.readTlv();
+    try rb.expectEmpty();
+    if (!std.mem.eql(u8, oid_a.value, oid_b.value)) return false;
+    if (isPreparedStringTag(val_a.tag) and isPreparedStringTag(val_b.tag)) {
+        return preparedStringsEqual(val_a.value, val_b.value);
+    }
+    return val_a.tag == val_b.tag and std.mem.eql(u8, val_a.value, val_b.value);
+}
+
+const der_utf8_string_tag: u8 = 0x0c;
+const der_printable_string_tag: u8 = 0x13;
+
+fn isPreparedStringTag(tag: u8) bool {
+    return tag == der_utf8_string_tag or tag == der_printable_string_tag;
+}
+
+fn preparedStringsEqual(a: []const u8, b: []const u8) bool {
+    if (!isAscii(a) or !isAscii(b)) return std.mem.eql(u8, a, b);
+    var ia: PreparedAscii = .{ .s = a };
+    var ib: PreparedAscii = .{ .s = b };
+    while (true) {
+        const ca = ia.next();
+        const cb = ib.next();
+        if (ca != cb) return false;
+        if (ca == null) return true;
+    }
+}
+
+fn isAscii(s: []const u8) bool {
+    for (s) |c| if (c >= 0x80) return false;
+    return true;
+}
+
+/// RFC 4518 §2.2 (whitespace mapped to SPACE), §2.3 case fold (ASCII), and
+/// §2.6.1 insignificant space handling, streamed one byte at a time.
+const PreparedAscii = struct {
+    s: []const u8,
+    i: usize = 0,
+    started: bool = false,
+    pending_space: bool = false,
+
+    fn isSpace(c: u8) bool {
+        return c == ' ' or (c >= 0x09 and c <= 0x0d);
+    }
+
+    fn next(self: *PreparedAscii) ?u8 {
+        while (self.i < self.s.len) {
+            const c = self.s[self.i];
+            if (isSpace(c)) {
+                self.i += 1;
+                if (self.started) self.pending_space = true;
+                continue;
+            }
+            if (self.pending_space) {
+                self.pending_space = false;
+                return ' ';
+            }
+            self.started = true;
+            self.i += 1;
+            return std.ascii.toLower(c);
+        }
+        return null; // trailing space is insignificant
+    }
+};
+
 const PathSearch = struct {
     chain: []const []const u8,
     anchors: []const []const u8,
@@ -525,7 +678,7 @@ const PathSearch = struct {
 
     /// Name chaining (§6.1.3(a)(4)) plus signature (§6.1.3(a)(1)).
     fn issues(self: *PathSearch, child: LinkInfo, issuer: LinkInfo) bool {
-        if (!std.mem.eql(u8, child.issuer_der, issuer.subject_der)) return false;
+        if (!namesEqual(child.issuer_der, issuer.subject_der)) return false;
         if (!self.spend()) return false;
         verifySignedBy(child, issuer) catch return false;
         return true;
@@ -557,7 +710,7 @@ const PathSearch = struct {
             // whose signature must verify under an anchor key (§6.1.3(a)(1));
             // a self-signed leaf that is itself an anchor passes `issues`.
             const same_identity = tip != 0 and (std.mem.eql(u8, self.chain[cur], anchor_der) or
-                (std.mem.eql(u8, cur_info.subject_der, anchor_info.subject_der) and
+                (namesEqual(cur_info.subject_der, anchor_info.subject_der) and
                     std.mem.eql(u8, cur_info.spki_der, anchor_info.spki_der)));
             if (same_identity) {
                 self.path.certs[tip] = anchor_der;
@@ -1451,10 +1604,14 @@ fn writeAlgEd25519(w: *W) void {
 }
 
 fn writeNameCn(w: *W, cn: []const u8) void {
+    writeNameCnTagged(w, cn, 0x0c); // UTF8String
+}
+
+fn writeNameCnTagged(w: *W, cn: []const u8, tag: u8) void {
     var attr_body: [80]u8 = undefined;
     var ab = W.init(&attr_body);
     ab.tlv(0x06, &[_]u8{ 0x55, 0x04, 0x03 }); // commonName
-    ab.tlv(0x0c, cn); // UTF8String
+    ab.tlv(tag, cn);
     var attr: [96]u8 = undefined;
     var a = W.init(&attr);
     a.tlv(0x30, ab.bytes());
@@ -1602,6 +1759,10 @@ const CertExtOpts = struct {
     extra_oid: []const u8 = &.{},
     extra_critical: bool = false,
     extra_value: []const u8 = &.{},
+    /// DER string tag of the issuer / subject commonName value (UTF8String by
+    /// default; 0x13 PrintableString exercises RFC 5280 §7.1 comparison).
+    issuer_cn_tag: u8 = 0x0c,
+    subject_cn_tag: u8 = 0x0c,
 };
 
 fn writeExtTlv(w: *W, oid: []const u8, ext_value: []const u8) void {
@@ -1707,9 +1868,9 @@ pub fn mintEd25519CertExt(
     tb.tlv(0xa0, vw.bytes());
     tb.tlv(0x02, &[_]u8{ 0x12, 0x34 }); // serial
     writeAlgEd25519(&tb); // signature alg in TBS
-    writeNameCn(&tb, issuer_cn);
+    writeNameCnTagged(&tb, issuer_cn, opts.issuer_cn_tag);
     writeValidity(&tb, nb, na);
-    writeNameCn(&tb, subject_cn);
+    writeNameCnTagged(&tb, subject_cn, opts.subject_cn_tag);
     writeSpkiEd25519(&tb, subject_pub);
 
     var ext_seq_body: [512]u8 = undefined;
@@ -2562,4 +2723,68 @@ test "path building: a path longer than max_path_certs is not built" {
     try std.testing.expectError(error.UnknownCa, buildServerPath(&certs, &.{f.root_r}, "path.test", pb_now));
     // Leaf + 9 CAs anchored at C0 is exactly max_path_certs and is built.
     try expectPath(try buildServerPath(certs[0..depth], &.{certs[depth]}, "path.test", pb_now), certs[0..depth], certs[depth]);
+}
+
+test "RFC 5280 §7.1 namesEqual: PrintableString vs UTF8String, case and insignificant space" {
+    var a_buf: [128]u8 = undefined;
+    var b_buf: [128]u8 = undefined;
+    const Name = struct {
+        fn cn(buf: []u8, value: []const u8, tag: u8) []const u8 {
+            var w = W.init(buf);
+            writeNameCnTagged(&w, value, tag);
+            return w.bytes();
+        }
+    };
+    const ps: u8 = 0x13;
+    const utf8: u8 = 0x0c;
+    const ia5: u8 = 0x16;
+    // Different string types, case and spacing: equal after preparation.
+    try std.testing.expect(namesEqual(Name.cn(&a_buf, "Onyx Test CA", ps), Name.cn(&b_buf, "  onyx   TEST\tca ", utf8)));
+    // Byte-identical is always equal.
+    try std.testing.expect(namesEqual(Name.cn(&a_buf, "x", ia5), Name.cn(&b_buf, "x", ia5)));
+    // Negatives: a different value, inner space removed, a non-prepared type.
+    try std.testing.expect(!namesEqual(Name.cn(&a_buf, "Onyx Test CA", ps), Name.cn(&b_buf, "Onyx Test CB", utf8)));
+    try std.testing.expect(!namesEqual(Name.cn(&a_buf, "Onyx Test CA", ps), Name.cn(&b_buf, "OnyxTest CA", utf8)));
+    try std.testing.expect(!namesEqual(Name.cn(&a_buf, "Onyx", ia5), Name.cn(&b_buf, "Onyx", utf8)));
+    // Non-ASCII UTF-8 is compared exactly (no Unicode case folding).
+    try std.testing.expect(namesEqual(Name.cn(&a_buf, "Caf\xc3\xa9", utf8), Name.cn(&b_buf, "Caf\xc3\xa9", utf8)));
+    try std.testing.expect(!namesEqual(Name.cn(&a_buf, "Caf\xc3\xa9", utf8), Name.cn(&b_buf, "CAF\xc3\xa9", utf8)));
+    // Malformed DER never matches.
+    try std.testing.expect(!namesEqual(&.{ 0x30, 0x05, 0x31 }, &.{ 0x30, 0x05, 0x32 }));
+
+    // Multi-valued RDN: attribute order inside the SET does not matter, but
+    // the RDN sequence and attribute count do.
+    const cn_ava = [_]u8{ 0x30, 0x08, 0x06, 0x03, 0x55, 0x04, 0x03, 0x13, 0x01, 'A' };
+    const o_ava = [_]u8{ 0x30, 0x08, 0x06, 0x03, 0x55, 0x04, 0x0a, 0x0c, 0x01, 'b' };
+    const o_ava_upper = [_]u8{ 0x30, 0x08, 0x06, 0x03, 0x55, 0x04, 0x0a, 0x13, 0x01, 'B' };
+    const cn_ava_lower = [_]u8{ 0x30, 0x08, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x01, 'a' };
+    const multi_1 = [_]u8{ 0x30, 0x16, 0x31, 0x14 } ++ cn_ava ++ o_ava;
+    const multi_2 = [_]u8{ 0x30, 0x16, 0x31, 0x14 } ++ o_ava_upper ++ cn_ava_lower;
+    try std.testing.expect(namesEqual(&multi_1, &multi_2));
+    const two_rdns = [_]u8{ 0x30, 0x18, 0x31, 0x0a } ++ cn_ava ++ [_]u8{ 0x31, 0x0a } ++ o_ava;
+    try std.testing.expect(!namesEqual(&multi_1, &two_rdns));
+    const cn_only = [_]u8{ 0x30, 0x0c, 0x31, 0x0a } ++ cn_ava;
+    try std.testing.expect(!namesEqual(&cn_only, &multi_1));
+    try std.testing.expect(!namesEqual(&cn_only, &two_rdns));
+}
+
+test "RFC 5280 §7.1 path building chains a UTF8String issuer to a PrintableString CA subject" {
+    var root_buf: [1024]u8 = undefined;
+    var leaf_buf: [1024]u8 = undefined;
+    var bad_buf: [1024]u8 = undefined;
+    // Root subject/issuer "Onyx Name CA" as PrintableString.
+    const root = try pbCert(&root_buf, "Onyx Name CA", "Onyx Name CA", 0xb1, 0xb1, pb_na, .{
+        .is_ca = true,
+        .issuer_cn_tag = 0x13,
+        .subject_cn_tag = 0x13,
+    });
+    // Leaf names its issuer as UTF8String with different case and spacing.
+    const leaf = try pbCert(&leaf_buf, " onyx  NAME ca", "path.test", 0xb2, 0xb1, pb_na, .{ .dns_names = &.{"path.test"} });
+    // Before §7.1 comparison this was UnknownCa (byte-different issuer DN).
+    try expectPath(try buildServerPath(&.{leaf}, &.{root}, "path.test", pb_now), &.{leaf}, root);
+    try verifySimpleChain(&.{ leaf, root });
+    // Negative: a genuinely different issuer name, though signed by the same key.
+    const bad = try pbCert(&bad_buf, "Onyx Name CB", "path.test", 0xb2, 0xb1, pb_na, .{ .dns_names = &.{"path.test"} });
+    try std.testing.expectError(error.UnknownCa, buildServerPath(&.{bad}, &.{root}, "path.test", pb_now));
+    try std.testing.expectError(error.IssuerMismatch, verifySimpleChain(&.{ bad, root }));
 }

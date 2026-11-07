@@ -9,6 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const windows = std.os.windows;
 const crypt32 = windows.crypt32;
+const x509_verify = @import("x509_verify.zig");
 
 const max_chain_certs = 32;
 const max_cert_bytes = 256 << 10;
@@ -26,11 +27,31 @@ const ChainContextPrefix = extern struct {
     cChain: u32,
 };
 
+/// The certificates handed to Windows for a pure-Zig `TrustedPath`: the
+/// built path (leaf first, then the issuers the path search chose, in path
+/// order) followed by the anchor that terminated it, unless the path already
+/// ends with that exact anchor. Presented certificates that are not on the
+/// path (extraneous, alternate cross-signs) are not offered, so Windows judges
+/// the same chain the Zig verifier accepted. Empty when `out` is too small.
+pub fn policyCerts(path: *const x509_verify.TrustedPath, out: [][]const u8) []const []const u8 {
+    const certs = path.slice();
+    const tip_is_anchor = certs.len != 0 and std.mem.eql(u8, certs[certs.len - 1], path.anchor);
+    const add_anchor = path.anchor.len != 0 and !tip_is_anchor;
+    const n = certs.len + @intFromBool(add_anchor);
+    if (certs.len == 0 or n > out.len) return out[0..0];
+    @memcpy(out[0..certs.len], certs);
+    if (add_anchor) out[certs.len] = path.anchor;
+    return out[0..n];
+}
+
 /// This is an additional native policy gate, never a substitute for the
-/// existing pure-Zig chain, name, and signature checks. It does not fetch
-/// issuers, roots, or CTLs over the network.
-pub fn verify(chain: []const []const u8, server_name: []const u8) error{BadCertificate}!void {
+/// existing pure-Zig chain, name, and signature checks. It receives the path
+/// the Zig verifier built (`x509_verify.buildServerPath`), not the raw
+/// presented chain. It does not fetch issuers, roots, or CTLs over the network.
+pub fn verify(path: *const x509_verify.TrustedPath, server_name: []const u8) error{BadCertificate}!void {
     if (builtin.os.tag != .windows) return error.BadCertificate;
+    var chain_buf: [max_chain_certs][]const u8 = undefined;
+    const chain = policyCerts(path, &chain_buf);
     if (chain.len == 0 or chain.len > max_chain_certs or
         server_name.len == 0 or server_name.len > max_name_bytes or
         std.mem.indexOfScalar(u8, server_name, 0) != null) return error.BadCertificate;
@@ -126,18 +147,53 @@ fn isIpLiteral(server_name: []const u8) bool {
     return true;
 }
 
+fn testPath(certs: []const []const u8, anchor: []const u8) x509_verify.TrustedPath {
+    var path: x509_verify.TrustedPath = .{ .anchor = anchor };
+    @memcpy(path.certs[0..certs.len], certs);
+    path.len = certs.len;
+    return path;
+}
+
 test "Windows chain policy rejects missing chain and malformed names" {
     if (builtin.os.tag != .windows) return;
     const testing = std.testing;
-    try testing.expectError(error.BadCertificate, verify(&.{}, "example.com"));
-    try testing.expectError(error.BadCertificate, verify(&.{&.{ 0x30, 0x00 }}, ""));
-    try testing.expectError(error.BadCertificate, verify(&.{&.{ 0x30, 0x00 }}, "ex\x00ample.com"));
-    try testing.expectError(error.BadCertificate, verify(&.{&.{ 0x30, 0x00 }}, "\xff"));
+    const bad = [_]u8{ 0x30, 0x00 };
+    const empty = testPath(&.{}, &.{});
+    try testing.expectError(error.BadCertificate, verify(&empty, "example.com"));
+    const one = testPath(&.{&bad}, &.{});
+    try testing.expectError(error.BadCertificate, verify(&one, ""));
+    try testing.expectError(error.BadCertificate, verify(&one, "ex\x00ample.com"));
+    try testing.expectError(error.BadCertificate, verify(&one, "\xff"));
 }
 
 test "Windows chain policy rejects malformed certificate DER" {
     if (builtin.os.tag != .windows) return;
-    try std.testing.expectError(error.BadCertificate, verify(&.{&.{ 0x30, 0x00 }}, "example.com"));
+    const one = testPath(&.{&[_]u8{ 0x30, 0x00 }}, &.{});
+    try std.testing.expectError(error.BadCertificate, verify(&one, "example.com"));
+}
+
+test "Windows chain policy is fed the built path plus its anchor, not the presented chain" {
+    const testing = std.testing;
+    var buf: [max_chain_certs][]const u8 = undefined;
+    // Path leaf -> inter, anchored at an external root: root is appended.
+    const leaf = "leaf";
+    const inter = "inter";
+    const root = "root";
+    const p1 = testPath(&.{ leaf, inter }, root);
+    const got1 = policyCerts(&p1, &buf);
+    try testing.expectEqual(@as(usize, 3), got1.len);
+    try testing.expectEqualStrings(leaf, got1[0]);
+    try testing.expectEqualStrings(inter, got1[1]);
+    try testing.expectEqualStrings(root, got1[2]);
+    // The path tip already IS the configured anchor: not duplicated.
+    const p2 = testPath(&.{ leaf, root }, root);
+    try testing.expectEqual(@as(usize, 2), policyCerts(&p2, &buf).len);
+    // No room, or an empty path: nothing (verify then fails closed).
+    try testing.expectEqual(@as(usize, 0), policyCerts(&p1, buf[0..2]).len);
+    const p3 = testPath(&.{}, root);
+    try testing.expectEqual(@as(usize, 0), policyCerts(&p3, &buf).len);
+    // On non-Windows hosts the gate itself always fails closed.
+    if (builtin.os.tag != .windows) try testing.expectError(error.BadCertificate, verify(&p1, "example.com"));
 }
 
 test "Windows chain policy distinguishes IP literals from DNS names" {

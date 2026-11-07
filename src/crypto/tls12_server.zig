@@ -31,6 +31,12 @@ const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 
 const named_group_secp256r1: u16 = 0x0017;
 const sig_ecdsa_secp256r1_sha256: u16 = 0x0403;
+/// TLS 1.2 SignatureAndHashAlgorithm {sha384(5), ecdsa(3)} (RFC 5246
+/// §7.4.1.4.1, RFC 8422 §5.4); the TLS 1.3 name is ecdsa_secp384r1_sha384 but
+/// in TLS 1.2 the pair does not bind the curve, so it is valid with a P-256 key.
+const sig_ecdsa_sha384: u16 = 0x0503;
+/// TLS 1.2 SignatureAndHashAlgorithm {sha512(6), ecdsa(3)}.
+const sig_ecdsa_sha512: u16 = 0x0603;
 const sig_rsa_pkcs1_sha256: u16 = 0x0401;
 
 /// RFC 5077 SessionTicket extension type.
@@ -1355,11 +1361,11 @@ pub const Server = struct {
         const scheme = self.ske_scheme;
         switch (activeCertificateAuth(self.config) orelse return error.NoSigningKey) {
             .ecdsa_p256 => {
-                if (scheme != sig_ecdsa_secp256r1_sha256) return error.NoCommonSignatureAlgorithms;
-                const sig = ecdsa_p256.sign(signed.items, self.config.ecdsa_p256_signing_key.?) catch return error.BadState;
+                const e = ecdsaSkeDigest(scheme, signed.items) orelse return error.NoCommonSignatureAlgorithms;
+                const sig = ecdsa_p256.signPrehashed(e, self.config.ecdsa_p256_signing_key.?, null) catch return error.BadState;
                 var der_buf: [ecdsa_p256.Signature.der_encoded_length_max]u8 = undefined;
                 const der = try ecdsa_p256.signatureToDer(sig, &der_buf);
-                try appendU16(self.allocator, &out, sig_ecdsa_secp256r1_sha256);
+                try appendU16(self.allocator, &out, scheme);
                 try appendU16(self.allocator, &out, @intCast(der.len));
                 try out.appendSlice(self.allocator, der);
             },
@@ -1690,6 +1696,30 @@ fn activeCertificateAuth(config: Config) ?CertificateAuth {
     return null;
 }
 
+/// The ECDSA-P256 input `e` for a TLS 1.2 ServerKeyExchange signed with
+/// `scheme`: the hash the SignatureAndHashAlgorithm names (RFC 5246
+/// §7.4.1.4.1, RFC 8422 §5.4), truncated to its leftmost 256 bits — the bit
+/// length of the P-256 group order (SEC 1 v2 §4.1.3 step 5, FIPS 186-5 §6.4.1).
+/// Null for any scheme that is not an ECDSA pair this server signs with.
+fn ecdsaSkeDigest(scheme: u16, msg: []const u8) ?[ecdsa_p256.prehash_len]u8 {
+    var e: [ecdsa_p256.prehash_len]u8 = undefined;
+    switch (scheme) {
+        sig_ecdsa_secp256r1_sha256 => std.crypto.hash.sha2.Sha256.hash(msg, &e, .{}),
+        sig_ecdsa_sha384 => {
+            var full: [48]u8 = undefined;
+            std.crypto.hash.sha2.Sha384.hash(msg, &full, .{});
+            e = full[0..ecdsa_p256.prehash_len].*;
+        },
+        sig_ecdsa_sha512 => {
+            var full: [64]u8 = undefined;
+            std.crypto.hash.sha2.Sha512.hash(msg, &full, .{});
+            e = full[0..ecdsa_p256.prehash_len].*;
+        },
+        else => return null,
+    }
+    return e;
+}
+
 const RsaScheme = struct { alg: rsa_verify.HashAlg, pss: bool };
 
 /// The hash (and padding) of an RSA SignatureScheme usable in a TLS 1.2
@@ -1720,7 +1750,9 @@ fn selectSkeScheme(config: Config, sig_algs: ?[]const u8) u16 {
     const offered = sig_algs orelse return 0;
     const auth = activeCertificateAuth(config) orelse return 0;
     const candidates: []const u16 = switch (auth) {
-        .ecdsa_p256 => &.{sig_ecdsa_secp256r1_sha256},
+        // SHA-256 first keeps the historical wire choice; {sha384,ecdsa} and
+        // {sha512,ecdsa} serve clients that list only the larger hashes.
+        .ecdsa_p256 => &.{ sig_ecdsa_secp256r1_sha256, sig_ecdsa_sha384, sig_ecdsa_sha512 },
         // rsa_pkcs1_sha256 first keeps the historical wire choice for clients
         // that offer it; PSS and larger hashes serve clients that do not.
         .rsa => &.{ 0x0401, 0x0804, 0x0501, 0x0805, 0x0601, 0x0806 },
@@ -4665,6 +4697,92 @@ test "tls12 conformance (RFC 5246 §7.4.1.4.1): ServerKeyExchange signs with a s
             defer allocator.free(alert);
             try std.testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, 40 }, alert);
         }
+    }
+}
+
+test "tls12 conformance (RFC 5246 §7.4.1.4.1, RFC 8422 §5.4): ECDSA ServerKeyExchange signs with sha256/sha384/sha512 per signature_algorithms" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const base = [_]u8{
+        0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17, // supported_groups: [secp256r1]
+        0x00, 0x17, 0x00, 0x00, // extended_master_secret
+    };
+    const P256 = std.crypto.ecc.P256;
+    const Case = struct { sigs: []const u8, want: ?u16 };
+    const cases = [_]Case{
+        // Only {sha384,ecdsa}: before the fix this was handshake_failure.
+        .{ .sigs = &.{ 0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x05, 0x03 }, .want = 0x0503 },
+        // Only {sha512,ecdsa}.
+        .{ .sigs = &.{ 0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x06, 0x03 }, .want = 0x0603 },
+        // sha512 and sha384 listed: server preference picks sha384.
+        .{ .sigs = &.{ 0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x06, 0x03, 0x05, 0x03 }, .want = 0x0503 },
+        // sha256 listed after sha384: server preference keeps sha256.
+        .{ .sigs = &.{ 0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x05, 0x03, 0x04, 0x03 }, .want = 0x0403 },
+        // RSA and SHA-1 ECDSA only: nothing this P-256 key signs with.
+        .{ .sigs = &.{ 0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x04, 0x01, 0x02, 0x03 }, .want = null },
+    };
+    for (cases) |case| {
+        var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+        defer server.deinit();
+        const exts = try std.mem.concat(allocator, u8, &.{ &base, case.sigs });
+        defer allocator.free(exts);
+        const ch = try conformanceHello12(allocator, 0x0303, 0x0303, &conformance_ecdsa_suites, &.{0}, exts);
+        defer allocator.free(ch);
+        const want = case.want orelse {
+            try std.testing.expectError(error.NoCommonSignatureAlgorithms, server.feed(ch));
+            continue;
+        };
+        const flight = switch (try server.feed(ch)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer allocator.free(flight);
+        try std.testing.expectEqual(want, server.ske_scheme);
+        var hs_bytes: std.ArrayList(u8) = .empty;
+        defer hs_bytes.deinit(allocator);
+        var pos: usize = 0;
+        while (pos < flight.len) {
+            const rec = (try tls12.completeRecord(flight[pos..])) orelse break;
+            try hs_bytes.appendSlice(allocator, rec.fragment);
+            pos += rec.wire_len;
+        }
+        var off: usize = 0;
+        var found = false;
+        while (off < hs_bytes.items.len) {
+            const msg = try parseHandshake(hs_bytes.items, &off);
+            if (msg.typ != .server_key_exchange) continue;
+            found = true;
+            try std.testing.expectEqual(want, std.mem.readInt(u16, msg.body[69..71], .big));
+            const sig_len = std.mem.readInt(u16, msg.body[71..73], .big);
+            try std.testing.expectEqual(msg.body.len, 73 + @as(usize, sig_len));
+            const der = msg.body[73..];
+            // Independent check with std's generic ECDSA over the named hash
+            // (it truncates the digest to the order's bit length itself).
+            const signed = try std.mem.concat(allocator, u8, &.{ &server.client_random, &server.server_random, msg.body[0..69] });
+            defer allocator.free(signed);
+            const sec1 = fixture.key.public_key.toUncompressedSec1();
+            switch (want) {
+                0x0403 => {
+                    const E = std.crypto.sign.ecdsa.Ecdsa(P256, std.crypto.hash.sha2.Sha256);
+                    try (try E.Signature.fromDer(der)).verify(signed, try E.PublicKey.fromSec1(&sec1));
+                },
+                0x0503 => {
+                    const E = std.crypto.sign.ecdsa.Ecdsa(P256, std.crypto.hash.sha2.Sha384);
+                    try (try E.Signature.fromDer(der)).verify(signed, try E.PublicKey.fromSec1(&sec1));
+                    // ...and it is not a SHA-256 signature mislabelled.
+                    const E256 = std.crypto.sign.ecdsa.Ecdsa(P256, std.crypto.hash.sha2.Sha256);
+                    try std.testing.expect(std.meta.isError((try E256.Signature.fromDer(der)).verify(signed, try E256.PublicKey.fromSec1(&sec1))));
+                },
+                0x0603 => {
+                    const E = std.crypto.sign.ecdsa.Ecdsa(P256, std.crypto.hash.sha2.Sha512);
+                    try (try E.Signature.fromDer(der)).verify(signed, try E.PublicKey.fromSec1(&sec1));
+                },
+                else => unreachable,
+            }
+        }
+        try std.testing.expect(found);
     }
 }
 
