@@ -3555,6 +3555,15 @@ pub const ConnState = struct {
     guest_revision: u64 = 0,
     guest_claim_revision: u64 = 0,
     guest_claim_hlc: u64 = 0,
+    /// Set at Helix adoption for a published legacy (epoch-1, process-local)
+    /// guest id on a node with a durable id space: the first publish retires
+    /// it and re-incarnates the guest under a durable id (publishOrdinaryGuest).
+    guest_legacy_reincarnate: bool = false,
+    /// The quit for this connection's guest presence was authored (QUIT):
+    /// no later refresh may re-incarnate it.
+    guest_quit_authored: bool = false,
+    /// The last publish attempt found no reservable guest id (gauge input).
+    guest_id_unavailable: bool = false,
     host_presentation: HostPresentationIntent = .{},
     // Builtin-only fault seam for the historical encoder failure after an
     // accepted account replacement. The real prior intent remains untouched.
@@ -6569,6 +6578,13 @@ pub const LinuxServer = struct {
     tls_ktls_active: std.atomic.Value(i64) = .init(0),
     /// Subset of `tls_ktls_active` running TLS 1.2.
     tls_ktls12_active: std.atomic.Value(i64) = .init(0),
+    /// Gauge: guests whose last publish found no reservable guest id
+    /// (recomputed by refreshOrdinaryGuests).
+    guest_unpublished_no_id: std.atomic.Value(u64) = .init(0),
+    guest_id_reserve_failures: std.atomic.Value(u64) = .init(0),
+    /// Last durable reservation error logged (rate limit: log on the first
+    /// error, on each change of error, and once on recovery).
+    guest_id_reserve_logged: ?anyerror = null,
     /// Cross-thread ACME signal: the renewal worker sets this only after writing
     /// new cert/key files. Reactor 0 consumes it on the housekeeping tick and
     /// performs the actual live TLS reload, so ACME never mutates listener state.
@@ -8592,6 +8608,8 @@ pub const LinuxServer = struct {
         try self.writeResourceBudgetPrometheus(self.allocator, &out);
         try self.writeSessionCredentialPrometheus(self.allocator, &out);
         try self.writeUpgradeContinuityPrometheus(self.allocator, &out);
+        try writePromGauge(self.allocator, &out, "onyx_guest_presence_unpublished_no_id", "Registered guests left unpublished because no guest id could be reserved (durable issuer refused or not yet active)", self.guest_unpublished_no_id.load(.acquire));
+        try writePromCounter(self.allocator, &out, "onyx_guest_id_reserve_failures_total", "Durable guest-id block reservations the presence issuer refused", self.guest_id_reserve_failures.load(.monotonic));
         const webpush_dropped: usize = if (self.webpush_worker) |worker| worker.dropped.load(.monotonic) else 0;
         try webpush_mod.appendDroppedSample(&out, self.allocator, webpush_dropped);
         var offer_retry_metrics: [offer_retry_reuse.RetryReasonStats.max_render_len]u8 = undefined;
@@ -23148,6 +23166,7 @@ pub const LinuxServer = struct {
         // converge authority and are client-display-deduped at the receiver.
         if (announce and !conn.session_mesh_announce_pending) {
             _ = self.retireOrdinaryGuest(conn);
+            conn.guest_quit_authored = true;
             self.publishWhoisGone(conn, nick);
             self.announceMembership(presence_channel, nick, 0, false, quit_identity, mesh_quit_setter);
         }
@@ -41216,13 +41235,10 @@ pub const LinuxServer = struct {
                 }
                 // The successor charges this row against the SendQ cap of the
                 // class it derives (adoptTlsState); refuse here what it would.
-                const successor_cap: u64 = if (self.successorClassPolicy(e.value)) |policy| policy.sendq else default_sendq_cap;
-                const carried_charge = tlsCarriedCharge(tls_row) orelse {
+                // A charge over the successor's class cap is admitted (see
+                // adoptTlsState); only an unrepresentable one is refused.
+                if (tlsCarriedCharge(tls_row) == null) {
                     skip = "carried TLS SendQ charge overflows (successor would refuse adoption)";
-                    continue;
-                };
-                if (carried_charge > successor_cap) {
-                    skip = "carried TLS SendQ charge exceeds the successor class sendq (successor would refuse adoption)";
                     continue;
                 }
                 tls_blob_version = tls_snapshot.minimalVersion(tls_row);
@@ -47702,6 +47718,8 @@ pub const LinuxServer = struct {
         conn.diagnostics_shard = id.shard;
         conn.overflow_allocator = self.allocator; // backs the SendQ overflow heap
         conn.guest_id = if (guest_relation == .published) snap.guest_incarnation else @splat(0);
+        conn.guest_legacy_reincarnate = guest_relation == .published and
+            self.config.mesh_presence_store_path.len != 0 and isLegacyGuestId(snap.guest_incarnation);
         conn.guest_revision = if (guest_id_present) snap.guest_revision else 0;
         conn.guest_claim_revision = if (guest_id_present) snap.guest_claim_revision else 0;
         conn.guest_claim_hlc = if (guest_id_present) snap.guest_claim_hlc else 0;
@@ -47785,14 +47803,20 @@ pub const LinuxServer = struct {
         class_ctx.is_tls = tls_state != null;
         self.assignConnClassCtx(conn, class_ctx);
         if (snap.flood_guard) |carry| {
-            const derived = conn.flood_guard orelse {
-                self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                return self.rejectAdopt(.flood_guard_missing, null);
-            };
-            conn.flood_guard = flood_guard.FloodGuard.importCarry(derived.config, now, carry) catch |adopt_err| {
-                self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
-                return self.rejectAdopt(.flood_guard_import, adopt_err);
-            };
+            // A carried guard is restored only under a policy the successor
+            // derives for this connection. A class without a guard (exempt or
+            // disabled: e.g. a user who became oper via IDENTIFY without a
+            // class re-match in 0.11.0) is strictly more permissive, so the
+            // carry is dropped. A different enabled policy (REHASH, class
+            // move) retunes the exact carried state like a live REHASH does,
+            // clamping tokens without pardoning or double-charging. Only a
+            // malformed carry refuses; a policy mismatch never aborts.
+            if (conn.flood_guard) |derived| {
+                conn.flood_guard = adoptFloodCarry(derived.config, now, carry) catch |adopt_err| {
+                    self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
+                    return self.rejectAdopt(.flood_guard_import, adopt_err);
+                };
+            }
         } else if (comptime builtin.os.tag == .windows) {
             if (self.config.native_adopt_barrier != null and conn.flood_guard != null) {
                 self.rollbackInheritedClientBeforeRecv(id, snap.fd, close_fd_on_failure);
@@ -48036,16 +48060,31 @@ pub const LinuxServer = struct {
         const carried = conn.session.snapshot();
         if (inheritedGuestRelation(conn.guest_id, conn.guest_revision, conn.guest_claim_revision, conn.guest_claim_hlc, carried.account, carried.nick) == .invalid)
             return "guest incarnation metadata is inconsistent (successor would refuse adoption)";
+        // The successor drops a carry its class has no guard for and retunes
+        // one under a different policy (adoptFloodCarry); only a carry that is
+        // malformed under its own policy is refused.
         if (flood_carry) |carry| {
-            const policy = self.successorClassPolicy(conn) orelse
-                return "flood-guard state but no connection class in the successor (successor would refuse adoption)";
-            const derived = policy.floodGuardConfig();
-            if (!derived.enabled)
-                return "flood-guard state but the successor class has no flood guard (successor would refuse adoption)";
-            _ = flood_guard.FloodGuard.importCarry(derived, self.nowMs(), carry) catch
-                return "flood-guard state does not match the successor class policy (successor would refuse adoption)";
+            if (self.successorClassPolicy(conn)) |policy| {
+                const derived = policy.floodGuardConfig();
+                if (derived.enabled) _ = adoptFloodCarry(derived, self.nowMs(), carry) catch
+                    return "flood-guard state is malformed (successor would refuse adoption)";
+            }
         }
         return null;
+    }
+
+    /// Restore a carried flood-guard image under the successor's derived
+    /// policy: exact import when the policies match, otherwise import under
+    /// the carried policy and retune to the derived one (REHASH semantics).
+    fn adoptFloodCarry(derived: flood_guard.GuardConfig, now: i64, carry: flood_guard.CarryState) flood_guard.CarryError!flood_guard.FloodGuard {
+        return flood_guard.FloodGuard.importCarry(derived, now, carry) catch |err| switch (err) {
+            error.PolicyMismatch => {
+                var guard = try flood_guard.FloodGuard.importCarry(carry.policy, now, carry);
+                guard.reconfigure(derived);
+                return guard;
+            },
+            else => return err,
+        };
     }
 
     /// The physical SendQ bytes a carried TLS row charges on adoption: queued
@@ -48065,7 +48104,13 @@ pub const LinuxServer = struct {
         tls_snapshot.validate(ts) catch |e| return self.rejectAdopt(.tls_snapshot_invalid, e);
         if (ts.fd != conn.fd) return self.rejectAdopt(.tls_fd_mismatch, null);
         const charged = tlsCarriedCharge(ts) orelse return self.rejectAdopt(.tls_charge_overflow, null);
-        if (charged > conn.sendq_cap) return self.rejectAdopt(.tls_sendq_cap, null);
+        // The predecessor queued this legitimately under its own cap
+        // (prepareCapture checked it). A smaller successor class (an oper the
+        // successor demotes, a REHASH) must not abort the whole adopt: admit
+        // the carried backlog by raising the cap for this commit only. The
+        // final class assignment restores the class cap, so the over-cap
+        // backlog drains and every new append is bounded by the new policy.
+        if (charged > conn.sendq_cap) conn.sendq_cap = charged;
         const tail_charge: usize = @intCast(ts.deferred_ciphertext_charge);
         const t = self.allocator.create(tls_conn.TlsConn) catch |e| return self.rejectAdopt(.tls_engine_alloc, e);
         const cfg12: ?tls12_server.Config = if (self.config.tls12_cert_chain.len != 0 and
@@ -72862,7 +72907,18 @@ pub const LinuxServer = struct {
             if (self.guest_block_next == self.guest_block_end or self.guest_block_epoch != durable.metadata.epoch) {
                 const ident = self.config.node_identity orelse return null;
                 const floor: u64 = if (durable.metadata.epoch == 1) legacy_guest_counter_floor else 0;
-                const first = durable.reserveSubjectBlock(&ident.sign_kp, guest_block_len, floor) catch return null;
+                const first = durable.reserveSubjectBlock(&ident.sign_kp, guest_block_len, floor) catch |err| {
+                    _ = self.guest_id_reserve_failures.fetchAdd(1, .monotonic);
+                    if (self.guest_id_reserve_logged == null or self.guest_id_reserve_logged.? != err) {
+                        self.guest_id_reserve_logged = err;
+                        srvLog("onyx-server: guest presence — durable guest id reservation failed ({s}); new guests stay unpublished until it succeeds\n", .{@errorName(err)});
+                    }
+                    return null;
+                };
+                if (self.guest_id_reserve_logged) |_| {
+                    self.guest_id_reserve_logged = null;
+                    srvLog("onyx-server: guest presence — durable guest id reservation recovered\n", .{});
+                }
                 self.guest_block_epoch = first.epoch;
                 self.guest_block_next = first.counter;
                 self.guest_block_end = first.counter + guest_block_len;
@@ -72877,10 +72933,81 @@ pub const LinuxServer = struct {
         return .{ .epoch = 1, .counter = counter };
     }
 
+    /// A guest id from the pre-durable process-local space: epoch 1 with a
+    /// counter below the durable epoch-1 floor.
+    fn isLegacyGuestId(id: [16]u8) bool {
+        const parts = mesh_presence_v2.subject(id) catch return false;
+        return parts.epoch == 1 and parts.counter <= legacy_guest_counter_floor;
+    }
+
+    fn clearGuestIncarnation(conn: *ConnState) void {
+        conn.guest_id = @splat(0);
+        conn.guest_revision = 0;
+        conn.guest_claim_revision = 0;
+        conn.guest_claim_hlc = 0;
+    }
+
+    /// Author a QUIT for a carried published incarnation from the carried
+    /// revision fields alone (the successor holds no retained record). Best
+    /// effort: a peer holding a higher revision keeps its newer record.
+    fn retireCarriedGuestIncarnation(self: *LinuxServer, auth: *guest_presence_route.Authority, conn: *const ConnState) void {
+        const ident = self.config.node_identity orelse return;
+        const revision = mesh_presence_v2.nextRevision(conn.guest_revision) catch return;
+        const now = self.guestNowMs();
+        const expires = std.math.add(i64, now, guest_presence_lease_ms) catch return;
+        const identity = membershipIdentityOf(conn);
+        const record: mesh_presence_v2.Record = .{
+            .operation = .quit,
+            .origin = ident.sign_kp.public_key,
+            .guest = conn.guest_id,
+            .revision = revision,
+            .routing_class = .true_guest,
+            .class_revision = 1,
+            .claim_hlc = conn.guest_claim_hlc,
+            .claim_revision = conn.guest_claim_revision,
+            .issued_ms = now,
+            .expires_ms = expires,
+            .nick = conn.session.displayName(),
+            .username = identity.username,
+            .host = identity.host,
+            .realname = identity.realname,
+            .server = self.serverName(),
+            .description = self.config.server_description,
+        };
+        var buffer: [mesh_presence_v2.max_wire_len]u8 = undefined;
+        const encoded = mesh_presence_v2.encode(record, &ident.sign_kp, &buffer) catch return;
+        const roots = self.presenceApprovalRoots(null) catch return;
+        defer self.allocator.free(roots);
+        _ = auth.admit(encoded, roots, now, 0, true) catch {};
+    }
+
     fn publishOrdinaryGuest(self: *LinuxServer, conn: *ConnState, drive: bool) void {
         if (!self.ordinaryGuestEligible(conn)) return;
         const ident = self.config.node_identity orelse return;
         const auth = self.ensureGuestAuthority() catch return;
+        const live = !conn.closing and !conn.guest_quit_authored;
+        // A published legacy epoch-1 id carried across Helix cannot be renewed
+        // safely: the successor's route authority is empty, so it republishes
+        // at revision 1 under a counter 0.11.0 may have reissued and a peer
+        // may hold at a higher revision or as QUIT (obsolete forever). Retire
+        // it best-effort at the next revision and re-incarnate the guest under
+        // a durable id. Peers drop the old subject; DMs addressed to the old
+        // id resolve terminal, nick-addressed traffic follows the new record.
+        if (conn.guest_legacy_reincarnate) {
+            conn.guest_legacy_reincarnate = false;
+            if (live and conn.guest_revision != 0) {
+                self.retireCarriedGuestIncarnation(auth, conn);
+                clearGuestIncarnation(conn);
+            }
+        }
+        // A live connection whose own published record is retained as QUIT
+        // (a 0.11.0-reissued holder of the same id disconnected) can never be
+        // renewed: re-incarnate instead of going silent forever.
+        if (live and conn.guest_revision != 0) {
+            if (auth.retainedByGuest(ident.sign_kp.public_key, conn.guest_id)) |kept| {
+                if (kept.operation == .quit) clearGuestIncarnation(conn);
+            }
+        }
         // An incarnation whose presence this connection never got admitted
         // (guest_revision == 0) owns nothing. A retained record under it is
         // another guest's (an id reused across a Helix by 0.11.0), so it is
@@ -72890,8 +73017,10 @@ pub const LinuxServer = struct {
         {
             conn.guest_id = self.reserveFreshGuestId(auth, ident.sign_kp.public_key) orelse {
                 conn.guest_id = @splat(0);
+                conn.guest_id_unavailable = true;
                 return;
             };
+            conn.guest_id_unavailable = false;
         }
         // The id is committed only together with an admitted presence record:
         // any early return below leaves an unpublished connection with no
@@ -72959,12 +73088,16 @@ pub const LinuxServer = struct {
     }
 
     fn refreshOrdinaryGuests(self: *LinuxServer) void {
+        var unpublished: u64 = 0;
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
                 if (!slot.occupied) continue;
                 self.publishOrdinaryGuest(&slot.value, false);
+                if (slot.value.guest_id_unavailable and std.mem.allEqual(u8, &slot.value.guest_id, 0) and
+                    self.ordinaryGuestEligible(&slot.value)) unpublished += 1;
             }
         }
+        self.guest_unpublished_no_id.store(unpublished, .release);
     }
 
     fn retireOrdinaryGuest(self: *LinuxServer, conn: *const ConnState) bool {
@@ -187345,6 +187478,8 @@ const HelixAdoptOutcome = struct {
     adopted: bool,
     reason: Server.AdoptReject,
     guest_serial: u64 = 0,
+    sendq_cap: usize = 0,
+    backlog: u64 = 0,
 };
 
 /// Real predecessor seal -> exact successor adoption of the fixture client.
@@ -187381,6 +187516,8 @@ fn helixSealThenAdoptForTest(fixture: *HelixAdoptTlsFixture) !HelixAdoptOutcome 
         var it = successor.reactors[0].clients.iterator();
         const adopted = it.next().?.value;
         try std.testing.expect(adopted.tls != null);
+        outcome.sendq_cap = adopted.sendq_cap;
+        outcome.backlog = sendq.backlog(adopted);
         // A published incarnation is kept; an unpublished one is dropped so
         // the first publish reserves a fresh (durable) id.
         const relation = Server.inheritedGuestRelation(snap.guest_incarnation, snap.guest_revision, snap.guest_claim_revision, snap.guest_claim_hlc, snap.account, snap.nick);
@@ -187510,17 +187647,21 @@ const GuestPublishFixtureForTest = struct {
     /// Admit a record under this node's origin, as an earlier incarnation of
     /// the process (or a peer replay) would have left it retained.
     fn retain(self: *@This(), counter: u64, operation: mesh_presence_v2.Operation, nick: []const u8) !void {
+        return self.retainAt(counter, operation, nick, 2, 1, 1);
+    }
+
+    fn retainAt(self: *@This(), counter: u64, operation: mesh_presence_v2.Operation, nick: []const u8, revision: u64, claim_revision: u64, claim_hlc: u64) !void {
         const now = self.server.guestNowMs();
         var buffer: [mesh_presence_v2.max_wire_len]u8 = undefined;
         const encoded = try mesh_presence_v2.encode(.{
             .operation = operation,
             .origin = self.identity.sign_kp.public_key,
             .guest = try mesh_presence_v2.guestId(.{ .epoch = 1, .counter = counter }),
-            .revision = 2,
+            .revision = revision,
             .routing_class = .true_guest,
             .class_revision = 1,
-            .claim_hlc = 1,
-            .claim_revision = 1,
+            .claim_hlc = claim_hlc,
+            .claim_revision = claim_revision,
             .issued_ms = now,
             .expires_ms = now + 60_000,
             .nick = nick,
@@ -187878,7 +188019,7 @@ test "Helix adopt: a carried unpublished id that a peer retired is replaced by a
     try std.testing.expectEqualStrings("Ariadne", seen.nick);
 }
 
-test "Helix adopt: the seal pre-check uses the successor's oper projection, not a password OPER's live class" {
+test "Helix adopt: a password OPER's TLS backlog over the successor user cap is admitted, not refused" {
     defer current_reactor = null;
     var builder = conn_class.Builder.init(std.testing.allocator);
     try builder.add(.{ .name = "opers", .policy = .{ .sendq = 8 << 20, .flood_exempt = true }, .oper_only = true });
@@ -187902,6 +188043,207 @@ test "Helix adopt: the seal pre-check uses the successor's oper projection, not 
     try rawAppendToConn(conn, backlog);
     const outcome = try helixSealThenAdoptForTest(&fixture);
     try std.testing.expectEqual(@as(usize, 1), outcome.expected);
-    try std.testing.expectEqual(@as(usize, 0), outcome.sealed);
-    try std.testing.expect(conn.fd >= 0 and conn.tls != null);
+    try std.testing.expectEqual(@as(usize, 1), outcome.sealed);
+    try std.testing.expectEqual(Server.AdoptReject.none, outcome.reason);
+    try std.testing.expect(outcome.adopted);
+    // The successor's class cap governs new appends; the carried backlog drains.
+    try std.testing.expectEqual(@as(usize, 64 << 10), outcome.sendq_cap);
+    try std.testing.expect(outcome.backlog >= 100 << 10);
+}
+
+test "Helix adopt: a user-class flood guard carried for an account the successor makes oper is dropped, not refused" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    // eshmaki shape: [class.opers] match_oper flood_exempt; [class.user]
+    // flood_lines = 120; [[opers]] binds the account.
+    var builder = conn_class.Builder.init(a);
+    try builder.add(.{ .name = "opers", .policy = .{ .sendq = 8 << 20, .flood_exempt = true }, .oper_only = true });
+    try builder.add(.{ .name = "user", .policy = .{ .sendq = 1 << 20, .flood_lines = 120, .flood_window_ms = 10_000, .flood_excess = 200, .flood_targets = 30 } });
+    var registry = try builder.finish();
+    defer registry.deinit();
+    const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .oper_registry = oper_mod.OperRegistry.init(&test_oper_bindings) catch unreachable });
+    defer {
+        server.deinit();
+        a.destroy(server);
+    }
+    server.config.class_registry = registry;
+    defer server.config.class_registry = null;
+    current_reactor = &server.reactors[0];
+    // 0.11.0 predecessor: registered without SASL (class user, guard live),
+    // then IDENTIFY elevated to oper without a class re-match, so it sealed
+    // the user-class guard.
+    var guard = flood_guard.FloodGuard.init(registry.byName("user").?.policy.floodGuardConfig(), server.nowMs());
+    _ = guard.classifyRaw(server.nowMs(), "PRIVMSG #room :hello\r\n");
+    const carry = try guard.exportCarry();
+    const sockets = try sameIPTestSocketPair();
+    defer closeFd(sockets[1]);
+    try std.testing.expect(server.adoptInheritedClient(.{ .nick = "Kain", .realname = "K", .username = "kain", .account = "admin", .logged_in = true, .fd = sockets[0], .flood_guard = carry }, null, null, false));
+    try std.testing.expectEqual(Server.AdoptReject.none, server.adopt_reject);
+    var it = server.reactors[0].clients.iterator();
+    const adopted = it.next().?.value;
+    try std.testing.expect(adopted.session.isOper());
+    try std.testing.expect(adopted.flood_guard == null);
+    try std.testing.expectEqual(@as(usize, 8 << 20), adopted.sendq_cap);
+    // The predecessor mirror no longer refuses this client either.
+    try std.testing.expect(server.sealAdoptionRefusal(adopted, carry) == null);
+}
+
+test "Helix adopt: a carried flood guard under a different enabled policy is retuned, not refused" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var builder = conn_class.Builder.init(a);
+    try builder.add(.{ .name = "user", .policy = .{ .flood_lines = 60, .flood_window_ms = 10_000 } });
+    var registry = try builder.finish();
+    defer registry.deinit();
+    const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0 });
+    defer {
+        server.deinit();
+        a.destroy(server);
+    }
+    server.config.class_registry = registry;
+    defer server.config.class_registry = null;
+    current_reactor = &server.reactors[0];
+    const old_policy: conn_class.Policy = .{ .flood_lines = 120, .flood_window_ms = 10_000 };
+    var guard = flood_guard.FloodGuard.init(old_policy.floodGuardConfig(), server.nowMs());
+    var sent: usize = 0;
+    while (sent < 100) : (sent += 1) _ = guard.classifyRaw(server.nowMs(), "JOIN #room\r\n");
+    const carry = try guard.exportCarry();
+    const sockets = try sameIPTestSocketPair();
+    defer closeFd(sockets[1]);
+    try std.testing.expect(server.adoptInheritedClient(.{ .nick = "Rehashed", .realname = "R", .username = "r", .fd = sockets[0], .flood_guard = carry }, null, null, false));
+    var it = server.reactors[0].clients.iterator();
+    const adopted = it.next().?.value;
+    const live = adopted.flood_guard orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.meta.eql(live.config, registry.byName("user").?.policy.floodGuardConfig()));
+    // Spent credit is clamped into the new policy, never pardoned.
+    try std.testing.expect(live.snapshot().command_tokens <= guard.snapshot().command_tokens);
+}
+
+test "Helix adopt: a live guest whose own record is retained as QUIT re-incarnates instead of going silent" {
+    defer current_reactor = null;
+    var fixture = try GuestPublishFixtureForTest.create();
+    defer fixture.deinit();
+    const conn = try fixture.guest("Ariadne", "Helix guest");
+    fixture.server.publishOrdinaryGuest(conn, false);
+    try std.testing.expect(conn.guest_revision != 0);
+    const shared = conn.guest_id;
+    const counter = (try mesh_presence_v2.subject(shared)).counter;
+    // A 0.11.0-reissued holder of the same id renewed it under its nick
+    // (new claim) and then disconnected: QUIT at the next revision.
+    const claim = fixture.server.nextMeshHlc();
+    try fixture.retainAt(counter, .present, "Reissued", 2, 2, claim);
+    try fixture.retainAt(counter, .quit, "Reissued", 3, 2, claim);
+    try std.testing.expectEqual(mesh_presence_v2.Operation.quit, fixture.server.guest_presence.?.retainedByGuest(fixture.identity.sign_kp.public_key, shared).?.operation);
+    fixture.server.publishOrdinaryGuest(conn, false);
+    try std.testing.expect(!std.mem.eql(u8, &shared, &conn.guest_id));
+    try std.testing.expect(conn.guest_revision != 0);
+    const auth = fixture.server.guest_presence.?;
+    const live = auth.liveByGuest(fixture.identity.sign_kp.public_key, conn.guest_id, fixture.server.guestNowMs()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Ariadne", live.nick);
+    // A connection whose own quit was authored is never re-incarnated.
+    const leaving = try fixture.guest("Leaving", "Leaving guest");
+    fixture.server.publishOrdinaryGuest(leaving, false);
+    const leaving_id = leaving.guest_id;
+    try fixture.retainAt((try mesh_presence_v2.subject(leaving_id)).counter, .quit, "Leaving", leaving.guest_revision + 1, leaving.guest_claim_revision, leaving.guest_claim_hlc);
+    leaving.guest_quit_authored = true;
+    fixture.server.publishOrdinaryGuest(leaving, false);
+    try std.testing.expectEqualSlices(u8, &leaving_id, &leaving.guest_id);
+}
+
+test "Helix adopt: an adopted legacy epoch-1 published id is retired and re-incarnated in the durable id space" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const store_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/presence.wal", .{tmp.sub_path});
+    var ident = try node_identity.fromSeed(@splat(0xB4), "legacy-guest-reincarnate-test");
+    defer ident.deinit();
+    const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .node_identity = &ident, .node_id = ident.shortId(), .crypto_io = std.testing.io, .mesh_presence_store_path = store_path });
+    defer {
+        server.deinit();
+        a.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+    const origin = ident.sign_kp.public_key;
+    const roots = [_][32]u8{origin};
+    const now = server.guestNowMs();
+    const legacy = try mesh_presence_v2.guestId(.{ .epoch = 1, .counter = 3 });
+    // A peer holds the predecessor's present record for (1,3) at revision 2.
+    const peer = try guest_presence_route.Authority.create(a);
+    defer peer.destroy();
+    var buffer: [mesh_presence_v2.max_wire_len]u8 = undefined;
+    _ = try peer.admit(try mesh_presence_v2.encode(.{
+        .operation = .present,
+        .origin = origin,
+        .guest = legacy,
+        .revision = 2,
+        .routing_class = .true_guest,
+        .class_revision = 1,
+        .claim_hlc = 5,
+        .claim_revision = 2,
+        .issued_ms = now,
+        .expires_ms = now + 60_000,
+        .nick = "Ariadne",
+        .username = "ariadne",
+        .host = "old.host",
+        .realname = "Helix guest",
+        .server = "here.example",
+        .description = "",
+    }, &ident.sign_kp, &buffer), &roots, now, 7, false);
+    const sockets = try sameIPTestSocketPair();
+    defer closeFd(sockets[1]);
+    try std.testing.expect(server.adoptInheritedClient(.{ .nick = "Ariadne", .realname = "Helix guest", .username = "ariadne", .fd = sockets[0], .guest_incarnation = legacy, .guest_revision = 2, .guest_claim_revision = 2, .guest_claim_hlc = 5 }, null, null, false));
+    var it = server.reactors[0].clients.iterator();
+    const conn = it.next().?.value;
+    try std.testing.expect(conn.guest_legacy_reincarnate);
+    conn.session.registration.registered = true;
+    server.publishOrdinaryGuest(conn, false);
+    const fresh = try mesh_presence_v2.subject(conn.guest_id);
+    try std.testing.expectEqual(server.durable_guest_presence.?.metadata.epoch, fresh.epoch);
+    try std.testing.expect(!std.mem.eql(u8, &legacy, &conn.guest_id));
+    // The old subject was retired at the next revision and peers accept it.
+    const auth = server.guest_presence.?;
+    const retired = auth.retainedByGuest(origin, legacy) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(mesh_presence_v2.Operation.quit, retired.operation);
+    try std.testing.expectEqual(@as(u64, 3), retired.revision);
+    try std.testing.expectEqual(guest_presence_route.Disposition.updated, try peer.admit(retired.wire, &roots, now, 7, false));
+    const published = auth.retainedByGuest(origin, conn.guest_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(guest_presence_route.Disposition.inserted, try peer.admit(published.wire, &roots, now, 7, false));
+}
+
+test "Helix adopt: a refused durable guest-id reservation is logged, counted and gauged until it recovers" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const store_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/presence.wal", .{tmp.sub_path});
+    var ident = try node_identity.fromSeed(@splat(0xB5), "guest-reserve-failure-test");
+    defer ident.deinit();
+    const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .node_identity = &ident, .node_id = ident.shortId(), .crypto_io = std.testing.io, .mesh_presence_store_path = store_path });
+    defer {
+        server.deinit();
+        a.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+    const id = try addTestLocalClient(server, "Stuck", null);
+    const conn = server.connFor(id).?;
+    conn.session.restore(.{ .nick = "Stuck", .username = "stuck", .realname = "Stuck guest" });
+    conn.session.registration.registered = true;
+    server.durable_guest_presence.?.local_authoring_disabled = true;
+    server.refreshOrdinaryGuests();
+    try std.testing.expect(std.mem.allEqual(u8, &conn.guest_id, 0));
+    try std.testing.expectEqual(@as(u64, 1), server.guest_unpublished_no_id.load(.acquire));
+    try std.testing.expect(server.guest_id_reserve_failures.load(.monotonic) >= 1);
+    try std.testing.expectEqual(@as(?anyerror, error.AuthoringDisabled), server.guest_id_reserve_logged);
+    server.durable_guest_presence.?.local_authoring_disabled = false;
+    server.refreshOrdinaryGuests();
+    try std.testing.expect(conn.guest_revision != 0);
+    try std.testing.expectEqual(@as(u64, 0), server.guest_unpublished_no_id.load(.acquire));
+    try std.testing.expect(server.guest_id_reserve_logged == null);
 }
