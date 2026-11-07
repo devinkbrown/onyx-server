@@ -26,12 +26,29 @@ substitutes for this table.
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.10.2+6ad83624e1a1` | `0.10.2+6ad83624e1a1` |
-| Executable SHA-256 | `f96c483ba99058ddf56c61364b2c1da28a6f893672bf34eee044f5ec6e90ec8e` | same |
-| Process ID at acceptance | `40047` | `2975020` |
+| Running image | `0.10.3+04beb65db4a0` | `0.10.3+04beb65db4a0` |
+| Executable SHA-256 | `fda55aaa57d9b84e070ed52b5d7bf80fd0ba47c4cd56039656bb676bfa847983` | same |
+| Process ID at acceptance | `9223` | `2980332` |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
+
+0.10.3 (`04beb65d`) carries the durable mesh presence store across Helix.
+Both nodes were cold-restarted onto it, eshmaki.me first, because 0.10.2
+refuses Helix with a presence store. Then a live `reload` ran on each node with
+a held TLS client:
+
+- **eshmaki.me:** PID 9223 was kept and the issuer epoch stayed at 11.
+- **ircx.us:** PID 2980332 was kept and the issuer epoch stayed at 12. The
+  first attempt refused safely with "not every registered client could be
+  sealed", a transient I/O-in-flight state. The retry adopted every client,
+  including real users.
+
+On both nodes the held client answered PING after the reload, and the log
+showed `mesh presence authority adopted hot (…; no cold epoch advance)`. The
+mesh health and CA-verified cross-node chat smokes passed afterwards. The
+release rebuilt byte-for-byte with `packaging/verify-release.sh`. The 0.10.2
+binary is kept as `onyx-server.0.10.2-6ad83624`.
 
 0.10.2 (`6ad83624`) restores Linux Helix handoff and adoption and makes reload
 refuse before exec while the durable mesh presence store is configured. Both
@@ -60,7 +77,7 @@ one node at a time (eshmaki.me first). Each restart re-established
 The previous `0.9.0+5bdd9dc55d99` binary is kept beside each live binary as
 `onyx-server.0.9.0-5bdd9dc5` for rollback. A live client reconnected after the
 restart; token resume was not exercised by a dedicated fixture for this rollout.
-Helix is blocked by the durable mesh presence store (see NEWS 0.10.2).
+Helix was then blocked by the durable mesh presence store (carried since 0.10.3).
 
 The 2026-11-03 `0.9.0` acceptance (durable token recovery across cold restart,
 four-client exact-event checks) is in the

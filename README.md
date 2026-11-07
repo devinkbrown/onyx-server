@@ -58,10 +58,9 @@ The source manifest is **0.10.0**, deployed to both production nodes on
 acceptance scope and rollback facts have one
 canonical home: [production status](docs/ops/onyx-server-paths.md).
 
-Production Helix is blocked by the durable mesh presence store, which has no
-Helix carry yet (not by WebTransport, as earlier notes said; see NEWS 0.10.2).
-Reload refuses safely before exec, and the fleet uses cold restarts one node at
-a time. The 0.9.0 acceptance verified saved durable
+Production nodes use Helix live reloads. Since 0.10.3 the durable mesh
+presence store is carried across Helix (see NEWS 0.10.3), and both nodes kept
+their PID and held clients through a live reload. The 0.9.0 acceptance verified saved durable
 account-token recovery after both restarts; the 0.10.0 rollout re-verified the
 secured mesh and cross-node delivery but did not repeat the token fixture.
 Neither claims preservation of old exact attachment tokens across a cold boundary.
