@@ -149,7 +149,7 @@ pub const Controller = struct {
     /// The candidate lives at main's final address before its dormant thread is
     /// spawned. Failure retracts the inert slot and every duplicate descriptor;
     /// no packet or IRC byte can be read before the server's no-fail commit.
-    pub fn prepareCandidate(self: *Controller, allocator: std.mem.Allocator, io: std.Io, ports: Ports, body: *const linux_wt_checkpoint.Body, tls: managed_wt.TlsConfig) !void {
+    pub fn prepareCandidate(self: *Controller, allocator: std.mem.Allocator, io: std.Io, ports: Ports, body: *const linux_wt_checkpoint.Body, tls: managed_wt.TlsConfig, policy: managed_wt.QuicPolicy) !void {
         if (comptime builtin.os.tag != .linux) return error.Unsupported;
         const slot = self.slot orelse return error.ConfiguredOwnerMismatch;
         if (slot.* != null or self.gate != null) return error.ConfiguredOwnerMismatch;
@@ -171,6 +171,10 @@ pub const Controller = struct {
         const duplicate: linux.fd_t = @intCast(duplicate_rc);
         var candidate = try managed_wt.WebTransportListener.initInherited(allocator, tls, duplicate, null, &body.snapshot.base);
         errdefer candidate.deinit();
+        // The successor serves new QUIC handshakes under its own configured
+        // policy (fresh per-process ticket key); carried connections keep
+        // their snapshot state.
+        try candidate.applyQuicPolicy(policy);
         try candidate.prepareActiveConnectionsInherited(&body.snapshot, body.bridges);
         try candidate.prepareInheritedResources(io);
         slot.* = candidate;

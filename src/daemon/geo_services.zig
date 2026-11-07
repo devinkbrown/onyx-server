@@ -23,6 +23,10 @@ const weather_units = @import("../proto/weather_units.zig");
 const news_sources = @import("../proto/news_sources.zig");
 const platform = @import("../substrate/platform.zig");
 const ca_bundle = @import("ca_bundle.zig");
+/// Defaults re-exported so the daemon config can name them without importing
+/// `ca_bundle` itself.
+pub const default_news_ca_bundle = ca_bundle.default_path;
+pub const default_news_ca_bundle_max_bytes = ca_bundle.default_max_bytes;
 const dlog = @import("dlog.zig");
 
 comptime {

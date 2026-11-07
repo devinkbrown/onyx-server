@@ -254,11 +254,27 @@ early_data_max_size = 0
 # clients that explicitly offer RawPublicKey receive the server leaf SPKI. When
 # request_client_cert is also on, clients may present a raw SPKI for CertFP mTLS.
 raw_public_key = false
-# Linux kTLS offload intent: "off", "tx", or "txrx". "tx" offloads TLS 1.3
-# server-to-client encryption; "txrx" also offloads client-to-server decryption.
-# The daemon only enables it when the kernel advertises the TLS ULP; otherwise
-# TLS stays userspace.
+# Linux kTLS offload intent: "off", "tx", or "txrx". "tx" offloads TLS 1.3 and
+# hardened TLS 1.2 server-to-client encryption; "txrx" also offloads
+# client-to-server decryption. The daemon only enables it when the kernel
+# advertises the TLS ULP; otherwise TLS stays userspace. Offloaded connections
+# survive Helix on the same descriptor. A TLS 1.2 connection whose client
+# negotiated a record_size_limit below 16384 stays in userspace.
 ktls = "off"
+# Key-exchange group preference for the TLS 1.3 listener (RFC 8446 §4.2.7),
+# most preferred first. Names: "X25519MLKEM768", "x25519", "secp256r1" (or
+# "P-256"). Omit for the default below. The QUIC/WebTransport listener uses the
+# subset it implements (X25519MLKEM768, x25519) in the same order, so when
+# [listen] webtransport is set the list must name at least one of those.
+# groups = ["X25519MLKEM768", "x25519", "secp256r1"]
+# RFC 9345 delegated credentials: mint a short-lived credential from the
+# default leaf on boot, renew it before expiry and whenever the leaf changes
+# (ACME renewal). Requires a leaf with the DelegationUsage extension
+# (1.3.6.1.4.1.44363.44) and digitalSignature; otherwise the daemon logs once
+# and serves without one. valid: 1s..168h; renew_before must be below valid.
+# algorithm: "ecdsa_p256" (default) or "ed25519". The delegated private key
+# never leaves process memory (key_out_dir is refused).
+# delegated_credentials = { valid = "24h", renew_before = "12h" }
 # ALPN ids the IRC listener may select, in preference order. Clients that send
 # no ALPN, or only other ids, still connect; [] turns ALPN off. The browser
 # WebSocket listener selects only "http/1.1".
@@ -293,6 +309,23 @@ debug_log = false
 # [[tls.ech_keys]]
 # config_path = "/etc/onyx-server/tls/echconfig.bin"
 # private_key = "0000000000000000000000000000000000000000000000000000000000000000"
+
+
+# --- [webtransport] — QUIC policy for [listen] webtransport -------------------
+[webtransport]
+# QUIC session resumption (RFC 9001 §4.5). The ticket key is random per process
+# and per node, distinct from the TCP TLS ticket key: a ticket only resumes on
+# the node that issued it, and a Helix successor issues new tickets.
+resumption = false
+# QUIC 0-RTT (RFC 9001 §4.6). Requires resumption. 0-RTT data is replayable
+# (RFC 8446 §8); a per-process replay guard plus the ticket-age window bound it,
+# and tickets from another node never decrypt here. Leave off unless needed.
+early_data = false
+# NewSessionTicket lifetime, seconds or a duration ("24h"), 1..604800.
+ticket_lifetime = "24h"
+# Optional static stateless-reset key (RFC 9000 §10.3.2): 64 hex characters,
+# env:/@file: allowed. Omit to derive it from the TLS signing key.
+# stateless_reset_key = "env:ONYX_QUIC_RESET_KEY"
 
 
 # --- [sts] — IRCv3 Strict Transport Security ---------------------------------

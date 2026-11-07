@@ -3832,6 +3832,7 @@ pub fn main(init: std.process.Init) !void {
                 if (wt_listener.?.port != srv_cfg.webtransport_port or wt_listener.?.irc_port != irc_port)
                     windows_driver.candidateAbortNow();
                 wt_listener.?.irc_host = srv_cfg.host;
+                wt_listener.?.applyQuicPolicy(srv_cfg.webtransport_quic) catch windows_driver.candidateAbortNow();
                 if (windows_wt_active_body) |*body| {
                     wt_listener.?.prepareActiveConnectionsWindows(&body.snapshot, body.bridges) catch |err| {
                         std.debug.print("onyx-server: Windows Helix active WebTransport restore failed ({s})\n", .{@errorName(err)});
@@ -4478,6 +4479,12 @@ pub fn main(init: std.process.Init) !void {
             .{ .cert_chain = srv_cfg.tls_cert_chain, .signing_key = signing_key },
             irc_port,
         );
+        wt_listener.?.applyQuicPolicy(srv_cfg.webtransport_quic) catch |err| {
+            std.debug.print("onyx-server: [webtransport] QUIC policy rejected ({s})\n", .{@errorName(err)});
+            wt_listener.?.deinit();
+            wt_listener = null;
+            return err;
+        };
         if (comptime builtin.os.tag == .windows) wt_listener.?.irc_host = srv_cfg.host;
         // Bind on all interfaces, dual-stack: the listener's socket is AF_INET6
         // with IPV6_V6ONLY=0, so `any_be` binds [::] and serves both IPv6 and
