@@ -80384,7 +80384,8 @@ test "managed leased core: every actual recovery factory allocation failure rele
     try read.release();
     try original.discardLeasedCold();
     closed = true;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, managedLeasedRecoveryAllocationCampaign, .{ inputs, storage, binding, store_id, event_id });
+    var backing: DeterministicSweepBacking = .{ .parent = std.testing.allocator };
+    try std.testing.checkAllAllocationFailures(backing.allocator(), managedLeasedRecoveryAllocationCampaign, .{ inputs, storage, binding, store_id, event_id });
     // A normal final recovery demonstrates the same source namespace remains
     // usable after the complete constructor/installation failure sweep.
     const retry = try ManagedCore.createLeasedCold(std.testing.allocator, std.testing.io, inputs, .{ .mode = .recover, .storage = storage }, binding);
@@ -80397,6 +80398,57 @@ test "managed leased core: every actual recovery factory allocation failure rele
 }
 
 const ManagedLeasedProvisionFaults = struct { before_commit: usize = 0, retained_journal: usize = 0 };
+
+/// Backing allocator for exhaustive allocation-failure sweeps whose code under
+/// test shrinks or grows buffers in place (`Writer.Allocating.toOwnedSlice`,
+/// `ArrayList.toOwnedSlice`, growth via `remap`). `std.testing.allocator`
+/// (`SafeAllocator`) answers an in-place shrink according to the current
+/// bucket fill, i.e. according to every earlier allocation in the process, so
+/// the same request can be satisfied in place in one run and need a fresh
+/// alloc+copy in the next. `checkAllAllocationFailures` counts only `alloc`
+/// calls, so that history dependence surfaces as NondeterministicMemoryUsage
+/// whenever binary layout or test order changes. Refusing every resize/remap
+/// (permitted by the Allocator contract) makes each run take the same
+/// alloc+copy+free path, so the sweep injects a failure at every allocation the
+/// fallback path performs, deterministically.
+const DeterministicSweepBacking = struct {
+    parent: std.mem.Allocator,
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.parent.rawAlloc(len, alignment, ra);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(memory, alignment, ra);
+    }
+};
+
+test "deterministic sweep backing: in-place shrink never depends on prior allocation history" {
+    // Regression for the managed leased provision sweep: the same
+    // toOwnedSlice shrink must cost exactly one extra allocation on every run,
+    // independent of how the parent allocator's buckets were filled before.
+    var backing: DeterministicSweepBacking = .{ .parent = std.testing.allocator };
+    var counts: [3]usize = undefined;
+    for (&counts, 0..) |*count, run| {
+        // Perturb the parent's bucket fill differently before each run.
+        const noise = try std.testing.allocator.alloc(u8, 1 + run * 37);
+        defer std.testing.allocator.free(noise);
+        var failing = std.testing.FailingAllocator.init(backing.allocator(), .{});
+        var writer = std.Io.Writer.Allocating.init(failing.allocator());
+        errdefer writer.deinit();
+        try writer.writer.splatByteAll('x', 9);
+        try writer.ensureUnusedCapacity(126);
+        const owned = try writer.toOwnedSlice();
+        defer failing.allocator().free(owned);
+        try std.testing.expectEqual(@as(usize, 9), owned.len);
+        count.* = failing.alloc_index;
+    }
+    try std.testing.expectEqual(counts[0], counts[1]);
+    try std.testing.expectEqual(counts[0], counts[2]);
+}
 
 fn managedLeasedProvisionAllocationCampaign(allocator: std.mem.Allocator, identity: *const node_identity.NodeIdentity, binding: RuntimeCreatedBindings, faults: *ManagedLeasedProvisionFaults) !void {
     // Each injected index gets a genuinely new protected namespace. Namespace
@@ -80452,7 +80504,8 @@ test "managed leased core: every provision allocation failure preserves explicit
     defer resolver.deinit();
     const binding: RuntimeCreatedBindings = .{ .rdns = &resolver, .dnsbl = null, .mail = null, .webpush = null };
     var faults: ManagedLeasedProvisionFaults = .{};
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, managedLeasedProvisionAllocationCampaign, .{ &identity, binding, &faults });
+    var backing: DeterministicSweepBacking = .{ .parent = std.testing.allocator };
+    try std.testing.checkAllAllocationFailures(backing.allocator(), managedLeasedProvisionAllocationCampaign, .{ &identity, binding, &faults });
     try std.testing.expect(faults.before_commit != 0);
     try std.testing.expect(faults.retained_journal != 0);
 }
