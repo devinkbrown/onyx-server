@@ -7,22 +7,47 @@ const std = @import("std");
 const wt = @import("../webtransport_listener.zig");
 const codec = @import("native_windows_active_webtransport_snapshot.zig");
 const magic = "HXLW";
+/// v2: graph + descriptors, no QUIC resumption authority. Still written when
+/// the predecessor holds no QUIC ticket key, so a Helix rollback to a v2-only
+/// binary keeps working in that (default) case.
 const version: u16 = 2;
 const domain = "onyx-linux-active-webtransport-v2";
+/// v3: v2 plus the QUIC session-ticket keys (RFC 9001 sec. 4.5/4.6, RFC 8446
+/// sec. 4.6.1), so tickets issued before an upgrade still resume afterwards.
+/// A v3 frame always carries a current key (canonical: no key => v2).
+const keyed_version: u16 = 3;
+const keyed_domain = "onyx-linux-active-webtransport-v3";
 pub const Error = codec.Error;
 pub const BridgeFd = wt.BridgeFd;
 pub const AcceptedIrcSocket = codec.AcceptedIrcSocket;
 pub const freeEncoded = codec.freeEncoded;
+
+/// The listener's QUIC session-ticket keys (secret). `previous` is the key
+/// retired by the last rotation, still accepted for tickets in flight.
+pub const QuicTicketKeys = struct {
+    current: ?[32]u8 = null,
+    previous: ?[32]u8 = null,
+
+    fn validate(self: QuicTicketKeys) Error!void {
+        if (self.current == null and self.previous != null) return error.InvalidSnapshot;
+    }
+    fn wipe(self: *QuicTicketKeys) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
+};
 
 pub const Body = struct {
     snapshot: wt.ActiveSnapshot,
     udp_fd: i32,
     bridges: []BridgeFd,
     accepted: []AcceptedIrcSocket,
+    /// Carried only by a v3 frame; absent (null) from a v2 predecessor.
+    quic_ticket_keys: QuicTicketKeys = .{},
 
     /// Releases graph memory only. Even on failed adoption, every original
     /// descriptor remains under the outer transaction's custody.
     pub fn deinit(self: *Body, allocator: std.mem.Allocator) void {
+        self.quic_ticket_keys.wipe();
         self.snapshot.deinit(allocator);
         allocator.free(self.bridges);
         allocator.free(self.accepted);
@@ -30,6 +55,7 @@ pub const Body = struct {
     }
 
     pub fn validate(self: *const Body, tls: wt.TlsConfig) Error!void {
+        try self.quic_ticket_keys.validate();
         self.snapshot.validate(tls) catch return error.InvalidSnapshot;
         if (!validFd(self.udp_fd) or self.snapshot.base.socket.ipv4 != null or
             self.snapshot.base.socket.primary.inode == 0) return error.InvalidSnapshot;
@@ -51,6 +77,24 @@ pub const Body = struct {
     }
 };
 
+/// The exact v2 body layout (no QUIC ticket keys).
+const BodyV2 = struct {
+    snapshot: wt.ActiveSnapshot,
+    udp_fd: i32,
+    bridges: []BridgeFd,
+    accepted: []AcceptedIrcSocket,
+};
+
+fn legacyBody(body: Body) BodyV2 {
+    return .{ .snapshot = body.snapshot, .udp_fd = body.udp_fd, .bridges = body.bridges, .accepted = body.accepted };
+}
+
+fn frameVersion(bytes: []const u8) Error!u16 {
+    if (bytes.len < 6 or !std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidSnapshot;
+    var header = codec.Reader{ .bytes = bytes[4..6] };
+    return header.int(u16);
+}
+
 fn validFd(fd: i32) bool {
     return fd > 0 and fd < 0x4000_0000;
 }
@@ -66,14 +110,27 @@ pub fn isCurrent(bytes: []const u8) bool {
     return bytes.len >= magic.len and std.mem.eql(u8, bytes[0..magic.len], magic);
 }
 
+/// Write the lowest exact frame: v2 without QUIC ticket keys (rollback
+/// compatible), v3 when a key must be carried.
 pub fn encode(allocator: std.mem.Allocator, body: *const Body, tls: wt.TlsConfig) Error![]u8 {
     try body.validate(tls);
-    return codec.encodeFramed(Body, allocator, body.*, magic, version, domain);
+    if (body.quic_ticket_keys.current == null)
+        return codec.encodeFramed(BodyV2, allocator, legacyBody(body.*), magic, version, domain);
+    return codec.encodeFramed(Body, allocator, body.*, magic, keyed_version, keyed_domain);
 }
 
+/// Strict on the current (v3) frame; a v2 frame (older predecessor, or no
+/// key to carry) decodes with the keys absent.
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8, tls: wt.TlsConfig) Error!Body {
     _ = try validateWire(bytes);
-    var body = try codec.decodeFramed(Body, allocator, bytes, magic, version, domain);
+    var body: Body = switch (try frameVersion(bytes)) {
+        keyed_version => try codec.decodeFramed(Body, allocator, bytes, magic, keyed_version, keyed_domain),
+        version => blk: {
+            const legacy = try codec.decodeFramed(BodyV2, allocator, bytes, magic, version, domain);
+            break :blk .{ .snapshot = legacy.snapshot, .udp_fd = legacy.udp_fd, .bridges = legacy.bridges, .accepted = legacy.accepted };
+        },
+        else => return error.InvalidSnapshot,
+    };
     errdefer body.deinit(allocator);
     try body.validate(tls);
     return body;
@@ -111,7 +168,15 @@ const ExpectedBridge = struct { slot: usize, identity: wt.BridgeIdentity };
 /// join without allocating. Semantic QUIC/H3 and TLS checks occur in decode,
 /// before candidate construction or descriptor ownership publication.
 pub fn validateWire(bytes: []const u8) Error!WireView {
-    var r = codec.Reader{ .bytes = try codec.scanFramed(Body, bytes, magic, version, domain) };
+    const keyed = switch (try frameVersion(bytes)) {
+        keyed_version => true,
+        version => false,
+        else => return error.InvalidSnapshot,
+    };
+    var r = codec.Reader{ .bytes = if (keyed)
+        try codec.scanFramed(Body, bytes, magic, keyed_version, keyed_domain)
+    else
+        try codec.scanFramed(BodyV2, bytes, magic, version, domain) };
     const base = try codec.readFixed(&r, wt.Snapshot);
     base.socket.validate() catch return error.InvalidSnapshot;
     if (base.socket.ipv4 != null or base.socket.primary.inode == 0) return error.InvalidSnapshot;
@@ -180,8 +245,15 @@ pub fn validateWire(bytes: []const u8) Error!WireView {
         }
     }
     for (joined[0..expected_count]) |join| if (!join) return error.InvalidSnapshot;
+    const accepted_end = r.pos;
+    if (keyed) {
+        // Canonical v3: a current key is mandatory (no key => v2 frame).
+        const keys = try codec.readFixed(&r, QuicTicketKeys);
+        try keys.validate();
+        if (keys.current == null) return error.InvalidSnapshot;
+    }
     if (r.pos != r.bytes.len) return error.InvalidSnapshot;
-    return .{ .udp_fd = fd, .bridge_bytes = r.bytes[bridge_start..bridge_end], .bridge_count = bridge_count, .accepted_bytes = r.bytes[accepted_start..], .accepted_count = accepted_count };
+    return .{ .udp_fd = fd, .bridge_bytes = r.bytes[bridge_start..bridge_end], .bridge_count = bridge_count, .accepted_bytes = r.bytes[accepted_start..accepted_end], .accepted_count = accepted_count };
 }
 
 test "Helix Linux WebTransport idle checkpoint rejects malformed wire and round-trips exactly" {
@@ -231,15 +303,81 @@ test "Helix Linux WebTransport idle checkpoint rejects malformed wire and round-
     // A correct checksum never authorizes descriptor aliases or unexpected rows.
     var fake_bridges = [_]BridgeFd{.{ .slot = 0, .fd = body.udp_fd, .device = 0, .inode = 1 }};
     body.bridges = &fake_bridges;
-    const alias = try codec.encodeFramed(Body, allocator, body, magic, version, domain);
+    const alias = try codec.encodeFramed(BodyV2, allocator, legacyBody(body), magic, version, domain);
     defer freeEncoded(allocator, alias);
     try std.testing.expectError(error.InvalidSnapshot, validateWire(alias));
     try std.testing.expectError(error.InvalidSnapshot, decode(allocator, alias, tls));
     body.bridges = &.{};
     body.udp_fd = -1;
-    const invalid_fd = try codec.encodeFramed(Body, allocator, body, magic, version, domain);
+    const invalid_fd = try codec.encodeFramed(BodyV2, allocator, legacyBody(body), magic, version, domain);
     defer freeEncoded(allocator, invalid_fd);
     try std.testing.expectError(error.InvalidSnapshot, validateWire(invalid_fd));
+}
+
+test "Helix Linux WebTransport carries QUIC ticket keys in v3 and accepts their absence from v2" {
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x38)));
+    var cert_buf: [1024]u8 = undefined;
+    const cert = try @import("../../proto/x509_selfsign.zig").buildSelfSigned(&cert_buf, .{
+        .common_name = "wt.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ 0x51, 0x9a },
+        .key_pair = key,
+        .dns_names = &.{"wt.test"},
+        .is_ca = true,
+    });
+    const chain = [_][]const u8{cert};
+    const tls: wt.TlsConfig = .{ .cert_chain = &chain, .signing_key = .{ .ed25519 = key } };
+    var owner = wt.WebTransportListener.init(allocator, tls, 6667);
+    defer owner.deinit();
+    try owner.prepareColdResources(std.testing.io, .{ .v4_mapped = .{ 127, 0, 0, 1 } }, 0);
+    var active = try owner.captureUnstartedActive(allocator);
+    defer active.deinit(allocator);
+
+    // No key: the rollback-compatible v2 frame, decoded with keys absent.
+    var body: Body = .{ .snapshot = active, .udp_fd = owner.socket.?.fd, .bridges = &.{}, .accepted = &.{} };
+    const plain = try encode(allocator, &body, tls);
+    defer freeEncoded(allocator, plain);
+    try std.testing.expectEqual(version, try frameVersion(plain));
+    var plain_decoded = try decode(allocator, plain, tls);
+    defer plain_decoded.deinit(allocator);
+    try std.testing.expect(plain_decoded.quic_ticket_keys.current == null and plain_decoded.quic_ticket_keys.previous == null);
+
+    // Current + previous key: v3, exact round trip.
+    body.quic_ticket_keys = .{ .current = @splat(0xc1), .previous = @splat(0xb2) };
+    const keyed = try encode(allocator, &body, tls);
+    defer freeEncoded(allocator, keyed);
+    try std.testing.expectEqual(keyed_version, try frameVersion(keyed));
+    try std.testing.expectEqual(body.udp_fd, (try validateWire(keyed)).udp_fd);
+    var keyed_decoded = try decode(allocator, keyed, tls);
+    defer keyed_decoded.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, &body.quic_ticket_keys.current.?, &keyed_decoded.quic_ticket_keys.current.?);
+    try std.testing.expectEqualSlices(u8, &body.quic_ticket_keys.previous.?, &keyed_decoded.quic_ticket_keys.previous.?);
+    const restored = try encode(allocator, &keyed_decoded, tls);
+    defer freeEncoded(allocator, restored);
+    try std.testing.expectEqualSlices(u8, keyed, restored);
+    for (0..keyed.len) |len| try std.testing.expectError(error.InvalidSnapshot, validateWire(keyed[0..len]));
+
+    // Strict v3: a previous key without a current one, or a v3 frame with no
+    // key at all (non-canonical; that state is v2), is refused.
+    var orphan = body;
+    orphan.quic_ticket_keys = .{ .previous = @splat(0xb2) };
+    try std.testing.expectError(error.InvalidSnapshot, encode(allocator, &orphan, tls));
+    const orphan_wire = try codec.encodeFramed(Body, allocator, orphan, magic, keyed_version, keyed_domain);
+    defer freeEncoded(allocator, orphan_wire);
+    try std.testing.expectError(error.InvalidSnapshot, validateWire(orphan_wire));
+    var empty = body;
+    empty.quic_ticket_keys = .{};
+    const empty_wire = try codec.encodeFramed(Body, allocator, empty, magic, keyed_version, keyed_domain);
+    defer freeEncoded(allocator, empty_wire);
+    try std.testing.expectError(error.InvalidSnapshot, validateWire(empty_wire));
+    // A v2-domain digest never authenticates a v3 frame (and vice versa).
+    const cross = try codec.encodeFramed(Body, allocator, body, magic, keyed_version, domain);
+    defer freeEncoded(allocator, cross);
+    try std.testing.expectError(error.InvalidSnapshot, validateWire(cross));
+    body.quic_ticket_keys = .{};
 }
 
 test "Helix Linux WebTransport validates bridge endpoints before equality without allocation" {
@@ -308,7 +446,7 @@ test "Helix Linux WebTransport validates bridge endpoints before equality withou
             // both untrusted rows reach the allocation-free wire validator.
             // Equal malformed local/peer endpoints used to reach TransportAddress.eql
             // on the second row and slice ip[0..17] before semantic validation.
-            const wire = try codec.encodeFramed(Body, allocator, body, magic, version, domain);
+            const wire = try codec.encodeFramed(BodyV2, allocator, legacyBody(body), magic, version, domain);
             defer freeEncoded(allocator, wire);
             try std.testing.expectError(error.InvalidSnapshot, validateWire(wire));
             var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });

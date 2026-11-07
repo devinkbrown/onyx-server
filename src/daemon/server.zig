@@ -10158,7 +10158,32 @@ pub const LinuxServer = struct {
     }
 
     fn captureLinuxWebTransport(self: *LinuxServer, token: @import("runtime_pause.zig").Token) !linux_wt_checkpoint.Body {
-        return self.linux_webtransport.capture(self.allocator, token, self.linuxWebTransportAcceptedSockets());
+        var body = try self.linux_webtransport.capture(self.allocator, token, self.linuxWebTransportAcceptedSockets());
+        // Carry the QUIC session-ticket keys (RFC 9001 sec. 4.5) so tickets
+        // issued before the upgrade still resume on the successor. Without a
+        // key the checkpoint stays in the rollback-compatible v2 frame.
+        if (self.linuxWebTransportOwner()) |listener| body.quic_ticket_keys = quicTicketKeysOf(listener);
+        return body;
+    }
+
+    fn quicTicketKeysOf(listener: *const managed_wt.WebTransportListener) linux_wt_checkpoint.QuicTicketKeys {
+        const current = listener.quic_ticket_key orelse return .{};
+        return .{ .current = current, .previous = listener.quic_previous_ticket_key };
+    }
+
+    /// Install carried QUIC ticket keys into the parked successor listener
+    /// before its worker is released. Strict: carried keys require resumption
+    /// to be enabled here (the same rule as the TCP ticket-key authority); an
+    /// older (v2) predecessor carries none and the fresh boot key is kept.
+    fn adoptQuicTicketKeys(listener: *managed_wt.WebTransportListener, resumption: bool, keys: linux_wt_checkpoint.QuicTicketKeys) !void {
+        const current = keys.current orelse {
+            if (keys.previous != null) return error.InvalidInheritedHandoff;
+            return;
+        };
+        if (!resumption or listener.quic_ticket_key == null) return error.InvalidInheritedHandoff;
+        if (listener.quic_ticket_key) |*fresh| std.crypto.secureZero(u8, fresh);
+        listener.quic_ticket_key = current;
+        listener.quic_previous_ticket_key = keys.previous;
     }
 
     fn validateLinuxWebTransportAcceptedJoin(self: *LinuxServer, body: *const linux_wt_checkpoint.Body) !void {
@@ -10170,6 +10195,11 @@ pub const LinuxServer = struct {
             .irc = try self.boundPort(),
             .webtransport = self.config.webtransport_port,
         }, body, tls, self.config.webtransport_quic);
+        const listener = self.linuxWebTransportOwner() orelse return error.InvalidRuntime;
+        adoptQuicTicketKeys(listener, self.config.webtransport_quic.resumption, body.quic_ticket_keys) catch |err| {
+            self.linux_webtransport.rollbackCandidate();
+            return err;
+        };
     }
 
     /// The WebTransport bridge's connected loopback socket must have exactly
@@ -169530,6 +169560,47 @@ test "server DATA origin is the server name and client DATA keeps its nick" {
     try Gate.has(ann, " 432 ");
     try std.testing.expectEqualStrings("Ann", ann.session.displayName());
     try std.testing.expect(!std.mem.eql(u8, ann.session.displayName(), origin));
+}
+
+test "Linux WebTransport Helix carries QUIC ticket keys strictly and keeps the fresh key without them" {
+    const allocator = std.testing.allocator;
+    var cert_buf: [2048]u8 = undefined;
+    const keys = try mintRehashTlsLeaf(&cert_buf, 0x5a, "wt-ticket.test");
+    const chain = [_][]const u8{keys.der};
+    const tls: managed_wt.TlsConfig = .{ .cert_chain = &chain, .signing_key = .{ .ed25519 = keys.kp } };
+    // Predecessor: resumption on, rotated once.
+    var source = managed_wt.WebTransportListener.init(allocator, tls, 6667);
+    defer source.deinit();
+    try source.applyQuicPolicy(.{ .resumption = true });
+    source.quic_previous_ticket_key = @splat(0x77);
+    const carried = Server.quicTicketKeysOf(&source);
+    try std.testing.expectEqualSlices(u8, &source.quic_ticket_key.?, &carried.current.?);
+    try std.testing.expectEqualSlices(u8, &source.quic_previous_ticket_key.?, &carried.previous.?);
+    // Successor: its fresh boot key is replaced by the carried keys, so a
+    // ticket sealed before the upgrade opens afterwards.
+    var successor = managed_wt.WebTransportListener.init(allocator, tls, 6667);
+    defer successor.deinit();
+    try successor.applyQuicPolicy(.{ .resumption = true });
+    try Server.adoptQuicTicketKeys(&successor, true, carried);
+    try std.testing.expectEqualSlices(u8, &carried.current.?, &successor.quic_ticket_key.?);
+    try std.testing.expectEqualSlices(u8, &carried.previous.?, &successor.quic_previous_ticket_key.?);
+    // A v2 predecessor (no keys) keeps the successor's fresh key.
+    var fresh = managed_wt.WebTransportListener.init(allocator, tls, 6667);
+    defer fresh.deinit();
+    try fresh.applyQuicPolicy(.{ .resumption = true });
+    const boot_key = fresh.quic_ticket_key.?;
+    try Server.adoptQuicTicketKeys(&fresh, true, .{});
+    try std.testing.expectEqualSlices(u8, &boot_key, &fresh.quic_ticket_key.?);
+    // Strict: carried keys into a resumption-disabled successor, or an orphan
+    // previous key, refuse the handoff.
+    var disabled = managed_wt.WebTransportListener.init(allocator, tls, 6667);
+    defer disabled.deinit();
+    try disabled.applyQuicPolicy(.{});
+    try std.testing.expectError(error.InvalidInheritedHandoff, Server.adoptQuicTicketKeys(&disabled, false, carried));
+    try std.testing.expect(disabled.quic_ticket_key == null);
+    try std.testing.expectError(error.InvalidInheritedHandoff, Server.adoptQuicTicketKeys(&fresh, true, .{ .previous = @splat(1) }));
+    // Resumption off on the predecessor: nothing to carry (v2 frame).
+    try std.testing.expect(Server.quicTicketKeysOf(&disabled).current == null);
 }
 
 test "Linux WebTransport Helix server adoption requires exact configured custody and preserves idle owner" {
