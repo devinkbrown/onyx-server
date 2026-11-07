@@ -233,8 +233,8 @@ Source: struct at `src/daemon/config_format.zig` (`Geo`), mapping at `src/daemon
 |---|---|---:|---|---|
 | `enabled` | bool | `false` | — | Enable the `!weather`/`!forecast`/`!news` bot. |
 | `news_insecure_tls` | bool | `false` | — | Operator escape hatch: skip TLS certificate verification for the live news fetch. The daemon logs a warning at boot when this is `true`. Weather is plain HTTP and unaffected. |
-| `news_ca_bundle` | string or null | unset (`/etc/ssl/certs/ca-certificates.crt`) | non-empty path | PEM CA bundle (`CERTIFICATE` blocks) used as the trust anchors for the live news fetch. The fetcher thread loads it once. If the file is missing, larger than `news_ca_bundle_max_bytes`, or holds no usable certificate, the daemon logs an error and disables the live news fetch. It never falls back to `news_insecure_tls`. Not read when `news_cache_dir` is set or `news_insecure_tls = true`. **Not yet effective:** the daemon parses this key but does not pass it to the geo service yet, so the live fetch always uses the default path. |
-| `news_ca_bundle_max_bytes` | integer | `4194304` | `65536..67108864` | Read bound for `news_ca_bundle`. A larger file is refused, not truncated. **Not yet effective:** parsed but not passed to the geo service yet, so the default `4194304` applies. |
+| `news_ca_bundle` | string or null | unset (`/etc/ssl/certs/ca-certificates.crt`) | non-empty path | PEM CA bundle (`CERTIFICATE` blocks) used as the trust anchors for the live news fetch. The fetcher thread loads it once. If the file is missing, larger than `news_ca_bundle_max_bytes`, or holds no usable certificate, the daemon logs an error and disables the live news fetch. It never falls back to `news_insecure_tls`. Not read when `news_cache_dir` is set or `news_insecure_tls = true`. Passed to the geo service at boot (`src/daemon/config_boot.zig` → `server.zig` `geo_services.Service.init`). |
+| `news_ca_bundle_max_bytes` | integer | `4194304` | `65536..67108864` | Read bound for `news_ca_bundle`. A larger file is refused, not truncated. Passed to the geo service at boot. |
 | `cmd_cooldown_ms` | integer | `3000` | `0..600000` | Minimum interval between bot replies in a single channel (anti-flood). 0 disables. |
 | `default_location` | string or null | unset | any string | Fallback place for `!weather` and `!forecast` after the argument, nick `location`, and channel `!setweather`. Also used by the MOTD `{weather}` line after nick `location` and `[weather] location`. |
 | `news_cache_dir` | string or null | unset | path | Directory of headline files written by `tools/news_update.sh` (`src_<key>.txt` / `cc_<cc>.txt`). A line is a title, or `epoch<TAB>title<TAB>deck`. When set, `!news` reads these files instead of fetching live. The daemon keeps up to five headlines per feed. |
@@ -880,7 +880,9 @@ Source: struct at `src/daemon/config_format.zig`, parsing at `src/daemon/config_
 | `enable_resumption` | bool | `false` | `true` or `false` | Enable TLS 1.3 PSK session tickets/resumption on the live TLS listener (`src/daemon/config_format.zig`, `src/daemon/config_boot.zig`). |
 | `early_data_max_size` | integer | `0` | `0..4294967295` | Maximum TLS 1.3 0-RTT bytes advertised in issued tickets. `0` disables early data while still allowing resumption (`src/daemon/config_format.zig`, `src/daemon/config_boot.zig`). |
 | `raw_public_key` | bool | `false` | `true` or `false` | Enables RFC 7250 raw-public-key negotiation. When true, a client that offers `server_certificate_type=RawPublicKey` may receive the active leaf's bare SubjectPublicKeyInfo instead of the X.509 chain. With `request_client_cert = true`, a client that offers `client_certificate_type=RawPublicKey` may present a bare SPKI for SASL EXTERNAL CertFP. Default off keeps X.509 handshakes byte-identical. |
-| `ktls` | string | `"off"` | `"off"`, `"tx"`, `"txrx"` | Requests Linux kTLS offload on the implicit TLS listener. `tx` offloads server-to-client TLS 1.3 encryption; `txrx` also offloads client-to-server decryption. The daemon only enables offload when the running kernel advertises the TLS ULP; otherwise TLS remains userspace. TLS 1.2 is not offloaded. |
+| `ktls` | string | `"off"` | `"off"`, `"tx"`, `"txrx"` | Requests Linux kTLS offload on the implicit TLS listener. `tx` offloads server-to-client encryption; `txrx` also offloads client-to-server decryption. Applies to TLS 1.3 and to hardened TLS 1.2 AEAD sessions (the 1.2 explicit nonce is installed as the record sequence, so kernel nonces continue the engine's). A TLS 1.2 client that negotiated a `record_size_limit` below 16384 stays in userspace. Under kernel RX a TLS 1.2 alert closes the connection and any handshake record (renegotiation) is fatal. Offloaded connections of both versions survive Helix on the same descriptor (`tls_session` schema v4). A Helix upgrade from a binary that writes `tls_session` v3 is adopted (its TLS 1.2 rows carry no channel binding, so `-PLUS` is not offered to them afterwards). A Helix rollback from this binary to a v3-only binary is refused for every TLS client (fail closed); rolling back requires a cold restart. The daemon only enables offload when the running kernel advertises the TLS ULP; otherwise TLS remains userspace. FreeBSD offloads TLS 1.3 only. |
+| `groups` | array of strings | `["X25519MLKEM768", "x25519", "secp256r1"]` | 1..8 distinct names from `X25519MLKEM768`, `x25519`, `secp256r1` (`P-256`, `P256`); case-insensitive | TLS 1.3 key-exchange group preference (RFC 8446 §4.2.7/§4.2.8), most preferred first; validated at parse time with `tls_server.validateGroups`. The QUIC/WebTransport listener uses the subset it implements (`X25519MLKEM768`, `x25519`) in the same order, so with `[listen] webtransport` set the list must name one of them. Boot-only: the slice lives for the process; a Helix successor parses its own copy. |
+| `delegated_credentials` | inline table or null | unset (no DC) | `valid`: 1s..168h (default `"24h"`); `renew_before`: below `valid` (default `"12h"`); `algorithm`: `"ecdsa_p256"` (default) or `"ed25519"` | RFC 9345 delegated-credential rotation. The maintenance reactor mints a credential from the default leaf at boot, renews it once it enters the renewal window, and re-mints when the leaf changes (ACME renewal, reload). Every candidate is validated by a probe `tls_server.Server.init` before it is installed; a superseded credential is freed only once no incomplete handshake borrows it. A credential is presented only while it is unexpired and bound to the serving leaf. A leaf without the DelegationUsage extension (OID 1.3.6.1.4.1.44363.44) or without digitalSignature is logged once and rotation stays off until the leaf changes; transient failures retry after 60 s. The delegated private key lives only in process memory: `key_out_dir` is refused. |
 | `alpn` | array of strings | `["irc"]` | up to 8 distinct ids, each 1..255 bytes; `[]` turns ALPN off | ALPN ids the IRC TLS listener may select, in preference order. A client that sends no ALPN, or only ids not listed, still completes the handshake: the server leaves ALPN out of its reply and sends no alert. The browser WebSocket listener selects only `http/1.1` while ALPN is on. Applies to the TLS 1.3 and TLS 1.2 legs; on the 1.2 leg a malformed ALPN extension is a decode error. |
 | `cert_compression` | bool | `false` | `true` or `false` | RFC 8879 certificate compression (zlib) for clients that offer it. The compressed form is sent only when it is smaller. |
 | `enforce_cert_signature_algorithms` | bool | `false` | `true` or `false` | Refuse the handshake (`handshake_failure`) when the chain's non-self-signed certificate signatures use an algorithm the client did not list in `signature_algorithms_cert` (or `signature_algorithms` when that is absent). Self-signed and trust-anchor certificates are exempt. |
@@ -896,6 +898,47 @@ use, so they never had an effect; a config that still sets either is refused
 with a message naming the key.
 
 Onyx Server has no STARTTLS path. TLS is a separate implicit-TLS listener (`src/main.zig`, `src/daemon/dispatch.zig`).
+
+**SCRAM `-PLUS` channel binding.** `SCRAM-SHA-512-PLUS` uses the RFC 9266
+`tls-exporter` binding. RFC 9266 §2 defines it for TLS 1.3 and for earlier
+versions only when the master secret is unique, i.e. with the RFC 7627
+extended master secret. The hardened TLS 1.2 engine requires EMS, so `-PLUS`
+is offered on TLS 1.2 too; without EMS the exporter is refused and `-PLUS` is
+not advertised. A Helix-resumed TLS 1.2 engine holds no master secret, so the
+binding derived at handshake time is carried in the `tls_session` row (schema
+v4). A v3 row has no binding, and that connection simply stops offering
+`-PLUS`.
+
+**0-RTT across the mesh.** TLS session-ticket keys are random per process and
+are carried only across a local Helix upgrade; they are never shared between
+mesh nodes. A ticket issued by one node does not decrypt on another, so a
+0-RTT flight captured at one node cannot be replayed into a different node
+(it falls back to a full handshake). Replay within one node is bounded by the
+per-process replay guard and the ticket-age window. The QUIC listener follows
+the same rule with its own per-process key (`[webtransport]`).
+
+**ACME tls-alpn-01.** With `[acme] challenge = "tls-alpn-01"` the implicit-TLS
+listener consults the renewal worker's challenge store on each connection's
+first record. A ClientHello with SNI for a pending domain and an ALPN list of
+exactly `acme-tls/1` is answered by an engine that holds only the challenge
+certificate and its key, selects `acme-tls/1`, and issues no ticket, early
+data, OCSP staple or delegated credential (RFC 8737 §3). The connection never
+reaches IRC and is closed once the handshake completes. TLS 1.2 validators are
+answered the same way when `enable_tls12` is on.
+
+## `[webtransport]`
+
+QUIC policy for the `[listen] webtransport` listener. Source: struct
+`WebTransport` at `src/daemon/config_format.zig`, mapping at
+`src/daemon/config_boot.zig`, applied by `WebTransportListener.applyQuicPolicy`
+on cold start and on every Helix candidate.
+
+| Key | Type | Default | Valid range | What it controls |
+|---|---|---:|---|---|
+| `resumption` | bool | `false` | — | Issue NewSessionTickets and accept PSK resumption (RFC 9001 §4.5). The ticket key is random per process and per node, distinct from the TCP TLS ticket key. |
+| `early_data` | bool | `false` | requires `resumption` | Accept 0-RTT (RFC 9001 §4.6). Replay is bounded by a per-process guard (with a quiet window after every listener start) and the ticket-age window; foreign-node tickets never decrypt. |
+| `ticket_lifetime` | integer seconds or duration | `"24h"` | `1..604800` | Advertised ticket lifetime (RFC 8446 §4.6.1). |
+| `stateless_reset_key` | string or null | unset | 64 hex characters, not all zero; `env:`/`@file:` allowed | Static stateless-reset key (RFC 9000 §10.3.2). Unset derives it from the TLS signing key, so a restarted process serving the same key emits the same tokens. |
 
 ### TLS metrics
 
@@ -914,6 +957,12 @@ Counters reset when the process image changes (restart or Helix).
 | `onyx_tls_early_data_total` | counter | `result`: `accepted`, `rejected` | TLS 1.3 0-RTT offers by outcome. |
 | `onyx_tls_ktls_offloads_total` | counter | `direction`: `tx`, `rx` | Connections whose record crypto moved into the kernel. |
 | `onyx_tls_ktls_active` | gauge | none | Open client connections with kernel TLS in either direction. |
+| `onyx_tls_ktls12_active` | gauge | none | The TLS 1.2 subset of `onyx_tls_ktls_active`. |
+| `onyx_tls_delegated_credential_expiry_seconds` | gauge | none | Seconds until the presented delegated credential expires; `0` when none is presented. |
+| `onyx_quic_resumptions_total` | counter | none | QUIC handshakes completed with PSK resumption. |
+| `onyx_quic_early_data_accepted_total` | counter | none | QUIC handshakes whose 0-RTT was accepted. |
+| `onyx_quic_early_data_rejected_total` | counter | none | QUIC handshakes whose offered 0-RTT was rejected. |
+| `onyx_quic_stateless_resets_sent_total` | counter | none | QUIC Stateless Reset datagrams sent. |
 | `onyx_tls_ocsp_staple_status` | gauge | `status`: `none`, `good`, `expired` | Exactly one is 1. `good` means a validated staple is being served. |
 | `onyx_tls_ocsp_staple_age_seconds` | gauge | none | Seconds since the staple's `thisUpdate`. Present only while a staple is held. |
 | `onyx_tls_ocsp_staple_expires_in_seconds` | gauge | none | Seconds until the staple stops being served. Present only while a staple is held. |

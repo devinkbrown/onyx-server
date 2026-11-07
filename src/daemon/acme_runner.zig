@@ -62,6 +62,12 @@ pub const Resolver = struct {
     }
 };
 
+/// RFC 8701 GREASE stays on for this outbound TLS 1.3 client so peers that
+/// mishandle unknown values are found early; GREASE ECH stays off because the
+/// daemon holds no ECHConfig for these hosts (draft-ietf-tls-esni §6.2).
+pub const outbound_grease = true;
+pub const outbound_ech_grease = false;
+
 /// Default maximum bytes accepted for a single HTTP response (ACME payloads are
 /// small). Operationally tunable via `[acme].max_response_bytes`.
 pub const default_max_response_bytes: usize = 256 * 1024;
@@ -153,6 +159,8 @@ pub fn httpsRequest(
         .trust_anchors = trust_anchors,
         .alpn_protocols = &.{"http/1.1"},
         .now_unix_seconds = wallClockSeconds(),
+        .grease = outbound_grease,
+        .ech_grease = outbound_ech_grease,
         // ACME directory TLS stays fail-open on CRL/CT (no CDP or pinned-log
         // cache here). http_fetch.Options is the opt-in wire for fetchers that
         // already hold a caller-supplied CRL or CT log set.
@@ -2619,4 +2627,13 @@ test "runSteps fails closed when the configured challenge has no provisioner" {
     };
     try std.testing.expectError(error.Dns01Unavailable, runSteps(&client, mock.transport(), &sink, 64));
     try std.testing.expect(!entries[5].used);
+}
+
+test "outbound TLS client keeps RFC 8701 GREASE on and GREASE ECH off" {
+    try std.testing.expect(outbound_grease);
+    try std.testing.expect(!outbound_ech_grease);
+    var tc = try tls_client.Client.init(std.testing.allocator, .{ .server_name = "example.test", .trust_anchors = &.{}, .grease = outbound_grease, .ech_grease = outbound_ech_grease });
+    defer tc.deinit();
+    try std.testing.expect(tc.grease != null);
+    try std.testing.expect(!tc.ech_grease);
 }

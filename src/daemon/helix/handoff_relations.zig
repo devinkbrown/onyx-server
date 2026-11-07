@@ -537,10 +537,14 @@ fn validateCurrentBody(capsules: []const capsule.Capsule, state_fds: []const i32
     // and a missing secured/framed transport checkpoint.
     for (capsules, 0..) |item, index| switch (item.header.kind) {
         .tls_session => {
-            // Mandatory exact TLS3 carries record policy, exporter, control
-            // cursors and typed queue custody. No hot legacy normalization.
-            const bytes = canonicalPayload(item, .tls_session) orelse return error.InvalidTls;
-            const tls = tls_snapshot.decodeCurrent(bytes) catch return error.InvalidTls;
+            // TLS3+ carries record policy, exporter, control cursors and typed
+            // queue custody. The descriptor window is 3..4: a v3 predecessor
+            // (the deployed binary before the TLS 1.2 channel-binding tail)
+            // stamps {3,3,3}, so negotiate the header and decode per version
+            // exactly like the server's adoption pass. Pinning current here
+            // refused every TLS client of a v3 predecessor's USR2.
+            const bytes = canonicalRollingPayload(item, .tls_session) orelse return error.InvalidTls;
+            const tls = tls_snapshot.decode(bytes, item.header.version) catch return error.InvalidTls;
             const client = findClient(capsules, tls.fd) orelse return error.OrphanTls;
             if (!client.was_secured) return error.UnexpectedTls;
             for (capsules[0..index]) |prior| {
@@ -1757,6 +1761,94 @@ test "current handoff relations accept a pre-bump v1 TLS sidecar (netsplit guard
     caps[1].header.min_supported = 1;
     caps[1].header.max_supported = 1;
     try std.testing.expectError(error.InvalidTls, validateWithEmptyPolicyStoresForTest(&caps, &.{10}));
+}
+
+test "current handoff relations accept a v3 TLS sidecar from the pre-binding predecessor" {
+    const allocator = std.testing.allocator;
+    const tls_server = @import("../../crypto/tls_server.zig");
+    const tls12_server = @import("../../crypto/tls12_server.zig");
+
+    const client13 = try session_snapshot.encode(allocator, .{ .nick = "alice", .fd = 10, .was_secured = true });
+    defer allocator.free(client13);
+    const client12 = try session_snapshot.encode(allocator, .{ .nick = "bob", .fd = 11, .was_secured = true });
+    defer allocator.free(client12);
+    // The TLS 1.3 layout is identical in v3 and v4.
+    const tls13 = try tls_snapshot.encode(allocator, .{
+        .kernel_tx_prefix_remaining = 0,
+        .fd = 10,
+        .state = .{ .barrier_phase = .none, .held_record_len = 0, .engine = .{ .tls13 = tls_server.Server.ResumeState{ .suite = 0x1302, .client_app_secret = @splat(1), .server_app_secret = @splat(2), .app_read_seq = 3, .app_write_seq = 4, .peer_record_size_limit_raw = 16385, .local_receive_policy = 16385, .record_size_limit_negotiated = false, .selected_alpn = &.{}, .exporter_master_secret = @splat(0), .exporter_master_secret_ready = true, .ku_prefix_len = 0, .ku_prefix = @splat(0) } } },
+    });
+    defer allocator.free(tls13);
+    // A v3 TLS 1.2 row is the v4 row without the 33-byte binding tail, which
+    // sits just before the 34-byte control tail (empty deferred plaintext).
+    const tls12_v4 = try tls_snapshot.encode(allocator, .{
+        .kernel_tx_prefix_remaining = 0,
+        .fd = 11,
+        .state = .{ .barrier_phase = .none, .held_record_len = 0, .engine = .{ .tls12 = tls12_server.Server.ResumeState{ .suite = 0xc02b, .keys = .{}, .app_read_seq = 5, .app_write_seq = 6, .peer_record_size_limit_raw = 16384, .local_receive_policy = 16384, .record_size_limit_negotiated = false, .selected_alpn = &.{} } } },
+    });
+    defer allocator.free(tls12_v4);
+    const cut = tls12_v4.len - 34 - 33;
+    const tls12 = try allocator.alloc(u8, tls12_v4.len - 33);
+    defer allocator.free(tls12);
+    @memcpy(tls12[0..cut], tls12_v4[0..cut]);
+    @memcpy(tls12[cut..], tls12_v4[cut + 33 ..]);
+
+    var monitor_buf: [2][32]u8 = undefined;
+    const monitor13 = try (monitor_capsule.MonitorCapsule{ .client_id = 10, .targets = &.{} }).encode(&monitor_buf[0]);
+    const monitor12 = try (monitor_capsule.MonitorCapsule{ .client_id = 11, .targets = &.{} }).encode(&monitor_buf[1]);
+    var silence_buf: [2][32]u8 = undefined;
+    const silence13 = try (silence_capsule.SilenceCapsule{ .client_id = 10, .masks = &.{} }).encode(&silence_buf[0]);
+    const silence12 = try (silence_capsule.SilenceCapsule{ .client_id = 11, .masks = &.{} }).encode(&silence_buf[1]);
+    const event_replay = try testEventSpineReplayCheckpoint(allocator);
+    defer allocator.free(event_replay);
+    const relay_replay = try testRelayV2ReplayCheckpoint(allocator);
+    defer allocator.free(relay_replay);
+    const relay_outbox = try testRelayV2OutboxCheckpoint(allocator);
+    defer allocator.free(relay_outbox);
+    const relay_event_log = try testRelayV2EventLogCheckpoint(allocator);
+    defer allocator.free(relay_event_log);
+    const attachment_delivery = try testAttachmentDeliveryCheckpoint(allocator);
+    defer allocator.free(attachment_delivery);
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
+    const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
+
+    const pieces = [_]TestPiece{
+        .{ .kind = .clients, .bytes = client13 },
+        .{ .kind = .tls_session, .bytes = tls13 },
+        .{ .kind = .monitor_list, .bytes = monitor13 },
+        .{ .kind = .silence_list, .bytes = silence13 },
+        .{ .kind = .clients, .bytes = client12 },
+        .{ .kind = .tls_session, .bytes = tls12 },
+        .{ .kind = .monitor_list, .bytes = monitor12 },
+        .{ .kind = .silence_list, .bytes = silence12 },
+        .{ .kind = .mesh_checkpoint, .bytes = event_replay },
+        .{ .kind = .mesh_checkpoint, .bytes = relay_replay },
+        .{ .kind = .mesh_checkpoint, .bytes = relay_outbox },
+        .{ .kind = .mesh_checkpoint, .bytes = relay_event_log },
+        .{ .kind = .mesh_checkpoint, .bytes = attachment_delivery },
+        .{ .kind = .mesh_checkpoint, .bytes = e2ee_group },
+        .{ .kind = .mesh_checkpoint, .bytes = &clock },
+    };
+    var fields: [pieces.len][1]capsule.Field = undefined;
+    var caps: [pieces.len]capsule.Capsule = undefined;
+    _ = makeTestCaps(&pieces, &fields, &caps);
+    for (caps[caps.len - 7 ..]) |*cap| cap.header.min_supported = 2;
+    // Stamp both TLS capsules exactly as the v3 predecessor did: {3,3,3}.
+    for ([_]usize{ 1, 5 }) |i| {
+        caps[i].header.version = 3;
+        caps[i].header.min_supported = 3;
+        caps[i].header.max_supported = 3;
+    }
+    const summary = try validateWithEmptyPolicyStoresForTest(&caps, &.{ 10, 11 });
+    try std.testing.expectEqual(@as(usize, 2), summary.tls);
+
+    // The v4 layout under a v3 header (and vice versa) is refused.
+    fields[5][0].bytes = tls12_v4;
+    try std.testing.expectError(error.InvalidTls, validateWithEmptyPolicyStoresForTest(&caps, &.{ 10, 11 }));
+    fields[5][0].bytes = tls12;
+    caps[5].header = capsule.Header.init(.tls_session);
+    try std.testing.expectError(error.InvalidTls, validateWithEmptyPolicyStoresForTest(&caps, &.{ 10, 11 }));
 }
 
 test "current handoff relations reject missing duplicate orphan and unexpected transport sidecars" {

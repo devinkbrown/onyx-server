@@ -28,6 +28,8 @@ const tls_record = @import("../crypto/tls_record.zig");
 const tls_handshake_reassembly = @import("../crypto/tls_handshake_reassembly.zig");
 const tls_resumption = @import("../crypto/tls_resumption.zig");
 const ktls = @import("ktls.zig");
+const acme_runner = @import("acme_runner.zig");
+const acme_challenge = @import("../proto/acme_challenge.zig");
 const kernel_other = @import("kernel_other.zig");
 const linux = std.os.linux;
 const posix = std.posix;
@@ -192,6 +194,21 @@ pub const TlsConn = struct {
     } else void = if (builtin.is_test) null else {},
     held_record_len: u32 = 0,
     control_turn_active: bool = false,
+    /// RFC 8737 tls-alpn-01: the ACME challenge store this listener consults
+    /// for an `acme-tls/1` ClientHello. Borrowed (the ACME Service outlives
+    /// every connection); null when tls-alpn-01 is not configured.
+    acme_store: ?*acme_runner.TlsAlpn01Store = null,
+    /// Set when this connection was selected as a tls-alpn-01 validation: the
+    /// engine presents the challenge certificate from this heap copy, and the
+    /// daemon closes the connection once the handshake completes.
+    acme_validation: ?*AcmeValidation = null,
+    /// The first complete record was already offered to `acme_store`.
+    acme_checked: bool = false,
+
+    const AcmeValidation = struct {
+        lease: acme_runner.TlsAlpn01Store.Lease,
+        chain: [1][]const u8,
+    };
 
     /// TLS 1.3-only adapter (back-compatible): the engine is fixed to the TLS 1.3
     /// server and a 1.2 ClientHello is rejected.
@@ -272,7 +289,74 @@ pub const TlsConn = struct {
         self.write_buf.deinit(self.allocator);
         if (self.ocsp_owned12) |bytes| self.allocator.free(bytes);
         if (self.ocsp_owned13) |bytes| self.allocator.free(bytes);
+        if (self.acme_validation) |validation| {
+            validation.lease.wipe();
+            std.crypto.secureZero(u8, std.mem.asBytes(validation));
+            self.allocator.destroy(validation);
+        }
         self.* = undefined;
+    }
+
+    /// True for a connection answering an RFC 8737 tls-alpn-01 validation.
+    /// RFC 8737 §3: such a connection carries no application data; the daemon
+    /// must close it once the handshake completes and never hand it to IRC.
+    pub fn isAcmeTlsAlpn01(self: *const TlsConn) bool {
+        return self.acme_validation != null;
+    }
+
+    /// Engine configs for an `acme-tls/1` validation (RFC 8737 §3): only the
+    /// challenge certificate and its key, only the `acme-tls/1` protocol, and
+    /// no tickets, early data, client certificates, OCSP or delegated
+    /// credentials. The acmeIdentifier extension is critical and unknown to
+    /// the X.509 parser, so the certificate signature-algorithm policy check
+    /// (which parses the chain) is off for this leaf.
+    fn acmeConfig13(base: tls_server.Config, validation: *const AcmeValidation) tls_server.Config {
+        var cfg = base;
+        cfg.cert_chain = &validation.chain;
+        cfg.ecdsa_p256_signing_key = validation.lease.key_pair;
+        cfg.signing_key = null;
+        cfg.rsa_signing_key = null;
+        cfg.alpn_protocols = &acme_alpn_protocols;
+        cfg.sni_certs = &.{};
+        cfg.ocsp_staple = &.{};
+        cfg.enable_session_tickets = false;
+        cfg.max_early_data_size = 0;
+        cfg.delegated_credential = null;
+        cfg.enable_raw_public_key = false;
+        cfg.request_client_cert = false;
+        cfg.enforce_cert_signature_algorithms = false;
+        cfg.enable_cert_compression = false;
+        return cfg;
+    }
+
+    fn acmeConfig12(base: tls12_server.Config, validation: *const AcmeValidation) tls12_server.Config {
+        var cfg = base;
+        cfg.cert_chain = &validation.chain;
+        cfg.ecdsa_p256_signing_key = validation.lease.key_pair;
+        cfg.rsa_signing_key = null;
+        cfg.alpn_protocols = &acme_alpn_protocols;
+        cfg.ocsp_staple = &.{};
+        cfg.enable_session_tickets = false;
+        cfg.request_client_cert = false;
+        return cfg;
+    }
+
+    const acme_alpn_protocols = [_][]const u8{acme_challenge.acme_tls_alpn_protocol};
+
+    /// Consult the tls-alpn-01 store with the complete first record. A hit
+    /// copies the lease into connection-owned storage; a miss (or a
+    /// fragmented hello) handles the connection normally.
+    fn selectAcmeValidation(self: *TlsConn) Error!void {
+        if (self.acme_checked) return;
+        self.acme_checked = true;
+        const store = self.acme_store orelse return;
+        var lease = store.selectForClientHello(self.recv_buf.items) orelse return;
+        errdefer lease.wipe();
+        const validation = try self.allocator.create(AcmeValidation);
+        validation.* = .{ .lease = lease, .chain = undefined };
+        validation.chain = .{validation.lease.certDer()};
+        lease.wipe();
+        self.acme_validation = validation;
     }
 
     /// True once the chosen engine's handshake has completed.
@@ -286,7 +370,8 @@ pub const TlsConn = struct {
     }
 
     pub const KtlsError = error{
-        /// The engine isn't a connected TLS 1.3 session (1.2 offload is deferred).
+        /// The engine isn't a connected TLS 1.3 or TLS 1.2 AEAD session whose
+        /// state the kernel can take over exactly (see `ktlsTxParams`).
         KtlsUnsupportedEngine,
         /// Inbound userspace buffer holds a partial TLS record — attaching kTLS RX
         /// mid-record would desync `app_read_seq` from the kernel.
@@ -304,29 +389,54 @@ pub const TlsConn = struct {
         return info.encode(out);
     }
 
+    fn ktls12Cipher(cipher: tls12_server.Server.KtlsCipher) ktls.Cipher {
+        return switch (cipher) {
+            .aes_128_gcm => .aes_gcm_128,
+            .aes_256_gcm => .aes_gcm_256,
+            .chacha20_poly1305 => .chacha20_poly1305,
+        };
+    }
+
+    /// Map a `tls12_server` kTLS bundle to an encoded TLS 1.2 kernel
+    /// `crypto_info`. `explicit` backs the AES-GCM explicit-nonce field
+    /// (= `seq`, the 1.2 engine's nonce discipline) until `encode` returns.
+    fn encodeKtls12CryptoInfo(params: tls12_server.Server.KtlsParams, explicit: *[ktls.rec_seq_len]u8, out: []u8) KtlsError![]const u8 {
+        const info = try ktls.tls12CryptoInfo(ktls12Cipher(params.cipher), params.fixed_iv, params.key, params.seq, explicit);
+        return info.encode(out);
+    }
+
+    fn buildKtlsCryptoInfo(self: *const TlsConn, direction: ktls.Direction, out: []u8) KtlsError![]const u8 {
+        if (!self.outputBoundaryClean() or self.control_phase != .none or self.tx_ku_reply_pending or self.control_turn_active or
+            self.acme_validation != null) return error.KtlsUnsupportedEngine;
+        switch (self.engine) {
+            .tls13 => |*s| {
+                const params = (if (direction == .tx) s.ktlsTxParams() else s.ktlsRxParams()) orelse return error.KtlsUnsupportedEngine;
+                return encodeKtlsCryptoInfo(params, out);
+            },
+            .tls12 => |*s| {
+                const params = (if (direction == .tx) s.ktlsTxParams() else s.ktlsRxParams()) orelse return error.KtlsUnsupportedEngine;
+                var explicit: [ktls.rec_seq_len]u8 = undefined;
+                defer std.crypto.secureZero(u8, &explicit);
+                return encodeKtls12CryptoInfo(params, &explicit, out);
+            },
+            .undecided => return error.KtlsUnsupportedEngine,
+        }
+    }
+
     /// Encode this session's server→client TX `crypto_info` into `out` (see
-    /// `ktls.CryptoInfo.encode`), ready for `setsockopt(TLS_TX)`. Only the TLS 1.3
-    /// engine is supported (1.2 kTLS derivation is deferred to a later phase);
-    /// returns `KtlsUnsupportedEngine` otherwise or before the handshake completes.
+    /// `ktls.CryptoInfo.encode`), ready for `setsockopt(TLS_TX)`. TLS 1.3 and
+    /// hardened TLS 1.2 AEAD sessions are supported; returns
+    /// `KtlsUnsupportedEngine` before the handshake completes or when the
+    /// engine cannot hand the direction over exactly.
     /// Pure (no syscalls): the byte transform half of `enableKtlsTx`.
     pub fn buildKtlsTxCryptoInfo(self: *const TlsConn, out: []u8) KtlsError![]const u8 {
-        if (!self.outputBoundaryClean() or self.control_phase != .none or self.tx_ku_reply_pending or self.control_turn_active) return error.KtlsUnsupportedEngine;
-        const params = switch (self.engine) {
-            .tls13 => |*s| s.ktlsTxParams() orelse return error.KtlsUnsupportedEngine,
-            .undecided, .tls12 => return error.KtlsUnsupportedEngine,
-        };
-        return encodeKtlsCryptoInfo(params, out);
+        return self.buildKtlsCryptoInfo(.tx, out);
     }
 
     /// The client→server RX `crypto_info` (for `setsockopt(TLS_RX)`). Same
     /// constraints as `buildKtlsTxCryptoInfo`.
     pub fn buildKtlsRxCryptoInfo(self: *const TlsConn, out: []u8) KtlsError![]const u8 {
-        if (!self.outputBoundaryClean() or self.control_phase != .none or self.tx_ku_reply_pending or self.control_turn_active) return error.KtlsUnsupportedEngine;
-        const params = switch (self.engine) {
-            .tls13 => |*s| s.ktlsRxParams() orelse return error.KtlsUnsupportedEngine,
-            .undecided, .tls12 => return error.KtlsUnsupportedEngine,
-        };
-        return encodeKtlsCryptoInfo(params, out);
+        return self.buildKtlsCryptoInfo(.rx, out);
     }
 
     /// Attach Linux kTLS TX offload to `fd` for the completed TLS 1.3 session, so
@@ -353,6 +463,7 @@ pub const TlsConn = struct {
             return;
         }
         var buf: [ktls.max_crypto_info_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &buf);
         const encoded = try self.buildKtlsTxCryptoInfo(&buf);
         try ktls.attachUlp(fd);
         try ktls.attachTx(fd, encoded);
@@ -384,6 +495,7 @@ pub const TlsConn = struct {
             return;
         }
         var buf: [ktls.max_crypto_info_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &buf);
         const encoded = try self.buildKtlsRxCryptoInfo(&buf);
         try ktls.attachUlp(fd);
         try ktls.attachRx(fd, encoded);
@@ -457,7 +569,9 @@ pub const TlsConn = struct {
         if (self.terminal_error != null or self.rx_open_control_type != 0 or self.alert_prefix_len != 0 or self.control_phase == .kernel_control_read_held) return false;
         return switch (self.engine) {
             .tls13 => |engine| engine.post_handshake_recv_len == 0,
-            else => false,
+            // TLS 1.2 has no post-handshake messages in this profile.
+            .tls12 => true,
+            .undecided => false,
         };
     }
 
@@ -469,7 +583,11 @@ pub const TlsConn = struct {
         return self.readKernelControlCandidate(fd, buf, &consumed) catch |err| {
             if (consumed) {
                 self.terminal_error = err;
-                if (self.engine == .tls13) self.engine.tls13.read_failed = true;
+                switch (self.engine) {
+                    .tls13 => |*engine| engine.read_failed = true,
+                    .tls12 => |*engine| engine.read_failed = true,
+                    .undecided => {},
+                }
                 if (err == error.TlsAlert) self.discardTerminalOutput();
             }
             return err;
@@ -479,6 +597,7 @@ pub const TlsConn = struct {
     fn readKernelControlCandidate(self: *TlsConn, fd: i32, buf: []u8, consumed: *bool) (Error || KtlsError || ktls.ControlError || ktls.RecvError)!KernelReadResult {
         if (!self.ktls_rx_offloaded or self.terminal_error != null or self.control_turn_active or
             self.hasPreparedWrite() or self.tx_ku_reply_pending) return error.BadState;
+        if (self.engine == .tls12) return self.readKernelControl12(fd, buf, consumed);
         const engine = try self.engine13();
         var rx_key = try engine.prepareKernelKeyUpdate(.rx);
         defer rx_key.deinit();
@@ -556,6 +675,48 @@ pub const TlsConn = struct {
                 }
                 return .{ .key_update = .{ .requested = requested, .software_reply = software } };
             },
+            else => return error.BadRecord,
+        }
+    }
+
+    /// Kernel RX demux for an offloaded TLS 1.2 session. The kernel already
+    /// authenticated the record (and accepts only record version 0x0303).
+    /// application_data is data; an alert (possibly split across records) is
+    /// terminal; any handshake record is a renegotiation attempt, which this
+    /// profile refuses (RFC 5746 §4.4 permits refusing; the hardened 1.2
+    /// engine never renegotiates), so the connection closes fatally. TLS 1.2
+    /// never enters the TLS 1.3 KeyUpdate paths.
+    fn readKernelControl12(self: *TlsConn, fd: i32, buf: []u8, consumed: *bool) (Error || KtlsError || ktls.ControlError || ktls.RecvError)!KernelReadResult {
+        const engine = &self.engine.tls12;
+        self.control_turn_active = true;
+        defer self.control_turn_active = false;
+        const rr = try ktls.recvmsgRecordType(fd, buf, linux.MSG.DONTWAIT);
+        consumed.* = true;
+        if (self.rx_open_control_type != 0 and self.rx_open_control_type != rr.record_type) return error.BadRecord;
+        switch (rr.record_type) {
+            23 => {
+                if (self.rx_open_control_type != 0 or self.alert_prefix_len != 0) return error.BadRecord;
+                return .{ .application = rr.plaintext };
+            },
+            21 => {
+                const total = @as(usize, self.alert_prefix_len) + rr.plaintext.len;
+                if (total > 2 or (rr.end_of_record and total != 2) or (!rr.end_of_record and total >= 2)) return error.BadRecord;
+                var bytes: [2]u8 = @splat(0);
+                if (self.alert_prefix_len != 0) bytes[0] = self.alert_prefix_byte;
+                @memcpy(bytes[self.alert_prefix_len..][0..rr.plaintext.len], rr.plaintext);
+                if (!rr.end_of_record) {
+                    self.rx_open_control_type = 21;
+                    self.alert_prefix_len = @intCast(total);
+                    self.alert_prefix_byte = if (total != 0) bytes[0] else 0;
+                    return .progress;
+                }
+                _ = @import("../proto/tls_alert.zig").parse(&bytes) catch return error.BadRecord;
+                self.terminal_error = error.TlsAlert;
+                engine.read_failed = true;
+                self.discardTerminalOutput();
+                return error.TlsAlert;
+            },
+            22 => return error.BadHandshake,
             else => return error.BadRecord,
         }
     }
@@ -728,7 +889,11 @@ pub const TlsConn = struct {
         if (!self.outputBoundaryClean()) return error.BadState;
         return switch (self.engine) {
             .tls13 => |*s| s.channelBindingTlsExporter(out),
-            else => error.BadState,
+            // RFC 9266 §2: tls-exporter is defined for TLS 1.2 only when the
+            // master secret is unique, i.e. with the RFC 7627 extended master
+            // secret; the 1.2 engine's exporter refuses (BadState) otherwise.
+            .tls12 => |*s| s.channelBindingTlsExporter(out),
+            .undecided => error.BadState,
         };
     }
 
@@ -779,16 +944,33 @@ pub const TlsConn = struct {
         self.plain_buf.clearRetainingCapacity();
         try self.recv_buf.appendSlice(self.allocator, socket_bytes);
 
+        // A TLS 1.3-only adapter builds its engine before any input; it has
+        // consumed nothing yet, so a tls-alpn-01 hit on the first complete
+        // record can still swap in the challenge-certificate engine.
+        if (!self.acme_checked and self.acme_store != null and self.engine == .tls13 and
+            try completeRecordLen(self.recv_buf.items) != null)
+        {
+            try self.selectAcmeValidation();
+            if (self.acme_validation) |validation| {
+                const replacement = try tls_server.Server.init(self.allocator, acmeConfig13(self.cfg13, validation));
+                self.engine.tls13.deinit();
+                self.engine = .{ .tls13 = replacement };
+            }
+        }
         if (std.meta.activeTag(self.engine) == .undecided) {
-            switch (try self.detectVersion()) {
+            const detected = try self.detectVersion();
+            if (detected != .need_more) try self.selectAcmeValidation();
+            switch (detected) {
                 .need_more => return .{ .handshake_bytes = &.{}, .plaintext = &.{} },
                 .tls13 => {
-                    const s13 = try tls_server.Server.init(self.allocator, self.cfg13);
+                    const cfg = if (self.acme_validation) |validation| acmeConfig13(self.cfg13, validation) else self.cfg13;
+                    const s13 = try tls_server.Server.init(self.allocator, cfg);
                     self.engine = .{ .tls13 = s13 };
                 },
                 .tls12 => {
                     const c12 = self.cfg12 orelse return error.ProtocolVersion;
-                    const s12 = try tls12_server.Server.init(self.allocator, c12);
+                    const cfg = if (self.acme_validation) |validation| acmeConfig12(c12, validation) else c12;
+                    const s12 = try tls12_server.Server.init(self.allocator, cfg);
                     self.engine = .{ .tls12 = s12 };
                 },
             }
@@ -1060,11 +1242,19 @@ pub const TlsConn = struct {
         if ((input.tx_offloaded and (engine_pending.len != 0 or self.unpublished.items.len != 0)) or
             (input.rx_offloaded and state.pending_recv.len != 0)) return error.BadState;
         try validateKernelRxControlPhase(input.rx_offloaded, state.barrier_phase, if (state.engine == .tls13) state.engine.tls13.ku_prefix_len else 0, state.rx_open_control_type, state.alert_prefix_len);
-        if (state.engine == .tls13) {
-            const rs = &state.engine.tls13;
-            if (input.tx_offloaded) rs.app_write_seq = try self.kernelSequence(input.fd, .tx);
-            if (input.rx_offloaded) rs.app_read_seq = try self.kernelSequence(input.fd, .rx);
-        } else if (input.tx_offloaded or input.rx_offloaded) return error.BadState;
+        // Once the kernel owns a direction the engine's sequence is stale: the
+        // successor must continue from the kernel's next record sequence.
+        switch (state.engine) {
+            .tls13 => |*rs| {
+                if (input.tx_offloaded) rs.app_write_seq = try self.kernelSequence(input.fd, .tx);
+                if (input.rx_offloaded) rs.app_read_seq = try self.kernelSequence(input.fd, .rx);
+            },
+            .tls12 => |*rs| {
+                if (state.tx_ku_reply_pending or state.barrier_phase == .userspace_requested_ku_held) return error.BadState;
+                if (input.tx_offloaded) rs.app_write_seq = try self.kernelSequence(input.fd, .tx);
+                if (input.rx_offloaded) rs.app_read_seq = try self.kernelSequence(input.fd, .rx);
+            },
+        }
         if (try deferredCiphertextCharge(state.engine, input.deferred_plain) != input.deferred_ciphertext_charge) return error.InvalidDeferred;
         var total: usize = engine_pending.len;
         for (input.wire_chunks) |piece| total = std.math.add(usize, total, piece.len) catch return error.PlaintextTooLong;
@@ -1090,7 +1280,8 @@ pub const TlsConn = struct {
         if (comptime builtin.os.tag != .linux) return error.Unsupported;
         const engine = switch (self.engine) {
             .tls13 => |*value| value,
-            else => return error.KtlsUnsupportedEngine,
+            .tls12 => |*value| return kernelSequence12(value, fd, direction),
+            .undecided => return error.KtlsUnsupportedEngine,
         };
         const params = (if (direction == .tx) engine.ktlsTxParams() else engine.ktlsRxParams()) orelse return error.KtlsUnsupportedEngine;
         var expected: [ktls.max_crypto_info_len]u8 = undefined;
@@ -1104,6 +1295,24 @@ pub const TlsConn = struct {
         var actual = try ktls.getTuple(fd, direction, cipher);
         defer actual.wipe();
         try actual.validateEpoch(encoded);
+        return actual.sequence();
+    }
+
+    /// TLS 1.2: read the live tuple with the 1.2 version and check its key,
+    /// salt and the `iv == rec_seq` nonce invariant (`validateTls12Epoch`);
+    /// the engine's own sequence may be stale once the kernel owns the
+    /// direction, so only the key material is compared.
+    fn kernelSequence12(engine: *const tls12_server.Server, fd: i32, direction: ktls.Direction) (KtlsError || ktls.ControlError)!u64 {
+        const params = (if (direction == .tx) engine.ktlsTxParams() else engine.ktlsRxParams()) orelse return error.KtlsUnsupportedEngine;
+        var expected: [ktls.max_crypto_info_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &expected);
+        var explicit: [ktls.rec_seq_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &explicit);
+        const encoded = try encodeKtls12CryptoInfo(params, &explicit, &expected);
+        const cipher = ktls12Cipher(params.cipher);
+        var actual = try ktls.getTupleVersion(fd, direction, cipher, ktls.TLS_1_2_VERSION);
+        defer actual.wipe();
+        try actual.validateTls12Epoch(cipher, encoded);
         return actual.sequence();
     }
 
@@ -1127,7 +1336,14 @@ pub const TlsConn = struct {
                 if (tx and try self.kernelSequence(fd, .tx) != engine.app_write_seq) return error.TupleMismatch;
                 if (rx and try self.kernelSequence(fd, .rx) != engine.app_read_seq) return error.TupleMismatch;
             },
-            .tls12 => if (tx or rx or self.tx_ku_reply_pending or self.rx_open_control_type != 0 or self.control_phase != .none) return error.BadState,
+            .tls12 => |*engine| {
+                // No KeyUpdate exists in TLS 1.2: only an open alert may be
+                // pending under the kernel-control hold.
+                if (self.tx_ku_reply_pending or self.rx_open_control_type == 22 or
+                    self.control_phase == .userspace_requested_ku_held) return error.BadState;
+                if (tx and try self.kernelSequence(fd, .tx) != engine.app_write_seq) return error.TupleMismatch;
+                if (rx and try self.kernelSequence(fd, .rx) != engine.app_read_seq) return error.TupleMismatch;
+            },
             .undecided => return error.BadState,
         }
         if (!rx and (self.rx_open_control_type != 0 or self.alert_prefix_len != 0)) return error.BadState;
@@ -4685,5 +4901,337 @@ test "protected MEDIA signaling: actual kernel epoch getter keeps held KU and ty
         defer a.free(last_plain);
         try std.testing.expectEqual(@as(usize, 0), last_plain.len);
         try protectedSignalingEpochUnchanged(pair, sockets.server, cipher);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Armor wave 3 (integrator): TLS 1.2 channel binding, TLS 1.2 kTLS, RFC 8737.
+// ---------------------------------------------------------------------------
+
+fn tls12Handshake(alloc: Allocator, conn: *TlsConn, client: *tls12_client.Client) !void {
+    const ch = try client.start();
+    defer alloc.free(ch);
+    const sf = try conn.onInbound(ch);
+    try std.testing.expectEqual(Version.tls12, conn.negotiatedVersion().?);
+    const cf = switch (try client.feed(sf.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer alloc.free(cf);
+    const sfin = try conn.onInbound(cf);
+    _ = try client.feed(sfin.handshake_bytes);
+    try std.testing.expect(conn.handshakeDone());
+    try std.testing.expect(client.handshakeDone());
+}
+
+fn ecdsaLeaf(buf: []u8, key: ecdsa_p256.KeyPair) ![]const u8 {
+    return x509_selfsign.buildSelfSignedEcdsaP256(buf, .{
+        .common_name = "irc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 1_893_456_000,
+        .serial = &.{ 1, 2, 3, 4 },
+        .key_pair = key,
+        .dns_names = &.{"irc.test"},
+        .is_ca = true,
+    });
+}
+
+test "RFC 9266: TLS 1.2 tls-exporter channel binding matches the client and is not re-derivable after resume" {
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x61)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    const ec_key = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var ec_buf: [2048]u8 = undefined;
+    const ec_der = try ecdsaLeaf(&ec_buf, ec_key);
+    const cfg13: tls_server.Config = .{ .cert_chain = &.{der}, .signing_key = kp };
+    const cfg12: tls12_server.Config = .{ .cert_chain = &.{ec_der}, .ecdsa_p256_signing_key = ec_key };
+    var conn = TlsConn.initDual(alloc, cfg13, cfg12);
+    defer conn.deinit();
+    var client = try tls12_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{ec_der}, .now_unix_seconds = 1_735_689_600 });
+    defer client.deinit();
+    try tls12Handshake(alloc, &conn, &client);
+
+    var server_cb: [32]u8 = undefined;
+    try conn.channelBindingTlsExporter(&server_cb);
+    var client_cb: [32]u8 = undefined;
+    try client.channelBindingTlsExporter(&client_cb);
+    try std.testing.expectEqualSlices(u8, &client_cb, &server_cb);
+
+    // A Helix-resumed TLS 1.2 engine carries no master secret, so the binding
+    // can only reach the successor as the carried value (tls_snapshot v4).
+    const st = try conn.exportResume();
+    var resumed = try TlsConn.resumeFrom(alloc, cfg13, cfg12, st);
+    defer resumed.deinit();
+    var after: [32]u8 = undefined;
+    try std.testing.expectError(error.BadState, resumed.channelBindingTlsExporter(&after));
+}
+
+test "kTLS TLS 1.2: crypto_info carries the 1.2 version, key, salt and explicit nonce = seq" {
+    const alloc = std.testing.allocator;
+    const native = @import("builtin").cpu.arch.endian();
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x62)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    const ec_key = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var ec_buf: [2048]u8 = undefined;
+    const ec_der = try ecdsaLeaf(&ec_buf, ec_key);
+    var conn = TlsConn.initDual(alloc, .{ .cert_chain = &.{der}, .signing_key = kp }, .{ .cert_chain = &.{ec_der}, .ecdsa_p256_signing_key = ec_key });
+    defer conn.deinit();
+    var client = try tls12_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{ec_der}, .now_unix_seconds = 1_735_689_600 });
+    defer client.deinit();
+
+    var buf: [ktls.max_crypto_info_len]u8 = undefined;
+    try std.testing.expectError(error.KtlsUnsupportedEngine, conn.buildKtlsTxCryptoInfo(&buf));
+    try tls12Handshake(alloc, &conn, &client);
+    // Advance the server's write sequence so the nonce check is non-trivial
+    // (the Finished record already used sequence 0).
+    const seq_before = conn.engine.tls12.app_write_seq;
+    const sealed = try conn.write("one");
+    const opened = try client.decrypt(sealed);
+    alloc.free(opened);
+
+    const engine = &conn.engine.tls12;
+    const suite = engine.selected_suite.?;
+    const tx = try conn.buildKtlsTxCryptoInfo(&buf);
+    try std.testing.expectEqual(ktls.TLS_1_2_VERSION, std.mem.readInt(u16, tx[0..2], native));
+    const seq_bytes = ktls.seqToBytes(engine.app_write_seq);
+    try std.testing.expectEqual(seq_before + 1, engine.app_write_seq);
+    try std.testing.expectEqualSlices(u8, &seq_bytes, tx[tx.len - 8 ..]);
+    switch (suite.aead()) {
+        .aes_128_gcm, .aes_256_gcm => {
+            // [hdr 4][iv 8 = seq][key][salt 4 = fixed iv][rec_seq 8]
+            try std.testing.expectEqualSlices(u8, &seq_bytes, tx[4..12]);
+            try std.testing.expectEqualSlices(u8, engine.keys.server_write.key[0..suite.keyLen()], tx[12..][0..suite.keyLen()]);
+            try std.testing.expectEqualSlices(u8, engine.keys.server_write.iv[0..4], tx[12 + suite.keyLen() ..][0..4]);
+        },
+        .chacha20_poly1305 => {
+            try std.testing.expectEqualSlices(u8, engine.keys.server_write.iv[0..12], tx[4..16]);
+            try std.testing.expectEqualSlices(u8, engine.keys.server_write.key[0..32], tx[16..48]);
+        },
+    }
+    const rx = try conn.buildKtlsRxCryptoInfo(&buf);
+    try std.testing.expectEqual(ktls.TLS_1_2_VERSION, std.mem.readInt(u16, rx[0..2], native));
+    try std.testing.expectEqualSlices(u8, &ktls.seqToBytes(engine.app_read_seq), rx[rx.len - 8 ..]);
+}
+
+fn loopbackPairOrSkip() !struct { client: linux.fd_t, server: linux.fd_t } {
+    const listen_fd = try testTcpSocketOrSkip();
+    defer _ = linux.close(listen_fd);
+    var addr = linux.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+    if (posix.errno(linux.bind(listen_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    if (posix.errno(linux.listen(listen_fd, 1)) != .SUCCESS) return error.SkipZigTest;
+    var storage: posix.sockaddr.storage = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    if (posix.errno(linux.getsockname(listen_fd, @ptrCast(&storage), &slen)) != .SUCCESS) return error.SkipZigTest;
+    addr.port = (@as(*const linux.sockaddr.in, @ptrCast(@alignCast(&storage)))).port;
+    const client_fd = try testTcpSocketOrSkip();
+    errdefer _ = linux.close(client_fd);
+    if (posix.errno(linux.connect(client_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    const accept_rc = linux.accept4(listen_fd, null, null, 0);
+    if (posix.errno(accept_rc) != .SUCCESS) return error.SkipZigTest;
+    return .{ .client = client_fd, .server = @intCast(accept_rc) };
+}
+
+fn writeAllFd(fd: linux.fd_t, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+        if (posix.errno(rc) != .SUCCESS) return error.TestUnexpectedResult;
+        off += @intCast(rc);
+    }
+}
+
+test "kTLS TLS 1.2: kernel TX/RX interoperate with the 1.2 client, capture carries kernel seqs, control records fail closed" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x63)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    const ec_key = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var ec_buf: [2048]u8 = undefined;
+    const ec_der = try ecdsaLeaf(&ec_buf, ec_key);
+    const cfg13: tls_server.Config = .{ .cert_chain = &.{der}, .signing_key = kp };
+    const cfg12: tls12_server.Config = .{ .cert_chain = &.{ec_der}, .ecdsa_p256_signing_key = ec_key };
+    var conn = TlsConn.initDual(alloc, cfg13, cfg12);
+    defer conn.deinit();
+    var client = try tls12_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{ec_der}, .now_unix_seconds = 1_735_689_600 });
+    defer client.deinit();
+    try tls12Handshake(alloc, &conn, &client);
+    const write_seq0 = conn.engine.tls12.app_write_seq;
+    const read_seq0 = conn.engine.tls12.app_read_seq;
+
+    const pair = try loopbackPairOrSkip();
+    defer _ = linux.close(pair.client);
+    defer _ = linux.close(pair.server);
+    conn.enableKtlsTx(pair.server) catch return error.SkipZigTest;
+    conn.enableKtlsRx(pair.server) catch return error.SkipZigTest;
+    try std.testing.expect(conn.kernelApplicationAllowed());
+
+    // Kernel TX: plaintext written to the socket arrives as a 1.2 record.
+    const msg = "kernel tls12 tx";
+    try writeAllFd(pair.server, msg);
+    var rec: [512]u8 = undefined;
+    const rn = linux.read(pair.client, &rec, rec.len);
+    if (posix.errno(rn) != .SUCCESS) return error.TestUnexpectedResult;
+    const got = try client.decrypt(rec[0..@intCast(rn)]);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(msg, got);
+
+    // Kernel RX: a client record is decrypted into recv() plaintext.
+    const c2s = try client.encrypt("kernel tls12 rx");
+    defer alloc.free(c2s);
+    try writeAllFd(pair.client, c2s);
+    var plain: [256]u8 = undefined;
+    const pn = linux.read(pair.server, &plain, plain.len);
+    if (posix.errno(pn) != .SUCCESS) return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("kernel tls12 rx", plain[0..@intCast(pn)]);
+
+    // Helix capture writes the kernel's next sequences back into the state.
+    {
+        var capture = try conn.prepareCapture(alloc, .{
+            .fd = pair.server,
+            .tx_offloaded = true,
+            .rx_offloaded = true,
+            .wire_chunks = &.{},
+            .deferred_plain = &.{},
+            .deferred_ciphertext_charge = 0,
+            .control_charge = 0,
+            .queue_cap = 1 << 20,
+            .kernel_tx_prefix_remaining = 0,
+        });
+        defer capture.deinit();
+        try std.testing.expectEqual(write_seq0 + 1, capture.state.engine.tls12.app_write_seq);
+        try std.testing.expectEqual(read_seq0 + 1, capture.state.engine.tls12.app_read_seq);
+        // The successor validates the inherited kernel tuples on the same fd.
+        var successor = try TlsConn.resumeFrom(alloc, cfg13, cfg12, capture.state);
+        defer successor.deinit();
+        try successor.restoreInheritedOffload(pair.server, true, true);
+        try std.testing.expect(successor.ktls_tx_offloaded and successor.ktls_rx_offloaded);
+        // A stale engine sequence is a tuple mismatch, never a silent adopt.
+        var stale_state = capture.state;
+        stale_state.engine.tls12.app_write_seq = write_seq0;
+        var stale = try TlsConn.resumeFrom(alloc, cfg13, cfg12, stale_state);
+        defer stale.deinit();
+        try std.testing.expectError(error.TupleMismatch, stale.restoreInheritedOffload(pair.server, true, true));
+    }
+
+    // A handshake record (renegotiation) under kernel RX is fatal.
+    const suite = client.selected_suite.?;
+    const reneg = try tls12.sealRecordAlloc(alloc, suite, &client.keys.client_write, client.app_write_seq, .handshake, &.{ 0, 0, 0, 0 });
+    defer alloc.free(reneg);
+    client.app_write_seq += 1;
+    try writeAllFd(pair.client, reneg);
+    var control: [256]u8 = undefined;
+    conn.control_phase = .kernel_control_read_held;
+    try std.testing.expectError(error.BadHandshake, conn.readKernelControl(pair.server, &control));
+    try std.testing.expect(conn.terminal_error != null);
+    try std.testing.expect(conn.engine.tls12.read_failed);
+}
+
+test "kTLS TLS 1.2: an alert under kernel RX is terminal and application data passes" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x64)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    const ec_key = ecdsa_p256.KeyPair.generate(std.testing.io);
+    var ec_buf: [2048]u8 = undefined;
+    const ec_der = try ecdsaLeaf(&ec_buf, ec_key);
+    var conn = TlsConn.initDual(alloc, .{ .cert_chain = &.{der}, .signing_key = kp }, .{ .cert_chain = &.{ec_der}, .ecdsa_p256_signing_key = ec_key });
+    defer conn.deinit();
+    var client = try tls12_client.Client.init(alloc, .{ .server_name = "irc.test", .trust_anchors = &.{ec_der}, .now_unix_seconds = 1_735_689_600 });
+    defer client.deinit();
+    try tls12Handshake(alloc, &conn, &client);
+    const pair = try loopbackPairOrSkip();
+    defer _ = linux.close(pair.client);
+    defer _ = linux.close(pair.server);
+    conn.enableKtlsRx(pair.server) catch return error.SkipZigTest;
+
+    const suite = client.selected_suite.?;
+    const data = try tls12.sealRecordAlloc(alloc, suite, &client.keys.client_write, client.app_write_seq, .application_data, "data");
+    defer alloc.free(data);
+    client.app_write_seq += 1;
+    const alert = try tls12.sealRecordAlloc(alloc, suite, &client.keys.client_write, client.app_write_seq, .alert, &.{ 1, 0 });
+    defer alloc.free(alert);
+    client.app_write_seq += 1;
+    try writeAllFd(pair.client, data);
+    try writeAllFd(pair.client, alert);
+    var control: [256]u8 = undefined;
+    conn.control_phase = .kernel_control_read_held;
+    switch (try conn.readKernelControl(pair.server, &control)) {
+        .application => |plain| try std.testing.expectEqualStrings("data", plain),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.TlsAlert, conn.readKernelControl(pair.server, &control));
+    try std.testing.expect(conn.engine.tls12.read_failed);
+}
+
+test "RFC 8737 tls-alpn-01: an acme-tls/1 hello gets the challenge certificate and ALPN; others are untouched" {
+    const alloc = std.testing.allocator;
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(0x65)));
+    var cert_buf: [1024]u8 = undefined;
+    const der = try makeLeaf(&cert_buf, kp);
+    const cfg13: tls_server.Config = .{ .cert_chain = &.{der}, .signing_key = kp, .alpn_protocols = &.{"irc"}, .enable_session_tickets = false };
+
+    var store: acme_runner.TlsAlpn01Store = .{};
+    var challenge_buf: [acme_challenge.max_tls_alpn01_cert_len]u8 = undefined;
+    var minted = try acme_runner.mintTlsAlpn01(std.testing.io, &challenge_buf, "irc.example.test", "token.thumbprint", 1_735_689_600);
+    defer ecdsa_p256.wipeKeyPair(&minted.key_pair);
+    try store.put("irc.example.test", minted.der, minted.key_pair);
+
+    // Validation handshake: SNI = the domain, ALPN exactly acme-tls/1.
+    {
+        var conn = try TlsConn.initBorrowed(alloc, cfg13);
+        defer conn.deinit();
+        conn.acme_store = &store;
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.example.test", .trust_anchors = &.{}, .alpn_protocols = &.{acme_challenge.acme_tls_alpn_protocol} });
+        defer client.deinit();
+        client.disableServerCertVerification();
+        const ch = try client.start();
+        defer alloc.free(ch);
+        const flight = try conn.onInbound(ch);
+        try std.testing.expect(flight.handshake_bytes.len != 0);
+        try std.testing.expect(conn.isAcmeTlsAlpn01());
+        // The engine presents the challenge certificate and its key, selects
+        // acme-tls/1, and issues no ticket or early data (RFC 8737 §3).
+        const engine_cfg = conn.engine.tls13.config;
+        try std.testing.expectEqualSlices(u8, minted.der, engine_cfg.cert_chain[0]);
+        try std.testing.expectEqual(@as(usize, 1), engine_cfg.cert_chain.len);
+        try std.testing.expect(engine_cfg.ecdsa_p256_signing_key != null and engine_cfg.signing_key == null);
+        try std.testing.expectEqualStrings(acme_challenge.acme_tls_alpn_protocol, engine_cfg.alpn_protocols[0]);
+        try std.testing.expect(!engine_cfg.enable_session_tickets and engine_cfg.max_early_data_size == 0);
+        try std.testing.expectEqualStrings(acme_challenge.acme_tls_alpn_protocol, conn.selectedAlpn().?);
+        // Our own client refuses the critical acmeIdentifier extension, as an
+        // ordinary client should; the CA validator accepts it.
+        try std.testing.expectError(error.UnsupportedCriticalExtension, client.feed(flight.handshake_bytes));
+        var info: [ktls.max_crypto_info_len]u8 = undefined;
+        try std.testing.expectError(error.KtlsUnsupportedEngine, conn.buildKtlsTxCryptoInfo(&info));
+    }
+    // An ordinary IRC hello (ALPN irc) to the same SNI is not a validation.
+    {
+        var conn = try TlsConn.initBorrowed(alloc, cfg13);
+        defer conn.deinit();
+        conn.acme_store = &store;
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.example.test", .trust_anchors = &.{der}, .alpn_protocols = &.{"irc"} });
+        defer client.deinit();
+        client.disableServerCertVerification();
+        const ch = try client.start();
+        defer alloc.free(ch);
+        _ = try conn.onInbound(ch);
+        try std.testing.expect(!conn.isAcmeTlsAlpn01());
+        try std.testing.expectEqualSlices(u8, der, conn.engine.tls13.config.cert_chain[0]);
+    }
+    // acme-tls/1 for a name with no live challenge is handled normally.
+    {
+        var conn = try TlsConn.initBorrowed(alloc, cfg13);
+        defer conn.deinit();
+        conn.acme_store = &store;
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "other.example.test", .trust_anchors = &.{}, .alpn_protocols = &.{acme_challenge.acme_tls_alpn_protocol} });
+        defer client.deinit();
+        const ch = try client.start();
+        defer alloc.free(ch);
+        _ = try conn.onInbound(ch);
+        try std.testing.expect(!conn.isAcmeTlsAlpn01());
     }
 }

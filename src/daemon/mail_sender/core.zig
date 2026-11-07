@@ -15,6 +15,12 @@ const platform = @import("../../substrate/platform.zig");
 const store_mod = @import("../store.zig");
 const runtime_pause = @import("../runtime_pause.zig");
 const testing = std.testing;
+
+/// RFC 8701 GREASE stays on for this outbound TLS 1.3 client so peers that
+/// mishandle unknown values are found early; GREASE ECH stays off because the
+/// daemon holds no ECHConfig for these hosts (draft-ietf-tls-esni §6.2).
+pub const outbound_grease = true;
+pub const outbound_ech_grease = false;
 const Config = @import("config.zig").Config;
 const configDigest = @import("config.zig").configDigest;
 const dormant_spawn_options = @import("limits.zig").dormant_spawn_options;
@@ -815,6 +821,8 @@ pub const Sender = struct {
             .server_name = self.config.relay_host,
             .trust_anchors = self.config.trust_anchors,
             .now_unix_seconds = wallClockSeconds(),
+            .grease = outbound_grease,
+            .ech_grease = outbound_ech_grease,
         });
         errdefer tc.deinit();
         if (self.config.insecure_skip_verify) tc.disableServerCertVerification();
@@ -1010,4 +1018,13 @@ test "companion failure custody mail exhausted reservation preserves accepted qu
     const fence = try sender.fenceProducers();
     try std.testing.expectError(error.OperationActive, sender.requireSettled(fence));
     try std.testing.expectError(error.FileNotFound, store_mod.openColdExisting(std.testing.io, tmp.dir, "unused.wal", .read_only));
+}
+
+test "outbound TLS client keeps RFC 8701 GREASE on and GREASE ECH off" {
+    try std.testing.expect(outbound_grease);
+    try std.testing.expect(!outbound_ech_grease);
+    var tc = try tls_client.Client.init(std.testing.allocator, .{ .server_name = "example.test", .trust_anchors = &.{}, .grease = outbound_grease, .ech_grease = outbound_ech_grease });
+    defer tc.deinit();
+    try std.testing.expect(tc.grease != null);
+    try std.testing.expect(!tc.ech_grease);
 }

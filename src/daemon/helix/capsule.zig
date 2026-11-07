@@ -194,7 +194,10 @@ pub const registry = [_]Descriptor{
     // adopting both historical v1 shapes (a pre-bump predecessor's next USR2 into
     // this binary must not netsplit); `tls_snapshot.decode` is version-aware (the
     // v1 arm tolerates the flags being absent OR present, v2 requires them).
-    .{ .kind = .tls_session, .schema_id = 0x4854_4c53, .current_version = 3, .min_supported = 3, .max_supported = 3 },
+    // v4 (2026-11): TLS 1.2 rows carry the RFC 9266 channel-binding tail and
+    // may be kTLS-offloaded. v3 rows (no tail, never offloaded) still decode;
+    // their TLS 1.2 binding is absent, so -PLUS is not offered for them.
+    .{ .kind = .tls_session, .schema_id = 0x4854_4c53, .current_version = 4, .min_supported = 3, .max_supported = 4 },
     .{ .kind = .mooring_ratchet, .schema_id = 0x4856_4549, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     // v2 (2026-07) introduces exact property-state checkpoints. Ordinary
     // magic-discriminated mesh payloads retain the full 1..2 range so a v1
@@ -710,11 +713,13 @@ test "mesh checkpoint v2 keeps ordinary pieces compatible and exact pieces fail 
     try std.testing.expectEqual(@as(u32, 1), exact_capsule.fields[0].ordinal);
 }
 
-test "tls_session requires exact canonical v3 and rejects predecessor descriptors" {
+// Updated for tls_session v4 (TLS 1.2 channel-binding tail + TLS 1.2 kTLS):
+// the previous form asserted the v3-only descriptor this change replaces.
+test "tls_session writes v4, still adopts canonical v3, and rejects older descriptors" {
     const d = descriptor(.tls_session);
-    try std.testing.expectEqual(@as(u16, 3), d.current_version);
+    try std.testing.expectEqual(@as(u16, 4), d.current_version);
     try std.testing.expectEqual(@as(u16, 3), d.min_supported);
-    try std.testing.expectEqual(@as(u16, 3), d.max_supported);
+    try std.testing.expectEqual(@as(u16, 4), d.max_supported);
     for (1..3) |version| {
         var legacy = Header.init(.tls_session);
         legacy.version = @intCast(version);
@@ -722,7 +727,12 @@ test "tls_session requires exact canonical v3 and rejects predecessor descriptor
         legacy.max_supported = @intCast(version);
         try std.testing.expectError(error.VersionUnsupported, negotiate(d, legacy));
     }
-    try std.testing.expectEqual(@as(u16, 3), try negotiate(d, Header.init(.tls_session)));
+    var v3 = Header.init(.tls_session);
+    v3.version = 3;
+    v3.min_supported = 3;
+    v3.max_supported = 3;
+    try std.testing.expectEqual(@as(u16, 3), try negotiate(d, v3));
+    try std.testing.expectEqual(@as(u16, 4), try negotiate(d, Header.init(.tls_session)));
 }
 
 test "sessions is a rolling v1 through v4 descriptor" {

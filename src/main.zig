@@ -3832,6 +3832,7 @@ pub fn main(init: std.process.Init) !void {
                 if (wt_listener.?.port != srv_cfg.webtransport_port or wt_listener.?.irc_port != irc_port)
                     windows_driver.candidateAbortNow();
                 wt_listener.?.irc_host = srv_cfg.host;
+                wt_listener.?.applyQuicPolicy(srv_cfg.webtransport_quic) catch windows_driver.candidateAbortNow();
                 if (windows_wt_active_body) |*body| {
                     wt_listener.?.prepareActiveConnectionsWindows(&body.snapshot, body.bridges) catch |err| {
                         std.debug.print("onyx-server: Windows Helix active WebTransport restore failed ({s})\n", .{@errorName(err)});
@@ -3861,6 +3862,7 @@ pub fn main(init: std.process.Init) !void {
             if (comptime builtin.os.tag == .windows) {
                 if (srv.acme_worker == s) srv.acme_worker = null;
             }
+            if (srv.acme_tls_alpn01_store == s.tlsAlpn01Store()) srv.acme_tls_alpn01_store = null;
             allocator.destroy(s);
         }
     };
@@ -3959,6 +3961,10 @@ pub fn main(init: std.process.Init) !void {
                 const svc = try allocator.create(AcmeRenewalService);
                 svc.* = AcmeRenewalService.init(allocator, init.io, srv, h.parsed.acme, &h.parsed.tls);
                 acme_renewal = svc;
+                // RFC 8737 §3: the implicit-TLS listener must answer
+                // acme-tls/1 validation hellos from this Service's store on
+                // every platform, not only where `acme_worker` is set.
+                if (h.parsed.acme.challenge == .tls_alpn_01) srv.acme_tls_alpn01_store = svc.tlsAlpn01Store();
                 if (comptime builtin.os.tag == .windows) {
                     // Pause and parked-restore both require the bound clock.
                     try svc.prepareColdResources(init.io);
@@ -4478,6 +4484,12 @@ pub fn main(init: std.process.Init) !void {
             .{ .cert_chain = srv_cfg.tls_cert_chain, .signing_key = signing_key },
             irc_port,
         );
+        wt_listener.?.applyQuicPolicy(srv_cfg.webtransport_quic) catch |err| {
+            std.debug.print("onyx-server: [webtransport] QUIC policy rejected ({s})\n", .{@errorName(err)});
+            wt_listener.?.deinit();
+            wt_listener = null;
+            return err;
+        };
         if (comptime builtin.os.tag == .windows) wt_listener.?.irc_host = srv_cfg.host;
         // Bind on all interfaces, dual-stack: the listener's socket is AF_INET6
         // with IPV6_V6ONLY=0, so `any_be` binds [::] and serves both IPv6 and

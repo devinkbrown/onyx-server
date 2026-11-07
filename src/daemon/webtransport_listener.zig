@@ -141,6 +141,7 @@ const quic_retry = @import("../proto/quic_retry.zig");
 const http3_conn = @import("../proto/http3_conn.zig");
 const quic_transport_params = @import("../proto/quic_transport_params.zig");
 const quic_handshake = @import("../proto/quic_handshake.zig");
+const supported_groups = @import("../proto/supported_groups.zig");
 const tls_resumption = @import("../crypto/tls_resumption.zig");
 
 /// Process-wide time-bounded single-use guard for accepted QUIC 0-RTT binders
@@ -153,6 +154,69 @@ var quic_replay_guard: quic_handshake.EarlyDataReplayGuard = .{};
 /// RFC 8446 §8.3 ticket-age tolerance used for QUIC 0-RTT; also sizes the
 /// replay guard's retention and the post-restart quiet window.
 const quic_early_data_skew_ms: u32 = 10_000;
+
+/// Process-wide QUIC handshake counters for `/metrics`. Globals (like the
+/// replay guard) so listener copies across Helix never split or double count.
+pub const QuicStats = struct {
+    /// Handshakes that completed with a PSK (RFC 8446 §2.2).
+    resumptions: std.atomic.Value(u64) = .init(0),
+    /// Completed handshakes whose 0-RTT offer was accepted / refused.
+    early_data_accepted: std.atomic.Value(u64) = .init(0),
+    early_data_rejected: std.atomic.Value(u64) = .init(0),
+    /// Stateless Reset datagrams actually sent (RFC 9000 §10.3).
+    stateless_resets_sent: std.atomic.Value(u64) = .init(0),
+
+    fn onEstablished(self: *QuicStats, resumed: bool, early_offered: bool, early_accepted: bool) void {
+        if (resumed) _ = self.resumptions.fetchAdd(1, .monotonic);
+        if (early_accepted) {
+            _ = self.early_data_accepted.fetchAdd(1, .monotonic);
+        } else if (early_offered) {
+            _ = self.early_data_rejected.fetchAdd(1, .monotonic);
+        }
+    }
+};
+pub var quic_stats: QuicStats = .{};
+
+/// Operator QUIC policy from `[webtransport]` and `[tls] groups`. Applied to a
+/// listener on cold start and to every Helix candidate, so a successor never
+/// silently runs with a different policy than its configuration.
+pub const QuicPolicy = struct {
+    resumption: bool = false,
+    early_data: bool = false,
+    ticket_lifetime_seconds: u32 = 86_400,
+    stateless_reset_key: ?[32]u8 = null,
+    group_order: []const quic_handshake.KeyExchangeGroup = &quic_handshake.default_group_order,
+};
+
+const quic_order_hybrid_first = [_]quic_handshake.KeyExchangeGroup{ .x25519mlkem768, .x25519 };
+const quic_order_classic_first = [_]quic_handshake.KeyExchangeGroup{ .x25519, .x25519mlkem768 };
+const quic_order_hybrid_only = [_]quic_handshake.KeyExchangeGroup{.x25519mlkem768};
+const quic_order_classic_only = [_]quic_handshake.KeyExchangeGroup{.x25519};
+
+/// The QUIC listener's group order for a `[tls] groups` list: the subset the
+/// QUIC handshake implements (X25519MLKEM768, x25519), in the operator's
+/// order. Returns a static slice, so the result has no lifetime tie to the
+/// config. Null when the list names neither group (QUIC could never agree on
+/// a key share with this server).
+pub fn quicGroupOrderFor(groups: []const supported_groups.NamedGroup) ?[]const quic_handshake.KeyExchangeGroup {
+    var first: ?quic_handshake.KeyExchangeGroup = null;
+    var second: ?quic_handshake.KeyExchangeGroup = null;
+    for (groups) |group| {
+        const mapped: quic_handshake.KeyExchangeGroup = switch (group) {
+            .x25519mlkem768 => .x25519mlkem768,
+            .x25519 => .x25519,
+            else => continue,
+        };
+        if (first == null) {
+            first = mapped;
+        } else if (second == null and first.? != mapped) {
+            second = mapped;
+        }
+    }
+    const head = first orelse return null;
+    if (second == null) return if (head == .x25519mlkem768) &quic_order_hybrid_only else &quic_order_classic_only;
+    return if (head == .x25519mlkem768) &quic_order_hybrid_first else &quic_order_classic_first;
+}
 const proxy_protocol = @import("../proto/proxy_protocol.zig");
 const media_socket = @import("../substrate/media_socket.zig");
 const dualstack_udp = @import("dualstack_udp.zig");
@@ -262,6 +326,9 @@ const Connection = struct {
     wt_stream_id: ?u64 = null,
     /// Whether the client's WT data stream has been observed yet.
     have_wt_stream: bool = false,
+    /// Whether this connection's completed handshake was counted in
+    /// `quic_stats` (exactly once).
+    handshake_counted: bool = false,
 
     fn scidSlice(self: *const Connection) []const u8 {
         return self.scid[0..self.scid_len];
@@ -371,6 +438,36 @@ pub const WebTransportListener = struct {
     quic_enable_early_data: bool = false,
     /// Server key-exchange group order (HRR + key_share choice).
     quic_group_order: []const quic_handshake.KeyExchangeGroup = &quic_handshake.default_group_order,
+
+    /// Install the operator QUIC policy. Resumption draws a fresh random
+    /// ticket key for this process (distinct from the TCP TLS ticket key and
+    /// never shared with another node), so a ticket resumes only here; a key
+    /// already installed by an earlier call is kept. Turning resumption off
+    /// wipes the keys. 0-RTT needs resumption (RFC 9001 §4.6.1).
+    pub fn applyQuicPolicy(self: *WebTransportListener, policy: QuicPolicy) !void {
+        if (policy.early_data and !policy.resumption) return error.InvalidQuicPolicy;
+        if (policy.ticket_lifetime_seconds == 0 or policy.ticket_lifetime_seconds > 604_800) return error.InvalidQuicPolicy;
+        if (policy.group_order.len == 0) return error.InvalidQuicPolicy;
+        var ticket_key: ?[32]u8 = self.quic_ticket_key;
+        if (policy.resumption and ticket_key == null) {
+            var fresh: [32]u8 = undefined;
+            try platform.fillOsEntropy(&fresh);
+            ticket_key = fresh;
+        }
+        if (!policy.resumption) {
+            if (self.quic_ticket_key) |*key| std.crypto.secureZero(u8, key);
+            if (self.quic_previous_ticket_key) |*key| std.crypto.secureZero(u8, key);
+            ticket_key = null;
+            self.quic_previous_ticket_key = null;
+        }
+        const reset_changed = !std.meta.eql(self.stateless_reset_key, policy.stateless_reset_key);
+        self.quic_ticket_key = ticket_key;
+        self.quic_ticket_lifetime_seconds = policy.ticket_lifetime_seconds;
+        self.quic_enable_early_data = policy.resumption and policy.early_data;
+        self.quic_group_order = policy.group_order;
+        self.stateless_reset_key = policy.stateless_reset_key;
+        if (reset_changed) self.derived_reset_key = null;
+    }
 
     pub fn init(allocator: std.mem.Allocator, tls: TlsConfig, irc_port: u16) WebTransportListener {
         armEarlyDataQuietWindow(wallClockSeconds());
@@ -1154,6 +1251,7 @@ pub const WebTransportListener = struct {
         self.recent_resets.record(token);
         const sock = if (self.socket) |*s| s else return;
         sock.sendTo(from, out[0..n]);
+        _ = quic_stats.stateless_resets_sent.fetchAdd(1, .monotonic);
     }
 
     /// The static stateless-reset key (RFC 9000 §10.3.2): the operator key
@@ -1211,7 +1309,21 @@ pub const WebTransportListener = struct {
         // Follow a validated migration: the core only changes its primary path on
         // a matching PATH_RESPONSE, so this address is already validated.
         conn.peer = addrFromPath(conn.conn.currentPath());
+        noteHandshakeOutcome(conn);
         self.serviceConnection(conn, now);
+    }
+
+    /// Count a newly completed server handshake once: PSK resumption and the
+    /// 0-RTT verdict (RFC 9001 §4.6.2: accepted only when EncryptedExtensions
+    /// carried `early_data`).
+    fn noteHandshakeOutcome(conn: *Connection) void {
+        if (conn.handshake_counted or !conn.conn.isEstablished()) return;
+        conn.handshake_counted = true;
+        const hs = switch (conn.conn.handshake) {
+            .server => |*server| server,
+            else => return,
+        };
+        quic_stats.onEstablished(hs.isResumed(), hs.early_data_offered, hs.earlyDataAccepted());
     }
 
     /// Run H3 service + event handling + bridge pump + flush for one connection.
@@ -3052,6 +3164,84 @@ test "stateless reset — never answers a datagram that could be one of our own 
     var echo: [256]u8 = undefined;
     @memcpy(echo[0..n], reply[0..n]);
     try testing.expect(fx.exchange(echo[0..n], &reply) == null);
+}
+
+test "QUIC policy — [tls] groups map to the QUIC subset in operator order" {
+    try testing.expectEqualSlices(quic_handshake.KeyExchangeGroup, &.{ .x25519mlkem768, .x25519 }, quicGroupOrderFor(&.{ .x25519mlkem768, .x25519, .secp256r1 }).?);
+    try testing.expectEqualSlices(quic_handshake.KeyExchangeGroup, &.{ .x25519, .x25519mlkem768 }, quicGroupOrderFor(&.{ .secp256r1, .x25519, .x25519mlkem768 }).?);
+    try testing.expectEqualSlices(quic_handshake.KeyExchangeGroup, &.{.x25519}, quicGroupOrderFor(&.{ .x25519, .secp256r1 }).?);
+    try testing.expectEqualSlices(quic_handshake.KeyExchangeGroup, &.{.x25519mlkem768}, quicGroupOrderFor(&.{.x25519mlkem768}).?);
+    try testing.expect(quicGroupOrderFor(&.{.secp256r1}) == null);
+}
+
+test "QUIC policy — applyQuicPolicy wires resumption, 0-RTT, lifetime, reset key and groups into new connections" {
+    var fx: PolicyFixture = undefined;
+    try fx.init(.never);
+    defer fx.deinit();
+    try testing.expectError(error.InvalidQuicPolicy, fx.lst.applyQuicPolicy(.{ .early_data = true }));
+    const operator_key: [32]u8 = @splat(0x5c);
+    try fx.lst.applyQuicPolicy(.{
+        .resumption = true,
+        .early_data = true,
+        .ticket_lifetime_seconds = 3600,
+        .stateless_reset_key = operator_key,
+        .group_order = quicGroupOrderFor(&.{ .x25519, .x25519mlkem768 }).?,
+    });
+    const first_ticket_key = fx.lst.quic_ticket_key.?;
+    try testing.expect(!std.mem.allEqual(u8, &first_ticket_key, 0));
+    try testing.expectEqualSlices(u8, &operator_key, &fx.lst.staticResetKey());
+    const dcid = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 2 };
+    const conn = fx.lst.createConnection(&dcid, fx.peer_addr, .{ .original_dcid = &dcid }) orelse return error.TestUnexpectedResult;
+    const cfg = conn.conn.handshake.server.config;
+    try testing.expectEqualSlices(u8, &first_ticket_key, &cfg.ticket_key.?);
+    try testing.expect(cfg.enable_early_data);
+    try testing.expect(cfg.replay_guard != null);
+    try testing.expectEqual(@as(u32, 3600), cfg.ticket_lifetime_seconds);
+    try testing.expectEqualSlices(quic_handshake.KeyExchangeGroup, &.{ .x25519, .x25519mlkem768 }, cfg.group_order);
+    try testing.expectEqualSlices(u8, &quic_retry.statelessResetTokenWithKey(&operator_key, conn.scidSlice()), &cfg.stateless_reset_token.?);
+    // Re-applying (a Helix candidate) keeps this process's ticket key.
+    try fx.lst.applyQuicPolicy(.{ .resumption = true });
+    try testing.expectEqualSlices(u8, &first_ticket_key, &fx.lst.quic_ticket_key.?);
+    try testing.expect(!fx.lst.quic_enable_early_data);
+    // Turning resumption off removes the keys and with them 0-RTT.
+    try fx.lst.applyQuicPolicy(.{});
+    try testing.expect(fx.lst.quic_ticket_key == null);
+    try testing.expect(!fx.lst.quic_enable_early_data);
+}
+
+test "QUIC policy — two listeners never share a ticket key (a foreign-node ticket cannot resume)" {
+    var a: PolicyFixture = undefined;
+    try a.init(.never);
+    defer a.deinit();
+    var b: PolicyFixture = undefined;
+    try b.init(.never);
+    defer b.deinit();
+    try a.lst.applyQuicPolicy(.{ .resumption = true, .early_data = true });
+    try b.lst.applyQuicPolicy(.{ .resumption = true, .early_data = true });
+    try testing.expect(!std.mem.eql(u8, &a.lst.quic_ticket_key.?, &b.lst.quic_ticket_key.?));
+}
+
+test "QUIC stats — handshake verdicts and sent stateless resets are counted" {
+    const before = quic_stats.resumptions.load(.monotonic);
+    const accepted_before = quic_stats.early_data_accepted.load(.monotonic);
+    const rejected_before = quic_stats.early_data_rejected.load(.monotonic);
+    quic_stats.onEstablished(true, true, true);
+    quic_stats.onEstablished(true, true, false);
+    quic_stats.onEstablished(false, false, false);
+    try testing.expectEqual(before + 2, quic_stats.resumptions.load(.monotonic));
+    try testing.expectEqual(accepted_before + 1, quic_stats.early_data_accepted.load(.monotonic));
+    try testing.expectEqual(rejected_before + 1, quic_stats.early_data_rejected.load(.monotonic));
+
+    var fx: PolicyFixture = undefined;
+    try fx.init(.never);
+    defer fx.deinit();
+    const resets_before = quic_stats.stateless_resets_sent.load(.monotonic);
+    const dcid = [_]u8{ 0xfe, 0xed, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
+    var buf: [128]u8 = undefined;
+    const pkt = buildShortHeaderDatagram(&buf, dcid, 40);
+    var reply: [256]u8 = undefined;
+    _ = fx.exchange(pkt, &reply) orelse return error.TestUnexpectedResult;
+    try testing.expect(quic_stats.stateless_resets_sent.load(.monotonic) > resets_before);
 }
 
 test "stateless reset — tokens come from a static key and are advertised in the transport parameters" {

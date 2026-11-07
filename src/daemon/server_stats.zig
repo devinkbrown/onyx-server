@@ -419,7 +419,11 @@ pub const TlsStats = struct {
             err == error.FinishedMismatch or err == error.BadState or
             err == error.UnexpectedMessage or err == error.DecodeError or
             err == error.Truncated) return .bad_handshake;
-        if (err == error.EchHrrUnsupported or err == error.BadEchConfig) return .ech;
+        // ECH failures: a malformed config, a server that could not open the
+        // inner ClientHello, an HRR whose ECH acceptance signal disagrees with
+        // the first flight, and a client-side accept/reject inconsistency.
+        if (err == error.BadEchConfig or err == error.EchHrrMismatch or
+            err == error.EchDecryptError or err == error.EchInconsistent) return .ech;
         if (err == error.OutOfMemory) return .resource;
         return .other;
     }
@@ -669,7 +673,10 @@ test "TlsStats classifies handshake errors into a bounded reason set" {
     try testing.expectEqual(TlsStats.FailureClass.bad_record, TlsStats.classifyFailure(error.RecordAuthenticationFailed));
     try testing.expectEqual(TlsStats.FailureClass.certificate, TlsStats.classifyFailure(error.NoCompatibleCertificate));
     try testing.expectEqual(TlsStats.FailureClass.bad_handshake, TlsStats.classifyFailure(error.FinishedMismatch));
-    try testing.expectEqual(TlsStats.FailureClass.ech, TlsStats.classifyFailure(error.EchHrrUnsupported));
+    try testing.expectEqual(TlsStats.FailureClass.ech, TlsStats.classifyFailure(error.EchHrrMismatch));
+    try testing.expectEqual(TlsStats.FailureClass.ech, TlsStats.classifyFailure(error.EchDecryptError));
+    try testing.expectEqual(TlsStats.FailureClass.ech, TlsStats.classifyFailure(error.EchInconsistent));
+    try testing.expectEqual(TlsStats.FailureClass.ech, TlsStats.classifyFailure(error.BadEchConfig));
     try testing.expectEqual(TlsStats.FailureClass.resource, TlsStats.classifyFailure(error.OutOfMemory));
     try testing.expectEqual(TlsStats.FailureClass.other, TlsStats.classifyFailure(error.SomethingNobodyNamed));
 }

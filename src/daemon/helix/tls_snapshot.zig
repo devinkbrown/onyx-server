@@ -27,19 +27,29 @@
 //!   [u32 len][pending_recv]   partial inbound TLS record buffered at export
 //!   [u32 len][pending_out]    queued outbound wire bytes not yet flushed
 //!   [u8 len][certfp]          lowercase-hex SHA-256 of the client leaf, or empty
+//!   ... record-size / ALPN fields, then the engine tail:
+//!   engine 1: exporter master secret, KeyUpdate prefix
+//!   engine 2 (v4+): [u8 present][32] RFC 9266 tls-exporter channel binding
+//!     (zeros when absent). A resumed TLS 1.2 engine holds no master secret,
+//!     so the binding derived at handshake time is carried instead; v3 blobs
+//!     decode it as absent (the successor then never offers -PLUS for them).
 const std = @import("std");
 
 const tls_conn = @import("../tls_conn.zig");
 const tls_server = @import("../../crypto/tls_server.zig");
 const tls12_server = @import("../../crypto/tls12_server.zig");
+const tls_record = @import("../../crypto/tls_record.zig");
 
 pub const Error = error{ Truncated, TrailingBytes, InvalidFlags, BadCertfp, TooLong, BadEngine, BadLength, BadState, UnsupportedVersion };
 
 const engine_tls13: u8 = 1;
 const engine_tls12: u8 = 2;
 
-/// Canonical connected-state schema. Live Helix accepts exactly this version.
-pub const schema_version: u16 = 3;
+/// Canonical connected-state schema written by this binary. v4 adds the TLS
+/// 1.2 channel-binding tail and TLS 1.2 kTLS offload; `decode` also accepts
+/// v3 (whose layout is v4 without that tail).
+pub const schema_version: u16 = 4;
+pub const min_schema_version: u16 = 3;
 
 const Secret13 = @FieldType(tls_server.Server.ResumeState, "client_app_secret");
 const Keys12 = @FieldType(tls12_server.Server.ResumeState, "keys");
@@ -77,6 +87,10 @@ pub const Snapshot = struct {
     control_charge: u32 = 0,
     deferred_ciphertext_charge: u64 = 0,
     deferred_plain: []const u8 = &.{},
+    /// TLS 1.2 only: the RFC 9266 tls-exporter value derived at handshake
+    /// time (EMS-bound, RFC 9266 §2). Must be null for a TLS 1.3 engine, which
+    /// re-derives it from its carried exporter master secret.
+    tls12_channel_binding: ?[32]u8 = null,
 };
 
 /// Shared validation for encode and decode: canonical state and representation
@@ -107,9 +121,16 @@ pub fn validate(snap: Snapshot) Error!void {
         },
         .tls12 => |rs| {
             tls12_server.Server.validateResumeState(rs) catch return error.BadState;
-            if (snap.tx_offloaded or snap.rx_offloaded or st.rx_open_control_type != 0 or st.alert_prefix_len != 0 or st.tx_ku_reply_pending or st.barrier_phase != .none or st.held_record_len != 0 or snap.control_charge != 0 or snap.deferred_plain.len != 0 or snap.deferred_ciphertext_charge != 0) return error.BadState;
+            // TLS 1.2 has no KeyUpdate: never a KU prefix, reply, or requested
+            // hold. kTLS offload (v4) may carry an open alert under the kernel
+            // control hold and deferred software plaintext behind it.
+            if (st.rx_open_control_type == 22 or st.tx_ku_reply_pending or
+                st.barrier_phase == .userspace_requested_ku_held) return error.BadState;
+            if (snap.tx_offloaded and tls_record.recordContentLimit12(rs.peer_record_size_limit_raw) != tls_record.max_plaintext_len) return error.BadState;
+            if (snap.rx_offloaded and rs.record_size_limit_negotiated and rs.local_receive_policy != tls_record.record_size_limit_max12) return error.BadState;
         },
     }
+    if (snap.tls12_channel_binding != null and st.engine != .tls12) return error.BadState;
     const charge = tls_conn.deferredCiphertextCharge(st.engine, snap.deferred_plain) catch return error.BadState;
     if (charge != snap.deferred_ciphertext_charge or charge > std.math.maxInt(usize) or
         snap.deferred_plain.len > std.math.maxInt(u32) or snap.deferred_plain.len > charge or
@@ -121,7 +142,7 @@ pub fn validate(snap: Snapshot) Error!void {
             if (snap.control_charge != expected) return error.BadState;
         },
         .userspace_requested_ku_held, .kernel_control_read_held => {
-            if (st.engine != .tls13 or st.tx_ku_reply_pending) return error.BadState;
+            if ((st.engine != .tls13 and st.barrier_phase == .userspace_requested_ku_held) or st.tx_ku_reply_pending) return error.BadState;
             const expected: u32 = if (snap.tx_offloaded) 5 else 27;
             if (snap.control_charge != 0 and snap.control_charge != expected) return error.BadState;
             if (snap.control_charge == 0 and snap.deferred_plain.len != 0) return error.BadState;
@@ -132,7 +153,7 @@ pub fn validate(snap: Snapshot) Error!void {
             } else if (!snap.rx_offloaded or st.held_record_len != 0 or st.pending_recv.len != 0) return error.BadState;
         },
         .software_tail_ready => {
-            if (st.engine != .tls13 or snap.tx_offloaded or st.tx_ku_reply_pending or st.held_record_len != 0 or
+            if (snap.tx_offloaded or st.tx_ku_reply_pending or st.held_record_len != 0 or
                 snap.control_charge != 0 or snap.deferred_plain.len == 0) return error.BadState;
         },
     }
@@ -190,6 +211,9 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
         try out.append(allocator, @intFromBool(rs.exporter_master_secret_ready));
         try out.append(allocator, rs.ku_prefix_len);
         try out.appendSlice(allocator, &rs.ku_prefix);
+    } else {
+        try out.append(allocator, @intFromBool(snap.tls12_channel_binding != null));
+        try out.appendSlice(allocator, &(snap.tls12_channel_binding orelse @as([32]u8, @splat(0))));
     }
     try out.appendSlice(allocator, &.{ snap.state.rx_open_control_type, snap.state.alert_prefix_len, snap.state.alert_prefix_byte, @intFromBool(snap.state.tx_ku_reply_pending), snap.state.tx_ku_reply_sent });
     try out.append(allocator, @backingInt(snap.state.barrier_phase));
@@ -203,11 +227,18 @@ pub fn encode(allocator: std.mem.Allocator, snap: Snapshot) (Error || std.mem.Al
 }
 
 pub fn decode(bytes: []const u8, version: u16) Error!Snapshot {
-    if (version != schema_version) return error.UnsupportedVersion;
-    return decodeCurrent(bytes);
+    return switch (version) {
+        3 => decodeLayout(bytes, false),
+        4 => decodeLayout(bytes, true),
+        else => error.UnsupportedVersion,
+    };
 }
 
 pub fn decodeCurrent(bytes: []const u8) Error!Snapshot {
+    return decodeLayout(bytes, true);
+}
+
+fn decodeLayout(bytes: []const u8, tls12_tail: bool) Error!Snapshot {
     var r = Reader{ .buf = bytes };
     const fd = try r.int(i32);
     const engine = try r.byte();
@@ -261,6 +292,14 @@ pub fn decodeCurrent(bytes: []const u8) Error!Snapshot {
         rs.ku_prefix_len = @intCast(prefix_len);
         @memcpy(&rs.ku_prefix, try r.take(4));
     }
+    var channel_binding: ?[32]u8 = null;
+    if (state.engine == .tls12 and tls12_tail) {
+        const present = try r.boolean();
+        const value = (try r.take(32))[0..32].*;
+        if (present) {
+            channel_binding = value;
+        } else if (!std.mem.allEqual(u8, &value, 0)) return error.BadState;
+    }
     state.rx_open_control_type = try r.byte();
     const alert_len = try r.byte();
     if (alert_len > 1) return error.BadLength;
@@ -277,8 +316,10 @@ pub fn decodeCurrent(bytes: []const u8) Error!Snapshot {
     const deferred_charge = try r.int(u64);
     const deferred_plain = try r.take(try r.int(u32));
     if (r.pos != bytes.len) return error.TrailingBytes;
-    const snap: Snapshot = .{ .kernel_tx_prefix_remaining = kernel_prefix, .fd = fd, .state = state, .pending_out = pending_out, .certfp = certfp, .tx_offloaded = tx, .rx_offloaded = rx, .control_charge = control_charge, .deferred_ciphertext_charge = deferred_charge, .deferred_plain = deferred_plain };
+    const snap: Snapshot = .{ .kernel_tx_prefix_remaining = kernel_prefix, .fd = fd, .state = state, .pending_out = pending_out, .certfp = certfp, .tx_offloaded = tx, .rx_offloaded = rx, .control_charge = control_charge, .deferred_ciphertext_charge = deferred_charge, .deferred_plain = deferred_plain, .tls12_channel_binding = channel_binding };
     try validate(snap);
+    // A v3 producer never offloaded TLS 1.2; refuse a v3 blob claiming it.
+    if (!tls12_tail and state.engine == .tls12 and (tx or rx or state.barrier_phase != .none)) return error.BadState;
     return snap;
 }
 
@@ -475,7 +516,9 @@ test "TLS3: canonical mandatory minimum every prefix and inactive suite tails" {
         const snap: Snapshot = .{ .kernel_tx_prefix_remaining = 0, .fd = 17, .state = .{ .engine = engine, .barrier_phase = .none, .held_record_len = 0 } };
         const wire = try encode(a, snap);
         defer a.free(wire);
-        try testing.expectEqual(@as(usize, if (engine == .tls13) 226 else 164), wire.len);
+        // v4: the TLS 1.2 layout gained the 33-byte channel-binding tail
+        // (was 164 in v3); the TLS 1.3 layout is unchanged.
+        try testing.expectEqual(@as(usize, if (engine == .tls13) 226 else 197), wire.len);
         for (0..wire.len) |n| {
             if (decodeCurrent(wire[0..n])) |_| return error.TestUnexpectedResult else |_| {}
         }
@@ -680,4 +723,100 @@ test "TLS3: kernel RX partial control requires phase2 and cannot overlap reply o
             _ = try decodeCurrent(accepted);
         }
     }
+}
+
+fn v4Tls12State() tls12_server.Server.ResumeState {
+    return .{
+        .suite = 0xc02b,
+        .keys = .{},
+        .app_read_seq = 11,
+        .app_write_seq = 12,
+        .peer_record_size_limit_raw = 16384,
+        .local_receive_policy = 16384,
+        .record_size_limit_negotiated = false,
+        .selected_alpn = &.{},
+    };
+}
+
+/// Byte offset of the v4 TLS 1.2 channel-binding tail: it sits just before
+/// the 34-byte control tail (empty deferred plaintext).
+fn tls12BindingOffset(wire: []const u8) usize {
+    return wire.len - 34 - 33;
+}
+
+test "TLS4: TLS 1.2 channel binding round-trips and v3 rows decode without it" {
+    const a = testing.allocator;
+    const binding: [32]u8 = @splat(0xcb);
+    const snap: Snapshot = .{ .kernel_tx_prefix_remaining = 0, .fd = 21, .state = .{ .engine = .{ .tls12 = v4Tls12State() }, .barrier_phase = .none, .held_record_len = 0 }, .tls12_channel_binding = binding };
+    const wire = try encode(a, snap);
+    defer a.free(wire);
+    const got = try decode(wire, 4);
+    try testing.expectEqualSlices(u8, &binding, &got.tls12_channel_binding.?);
+
+    // Absent binding is canonical zeros; a non-zero absent value is refused.
+    var absent = snap;
+    absent.tls12_channel_binding = null;
+    const absent_wire = try encode(a, absent);
+    defer a.free(absent_wire);
+    try testing.expect((try decodeCurrent(absent_wire)).tls12_channel_binding == null);
+    const flag_at = tls12BindingOffset(absent_wire);
+    try testing.expectEqual(@as(u8, 0), absent_wire[flag_at]);
+    const forged = try a.dupe(u8, absent_wire);
+    defer a.free(forged);
+    forged[flag_at + 1] = 1;
+    try testing.expectError(error.BadState, decodeCurrent(forged));
+
+    // A v3 producer's row is the v4 row without the 33-byte tail.
+    const v3 = try a.alloc(u8, wire.len - 33);
+    defer a.free(v3);
+    @memcpy(v3[0..flag_at], wire[0..flag_at]);
+    @memcpy(v3[flag_at..], wire[flag_at + 33 ..]);
+    const legacy = try decode(v3, 3);
+    try testing.expect(legacy.tls12_channel_binding == null);
+    try testing.expectEqual(@as(u64, 12), legacy.state.engine.tls12.app_write_seq);
+    // ...and is not a valid v4 row.
+    if (decode(v3, 4)) |_| return error.TestUnexpectedResult else |_| {}
+
+    // A TLS 1.3 row never carries a 1.2 binding.
+    const s13 = tls_server.Server.ResumeState{ .suite = 0x1302, .client_app_secret = @splat(1), .server_app_secret = @splat(2), .app_read_seq = 0, .app_write_seq = 0, .peer_record_size_limit_raw = 16385, .local_receive_policy = 16385, .record_size_limit_negotiated = false, .selected_alpn = &.{}, .exporter_master_secret = @splat(0), .exporter_master_secret_ready = true, .ku_prefix_len = 0, .ku_prefix = @splat(0) };
+    try testing.expectError(error.BadState, validate(.{ .kernel_tx_prefix_remaining = 0, .fd = 22, .state = .{ .engine = .{ .tls13 = s13 }, .barrier_phase = .none, .held_record_len = 0 }, .tls12_channel_binding = binding }));
+}
+
+test "TLS4: TLS 1.2 kTLS offload rows validate; KeyUpdate state and v3 offload are refused" {
+    const a = testing.allocator;
+    const base: Snapshot = .{ .kernel_tx_prefix_remaining = 0, .fd = 23, .state = .{ .engine = .{ .tls12 = v4Tls12State() }, .barrier_phase = .none, .held_record_len = 0 }, .tx_offloaded = true, .rx_offloaded = true };
+    const wire = try encode(a, base);
+    defer a.free(wire);
+    const got = try decodeCurrent(wire);
+    try testing.expect(got.tx_offloaded and got.rx_offloaded);
+
+    // An alert split across kernel records may be open under the hold.
+    var alert = base;
+    alert.state.barrier_phase = .kernel_control_read_held;
+    alert.state.rx_open_control_type = 21;
+    alert.state.alert_prefix_len = 1;
+    alert.state.alert_prefix_byte = 2;
+    try validate(alert);
+
+    var ku = base;
+    ku.state.tx_ku_reply_pending = true;
+    ku.control_charge = 5;
+    try testing.expectError(error.BadState, validate(ku));
+    var hs = alert;
+    hs.state.rx_open_control_type = 22;
+    hs.state.alert_prefix_len = 0;
+    hs.state.alert_prefix_byte = 0;
+    try testing.expectError(error.BadState, validate(hs));
+    var small = base;
+    small.state.engine.tls12.peer_record_size_limit_raw = 4096;
+    small.state.engine.tls12.record_size_limit_negotiated = true;
+    try testing.expectError(error.BadState, validate(small));
+
+    // A v3 row cannot claim TLS 1.2 offload.
+    const flag_at = tls12BindingOffset(wire);
+    const v3 = try a.alloc(u8, wire.len - 33);
+    defer a.free(v3);
+    @memcpy(v3[0..flag_at], wire[0..flag_at]);
+    @memcpy(v3[flag_at..], wire[flag_at + 33 ..]);
+    try testing.expectError(error.BadState, decode(v3, 3));
 }

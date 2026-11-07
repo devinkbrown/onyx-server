@@ -14,6 +14,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const toml = @import("../proto/toml.zig");
+const supported_groups = @import("../proto/supported_groups.zig");
+const tls_server = @import("../crypto/tls_server.zig");
 const acme_cli = @import("acme_cli.zig");
 const acme_http01_listener = @import("acme_http01_listener.zig");
 const acme_runner = @import("acme_runner.zig");
@@ -114,6 +116,7 @@ pub const Config = struct {
     cloak: Cloak = .{},
     guest_presence: GuestPresence = .{},
     tls: Tls = .{},
+    webtransport: WebTransport = .{},
     acme: Acme = .{},
     ocsp: Ocsp = .{},
     webpush: Webpush = .{},
@@ -866,6 +869,51 @@ pub const Config = struct {
         /// to stderr: states, message types, lengths and error names only,
         /// never key material. Applied once at process start. Default off.
         debug_log: bool = false,
+        /// `[tls] groups`: ordered key-exchange group preference for the TLS
+        /// 1.3 listener (RFC 8446 §4.2.7 / §4.2.8), owned. Null keeps
+        /// `tls_server.default_groups`. Validated at parse time with
+        /// `tls_server.validateGroups`. The QUIC listener uses the subset it
+        /// implements (X25519MLKEM768, x25519) in the same order.
+        groups: ?[]const supported_groups.NamedGroup = null,
+        /// `[tls] delegated_credentials`: automatic RFC 9345 delegated
+        /// credential rotation. Null (the default) presents no DC.
+        delegated_credentials: ?DelegatedCredentials = null,
+    };
+
+    /// `[tls] delegated_credentials = { valid = "24h", renew_before = "12h" }`.
+    /// The daemon mints a fresh short-lived DC from the default leaf on boot
+    /// and whenever the active one enters its renewal window or the leaf
+    /// changes. The delegated private key lives only in process memory.
+    pub const DelegatedCredentials = struct {
+        /// DC lifetime in seconds; 1..604800 (RFC 9345 §4.1.3: at most 7 days).
+        valid_seconds: u32 = 24 * 60 * 60,
+        /// Renew once the active DC has this many seconds or fewer left; must
+        /// be below `valid_seconds`.
+        renew_before_seconds: u32 = 12 * 60 * 60,
+        /// The delegated key's algorithm (`dc_cert_verify_algorithm`).
+        algorithm: Algorithm = .ecdsa_p256,
+
+        pub const Algorithm = enum { ecdsa_p256, ed25519 };
+    };
+
+    /// `[webtransport]` QUIC policy for the `[listen] webtransport` listener.
+    /// Every key defaults off so the QUIC wire stays a full 1-RTT handshake.
+    pub const WebTransport = struct {
+        /// Issue NewSessionTickets and accept PSK resumption (RFC 9001 §4.5).
+        /// The ticket key is random per process and per node, distinct from
+        /// the TCP TLS ticket key, so a ticket only resumes on the node and
+        /// process that issued it.
+        resumption: bool = false,
+        /// Accept 0-RTT (RFC 9001 §4.6). Requires `resumption`. OFF by default:
+        /// 0-RTT data is replayable (RFC 8446 §8); the listener bounds that
+        /// with a per-process replay guard and the ticket-age window.
+        early_data: bool = false,
+        /// NewSessionTicket lifetime, 1..604800 seconds (RFC 8446 §4.6.1).
+        ticket_lifetime_seconds: u32 = 86_400,
+        /// Optional static stateless-reset key (RFC 9000 §10.3.2), 32 bytes
+        /// as 64 hex characters (env:/@file: indirection allowed). Null
+        /// derives the key from the TLS signing key.
+        stateless_reset_key: ?[32]u8 = null,
     };
 
     /// ALPN id list used when `[tls] alpn` is absent.
@@ -1181,6 +1229,7 @@ pub const Config = struct {
         }
         allocator.free(self.tls.ech_keys);
         if (self.tls.alpn) |list| freeStringList(allocator, list);
+        if (self.tls.groups) |list| allocator.free(list);
         allocator.free(self.acme.directory_url);
         allocator.free(self.acme.ca_bundle_path);
         allocator.free(self.webpush.subject);
@@ -1238,6 +1287,15 @@ pub const TomlError = toml.ParseError || error{
     @"tls.debug_log",
     @"tls.ticket_lifetime",
     @"tls.mooring_max_meshpass_len",
+    @"tls.groups",
+    @"tls.delegated_credentials",
+    @"tls.delegated_credentials.key_out_dir is not supported: the delegated private key never leaves process memory",
+    /// `[webtransport]` QUIC policy keys: wrong type, out of range, or an
+    /// inconsistent combination.
+    @"webtransport.resumption",
+    @"webtransport.early_data",
+    @"webtransport.ticket_lifetime",
+    @"webtransport.stateless_reset_key",
     /// Keys that only ever tuned modules outside the daemon; refused.
     @"tls.ratchet_max_skip was removed: it never applied to the daemon",
     @"tls.treekem_max_members was removed: it never applied to the daemon",
@@ -1774,6 +1832,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("tls.raw_public_key")) |b| cfg.tls.raw_public_key = b;
     if (doc.getString("tls.ktls")) |s| cfg.tls.ktls = parseKtlsMode(s) orelse return error.ParseError;
     try parseTlsPolicy(allocator, resolver, doc, &cfg);
+    try parseWebTransportPolicy(allocator, resolver, doc, &cfg);
 
     // [[tls.sni]] — additional SNI-selectable certificates. Each entry pairs one
     // or more host names with an on-disk cert+key; main.zig loads the material
@@ -2353,6 +2412,56 @@ fn parseTlsPolicy(allocator: std.mem.Allocator, resolver: Resolver, doc: toml.Do
         if (seconds == 0 or seconds > Config.max_tls_ticket_lifetime_seconds) return error.@"tls.ticket_lifetime";
         cfg.tls.ticket_lifetime_seconds = @intCast(seconds);
     }
+    if (doc.get("tls.groups")) |value| {
+        const items = switch (value.*) {
+            .array => |arr| arr,
+            else => return error.@"tls.groups",
+        };
+        if (items.len == 0 or items.len > 8) return error.@"tls.groups";
+        const list = try allocator.alloc(supported_groups.NamedGroup, items.len);
+        errdefer allocator.free(list);
+        for (items, list) |*item, *slot| {
+            const name = switch (item.*) {
+                .string => |text| text,
+                else => return error.@"tls.groups",
+            };
+            slot.* = tls_server.groupFromName(name) orelse return error.@"tls.groups";
+        }
+        tls_server.validateGroups(list) catch return error.@"tls.groups";
+        // The QUIC listener implements only X25519MLKEM768 and x25519; a list
+        // without either would leave WebTransport with no group to agree on.
+        if (cfg.listen.webtransport != 0) {
+            const quic_capable = for (list) |group| {
+                if (group == .x25519 or group == .x25519mlkem768) break true;
+            } else false;
+            if (!quic_capable) return error.@"tls.groups";
+        }
+        if (cfg.tls.groups) |old| allocator.free(old);
+        cfg.tls.groups = list;
+    }
+    if (doc.get("tls.delegated_credentials")) |value| {
+        if (value.* != .table) return error.@"tls.delegated_credentials";
+        if (value.get("key_out_dir") != null)
+            return error.@"tls.delegated_credentials.key_out_dir is not supported: the delegated private key never leaves process memory";
+        var dc: Config.DelegatedCredentials = .{};
+        var it = value.table.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (std.mem.eql(u8, key, "valid")) {
+                dc.valid_seconds = durationSecondsField(entry.value_ptr, 1, max_delegated_credential_seconds) orelse return error.@"tls.delegated_credentials";
+            } else if (std.mem.eql(u8, key, "renew_before")) {
+                dc.renew_before_seconds = durationSecondsField(entry.value_ptr, 1, max_delegated_credential_seconds) orelse return error.@"tls.delegated_credentials";
+            } else if (std.mem.eql(u8, key, "algorithm")) {
+                const text = switch (entry.value_ptr.*) {
+                    .string => |t| t,
+                    else => return error.@"tls.delegated_credentials",
+                };
+                dc.algorithm = std.meta.stringToEnum(Config.DelegatedCredentials.Algorithm, text) orelse return error.@"tls.delegated_credentials";
+            } else return error.@"tls.delegated_credentials";
+        }
+        if (dc.renew_before_seconds >= dc.valid_seconds) return error.@"tls.delegated_credentials";
+        cfg.tls.delegated_credentials = dc;
+    }
     if (doc.get("tls.mooring_max_meshpass_len")) |value| {
         const n = switch (value.*) {
             .integer => |n| n,
@@ -2371,6 +2480,56 @@ fn parseTlsPolicy(allocator: std.mem.Allocator, resolver: Resolver, doc: toml.Do
             if (admissionTokenDecodedLenBound(token) > cap) return error.@"tls.mooring_max_meshpass_len";
         }
     }
+}
+
+/// `[webtransport]` QUIC policy keys. Type and range errors are named; 0-RTT
+/// without resumption is refused because it could never take effect.
+fn parseWebTransportPolicy(allocator: std.mem.Allocator, resolver: Resolver, doc: toml.Document, cfg: *Config) TomlError!void {
+    if (doc.get("webtransport.resumption")) |value| switch (value.*) {
+        .boolean => |b| cfg.webtransport.resumption = b,
+        else => return error.@"webtransport.resumption",
+    };
+    if (doc.get("webtransport.early_data")) |value| switch (value.*) {
+        .boolean => |b| cfg.webtransport.early_data = b,
+        else => return error.@"webtransport.early_data",
+    };
+    if (doc.get("webtransport.ticket_lifetime")) |value| {
+        cfg.webtransport.ticket_lifetime_seconds = durationSecondsField(value, 1, Config.max_tls_ticket_lifetime_seconds) orelse
+            return error.@"webtransport.ticket_lifetime";
+    }
+    if (doc.get("webtransport.stateless_reset_key")) |value| {
+        const raw = switch (value.*) {
+            .string => |text| text,
+            else => return error.@"webtransport.stateless_reset_key",
+        };
+        const resolved = try resolveStr(allocator, resolver, raw);
+        defer {
+            std.crypto.secureZero(u8, @constCast(resolved));
+            allocator.free(resolved);
+        }
+        const text = std.mem.trim(u8, resolved, " \t\r\n");
+        if (text.len != 64) return error.@"webtransport.stateless_reset_key";
+        var key: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&key, text) catch return error.@"webtransport.stateless_reset_key";
+        if (std.mem.allEqual(u8, &key, 0)) return error.@"webtransport.stateless_reset_key";
+        cfg.webtransport.stateless_reset_key = key;
+    }
+    if (cfg.webtransport.early_data and !cfg.webtransport.resumption) return error.@"webtransport.early_data";
+}
+
+/// RFC 9345 §4.1.3: a delegated credential is valid for at most 7 days.
+const max_delegated_credential_seconds: u64 = 7 * 24 * 60 * 60;
+
+/// A duration given either as integer seconds or as a duration string
+/// ("24h", "90m"), bounded to `min..max` seconds. Null on any other shape.
+fn durationSecondsField(value: *const toml.Value, min: u64, max: u64) ?u32 {
+    const seconds: u64 = switch (value.*) {
+        .integer => |n| if (n < 0) return null else @intCast(n),
+        .string => |text| (durationMs(text) catch return null) / 1000,
+        else => return null,
+    };
+    if (seconds < min or seconds > max or seconds > std.math.maxInt(u32)) return null;
+    return @intCast(seconds);
 }
 
 /// Largest admission token M1 can carry.
@@ -5219,6 +5378,107 @@ test "parseToml: a [[tls.sni]] entry missing required keys is rejected" {
         base ++ "[[tls.sni]]\nserver_names=[]\ncert_path=\"a.pem\"\nkey_path=\"a.key\"\n",
         .{},
     ));
+}
+
+test "parseToml: tls.groups maps IANA names in order and rejects bad lists" {
+    const allocator = testing.allocator;
+    const base = "[node]\nid=1\n[listen]\nirc=6680\n[tls]\n";
+    {
+        var cfg = try parseToml(allocator, base, .{});
+        defer cfg.deinit(allocator);
+        try testing.expect(cfg.tls.groups == null);
+    }
+    {
+        var cfg = try parseToml(allocator, base ++ "groups = [\"x25519\", \"P-256\", \"X25519MLKEM768\"]\n", .{});
+        defer cfg.deinit(allocator);
+        try testing.expectEqualSlices(supported_groups.NamedGroup, &.{ .x25519, .secp256r1, .x25519mlkem768 }, cfg.tls.groups.?);
+    }
+    for ([_][]const u8{
+        "groups = []\n",
+        "groups = [\"x448\"]\n",
+        "groups = [\"x25519\", \"X25519\"]\n",
+        "groups = \"x25519\"\n",
+        "groups = [1]\n",
+    }) |line| {
+        const text = try std.mem.concat(allocator, u8, &.{ base, line });
+        defer allocator.free(text);
+        try testing.expectError(error.@"tls.groups", parseToml(allocator, text, .{}));
+    }
+    // secp256r1 alone is fine for TCP TLS but leaves QUIC without a group.
+    {
+        var cfg = try parseToml(allocator, base ++ "groups = [\"secp256r1\"]\n", .{});
+        defer cfg.deinit(allocator);
+        try testing.expectEqualSlices(supported_groups.NamedGroup, &.{.secp256r1}, cfg.tls.groups.?);
+    }
+    try testing.expectError(error.@"tls.groups", parseToml(allocator, "[node]\nid=1\n[listen]\nirc=6680\nwebtransport=8443\n[tls]\ngroups = [\"secp256r1\"]\n", .{}));
+}
+
+test "parseToml: tls.delegated_credentials parses lifetimes and fails closed" {
+    const allocator = testing.allocator;
+    const base = "[node]\nid=1\n[listen]\nirc=6680\n[tls]\n";
+    {
+        var cfg = try parseToml(allocator, base, .{});
+        defer cfg.deinit(allocator);
+        try testing.expect(cfg.tls.delegated_credentials == null);
+    }
+    {
+        var cfg = try parseToml(allocator, base ++ "delegated_credentials = { valid = \"24h\" }\n", .{});
+        defer cfg.deinit(allocator);
+        const dc = cfg.tls.delegated_credentials.?;
+        try testing.expectEqual(@as(u32, 86_400), dc.valid_seconds);
+        try testing.expectEqual(@as(u32, 43_200), dc.renew_before_seconds);
+        try testing.expectEqual(Config.DelegatedCredentials.Algorithm.ecdsa_p256, dc.algorithm);
+    }
+    {
+        var cfg = try parseToml(allocator, base ++ "delegated_credentials = { valid = \"168h\", renew_before = 3600, algorithm = \"ed25519\" }\n", .{});
+        defer cfg.deinit(allocator);
+        const dc = cfg.tls.delegated_credentials.?;
+        try testing.expectEqual(@as(u32, 604_800), dc.valid_seconds);
+        try testing.expectEqual(@as(u32, 3600), dc.renew_before_seconds);
+        try testing.expectEqual(Config.DelegatedCredentials.Algorithm.ed25519, dc.algorithm);
+    }
+    for ([_][]const u8{
+        "delegated_credentials = { valid = \"169h\" }\n",
+        "delegated_credentials = { valid = \"1h\", renew_before = \"1h\" }\n",
+        "delegated_credentials = { valid = 0 }\n",
+        "delegated_credentials = { algorithm = \"rsa\" }\n",
+        "delegated_credentials = { lifetime = \"24h\" }\n",
+        "delegated_credentials = true\n",
+    }) |line| {
+        const text = try std.mem.concat(allocator, u8, &.{ base, line });
+        defer allocator.free(text);
+        try testing.expectError(error.@"tls.delegated_credentials", parseToml(allocator, text, .{}));
+    }
+    try testing.expectError(
+        error.@"tls.delegated_credentials.key_out_dir is not supported: the delegated private key never leaves process memory",
+        parseToml(allocator, base ++ "delegated_credentials = { key_out_dir = \"/tmp\", valid = \"24h\" }\n", .{}),
+    );
+}
+
+test "parseToml: webtransport QUIC policy defaults off and validates" {
+    const allocator = testing.allocator;
+    const base = "[node]\nid=1\n[listen]\nirc=6680\n";
+    {
+        var cfg = try parseToml(allocator, base, .{});
+        defer cfg.deinit(allocator);
+        try testing.expect(!cfg.webtransport.resumption);
+        try testing.expect(!cfg.webtransport.early_data);
+        try testing.expectEqual(@as(u32, 86_400), cfg.webtransport.ticket_lifetime_seconds);
+        try testing.expect(cfg.webtransport.stateless_reset_key == null);
+    }
+    {
+        var cfg = try parseToml(allocator, base ++ "[webtransport]\nresumption = true\nearly_data = true\nticket_lifetime = \"12h\"\nstateless_reset_key = \"" ++ "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f" ++ "\"\n", .{});
+        defer cfg.deinit(allocator);
+        try testing.expect(cfg.webtransport.resumption);
+        try testing.expect(cfg.webtransport.early_data);
+        try testing.expectEqual(@as(u32, 43_200), cfg.webtransport.ticket_lifetime_seconds);
+        try testing.expectEqual(@as([32]u8, @splat(0x0f)), cfg.webtransport.stateless_reset_key.?);
+    }
+    try testing.expectError(error.@"webtransport.early_data", parseToml(allocator, base ++ "[webtransport]\nearly_data = true\n", .{}));
+    try testing.expectError(error.@"webtransport.resumption", parseToml(allocator, base ++ "[webtransport]\nresumption = 1\n", .{}));
+    try testing.expectError(error.@"webtransport.ticket_lifetime", parseToml(allocator, base ++ "[webtransport]\nticket_lifetime = \"169h\"\n", .{}));
+    try testing.expectError(error.@"webtransport.stateless_reset_key", parseToml(allocator, base ++ "[webtransport]\nstateless_reset_key = \"abcd\"\n", .{}));
+    try testing.expectError(error.@"webtransport.stateless_reset_key", parseToml(allocator, base ++ "[webtransport]\nstateless_reset_key = \"" ++ "0000000000000000000000000000000000000000000000000000000000000000" ++ "\"\n", .{}));
 }
 
 test "parseToml: ktls mode parses txrx and rejects an unknown value" {

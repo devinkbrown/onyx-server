@@ -345,6 +345,9 @@ const mesh_redial = @import("helix/mesh_redial.zig");
 const mesh_presence_hot_checkpoint = @import("helix/mesh_presence_hot_checkpoint.zig");
 const mesh_clock_snapshot = @import("helix/mesh_clock_snapshot.zig");
 const tls_server = @import("../crypto/tls_server.zig");
+const supported_groups = @import("../proto/supported_groups.zig");
+const dc_mint = @import("../crypto/dc_mint.zig");
+const acme_runner = @import("acme_runner.zig");
 const tls12_server = @import("../crypto/tls12_server.zig");
 const tls_resumption = @import("../crypto/tls_resumption.zig");
 const http_fetch = @import("http_fetch.zig");
@@ -2265,7 +2268,12 @@ pub const Config = struct {
     geo_enabled: bool = false,
     /// Skip TLS verification for news feeds (public read-only data) so the
     /// best-effort clean-room TLS reaches more hosts. `[geo] news_insecure_tls`.
-    geo_news_insecure_tls: bool = true,
+    geo_news_insecure_tls: bool = false,
+    /// PEM trust-anchor bundle the live news fetch verifies against when
+    /// `geo_news_insecure_tls` is false (`[geo] news_ca_bundle`). Borrowed.
+    geo_news_ca_bundle: []const u8 = geo_services.default_news_ca_bundle,
+    /// Read bound for `geo_news_ca_bundle` (`[geo] news_ca_bundle_max_bytes`).
+    geo_news_ca_bundle_max_bytes: usize = geo_services.default_news_ca_bundle_max_bytes,
     /// Minimum interval between fantasy-bot (`!weather`/`!news`) replies in a
     /// single channel, in ms (anti-flood). 0 disables. `[geo] cmd_cooldown_ms`.
     geo_cmd_cooldown_ms: u32 = 3000,
@@ -2751,6 +2759,17 @@ pub const Config = struct {
     /// `[tls] ticket_lifetime`: NewSessionTicket lifetime for both legs.
     /// Null keeps each engine's default.
     tls_ticket_lifetime_seconds: ?u32 = null,
+    /// `[tls] groups`: TLS 1.3 key-exchange group preference, validated by
+    /// `tls_server.validateGroups` at parse time. Borrowed from the boot
+    /// config, which main keeps for the process lifetime; TLS settings are
+    /// boot-only (REHASH never replaces them) and a Helix successor parses
+    /// its own copy, so every Server built from it outlives no owner.
+    tls_groups: []const supported_groups.NamedGroup = &tls_server.default_groups,
+    /// `[tls] delegated_credentials`: RFC 9345 DC rotation policy, or null.
+    tls_delegated_credentials: ?config_format.Config.DelegatedCredentials = null,
+    /// `[webtransport]` QUIC policy plus the QUIC group order derived from
+    /// `[tls] groups`. Applied to the cold listener and every Helix candidate.
+    webtransport_quic: managed_wt.QuicPolicy = .{},
     /// RFC 7250 server raw public keys. Default false preserves X.509 Certificate
     /// messages; when true, clients that explicitly offer RawPublicKey may receive
     /// the leaf SPKI instead of the certificate chain.
@@ -3396,6 +3415,8 @@ pub const ConnState = struct {
     tls_handshake_finished: bool = false,
     /// This connection owns one unit of `tls_ktls_active`.
     stats_ktls_counted: bool = false,
+    /// This TLS 1.2 connection also owns one unit of `tls_ktls12_active`.
+    stats_ktls12_counted: bool = false,
     /// Turn-local guards: no nested protocol progress or hot capture while a
     /// borrowed Outcome is being dispatched. They never survive a safe point.
     tls_ingress_active: bool = false,
@@ -6514,12 +6535,20 @@ pub const LinuxServer = struct {
     /// Live gauge of client connections with kernel TLS offload in either
     /// direction. Each connection owns at most one unit (`stats_ktls_counted`).
     tls_ktls_active: std.atomic.Value(i64) = .init(0),
+    /// Subset of `tls_ktls_active` running TLS 1.2.
+    tls_ktls12_active: std.atomic.Value(i64) = .init(0),
     /// Cross-thread ACME signal: the renewal worker sets this only after writing
     /// new cert/key files. Reactor 0 consumes it on the housekeeping tick and
     /// performs the actual live TLS reload, so ACME never mutates listener state.
     acme_reload_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     acme_reload_retry_after_ms: i64 = 0,
     acme_worker: ?*@import("acme_renewal.zig").Service = null,
+    /// RFC 8737 tls-alpn-01 challenge store owned by the ACME renewal Service.
+    /// Kept separate from `acme_worker` so it is wired on every platform
+    /// without entering Windows Helix runtime-relation accounting. main.zig
+    /// sets it only for `challenge = "tls-alpn-01"` and clears it before the
+    /// Service is destroyed (after the reactors have stopped).
+    acme_tls_alpn01_store: ?*acme_runner.TlsAlpn01Store = null,
     /// Boot-time `[tls]` view used for ACME-triggered reloads. Changing `[tls]`
     /// paths through live REHASH while ACME is enabled is intentionally unsupported;
     /// REHASH still uses `reload_parsed` for its own operator-requested reload.
@@ -6542,6 +6571,25 @@ pub const LinuxServer = struct {
     /// it; on a new publish it becomes `ocsp_staple_prev`. Incomplete handshakes
     /// borrow its immutable bytes until they finish or close.
     ocsp_staple_owned: ?[]u8 = null,
+    /// RFC 9345 delegated-credential rotation state (`[tls]
+    /// delegated_credentials`), owned by the maintenance reactor. `dc_active`
+    /// is the credential new handshakes present; superseded credentials wait
+    /// in `dc_retired` until no incomplete handshake borrows their bytes.
+    dc_active: ?*dc_mint.Minted = null,
+    dc_retired: std.ArrayListUnmanaged(*dc_mint.Minted) = .empty,
+    /// Leaf DER (`tls_cert_chain[0]`) the active credential was minted for. A
+    /// credential is presented only while this is still the serving leaf.
+    /// `dc_leaf` is the fast per-handshake identity check; `dc_leaf_digest`
+    /// (SHA-256 of the DER) is the authoritative one maintenance compares, so
+    /// a renewed leaf that reuses the old allocation is still detected.
+    dc_leaf: []const u8 = &.{},
+    dc_leaf_digest: [32]u8 = @splat(0),
+    /// SHA-256 of a leaf for which minting failed permanently (no
+    /// DelegationUsage, wrong key usage, unsupported key). Rotation stays off
+    /// until the serving leaf changes.
+    dc_refused_digest: ?[32]u8 = null,
+    /// Wall-clock second before which a transient mint failure is not retried.
+    dc_retry_after_unix: i64 = 0,
     /// Exclusive wall-clock deadline of the active, validated OCSP response.
     /// Config construction checks it without repeating signature work for
     /// every unauthenticated socket; maintenance clears the stale active view.
@@ -7246,6 +7294,8 @@ pub const LinuxServer = struct {
             .weather_enabled = config.geo_enabled,
             .news_enabled = config.geo_enabled,
             .news_insecure_tls = config.geo_news_insecure_tls,
+            .news_ca_bundle = config.geo_news_ca_bundle,
+            .news_ca_bundle_max_bytes = config.geo_news_ca_bundle_max_bytes,
             .news_cache_dir = config.geo_news_cache_dir,
             .max_headlines = @intCast(@min(config.news_count, 5)),
         });
@@ -8359,6 +8409,8 @@ pub const LinuxServer = struct {
         if (self.geo.opts.weather_enabled != self.config.geo_enabled or
             self.geo.opts.news_enabled != self.config.geo_enabled or
             self.geo.opts.news_insecure_tls != self.config.geo_news_insecure_tls or
+            !std.mem.eql(u8, self.geo.opts.news_ca_bundle, self.config.geo_news_ca_bundle) or
+            self.geo.opts.news_ca_bundle_max_bytes != self.config.geo_news_ca_bundle_max_bytes or
             !std.mem.eql(u8, self.geo.opts.news_cache_dir, self.config.geo_news_cache_dir) or
             self.geo.opts.max_headlines != @min(self.config.news_count, 5)) return error.ConfiguredOwnerMismatch;
         if (self.metrics_server) |*owner| {
@@ -8521,6 +8573,16 @@ pub const LinuxServer = struct {
     fn writeTlsPrometheus(self: *LinuxServer, allocator: std.mem.Allocator, out: *std.ArrayList(u8), now_unix: i64) !void {
         try self.tls_stats.writePrometheus(allocator, out);
         try writePromGauge(allocator, out, "onyx_tls_ktls_active", "Client connections with kernel TLS offload in either direction", @max(@as(i64, 0), self.tls_ktls_active.load(.acquire)));
+        try writePromGauge(allocator, out, "onyx_tls_ktls12_active", "TLS 1.2 client connections with kernel TLS offload in either direction", @max(@as(i64, 0), self.tls_ktls12_active.load(.acquire)));
+        // RFC 9345 delegated credential: seconds until the servable credential
+        // expires (0 when none is being presented).
+        try writePromGauge(allocator, out, "onyx_tls_delegated_credential_expiry_seconds", "Seconds until the presented delegated credential expires (0 = none)", self.delegatedCredentialSecondsLeft(now_unix) orelse 0);
+        // QUIC (WebTransport listener) resumption, 0-RTT and stateless resets.
+        const quic = &managed_wt.quic_stats;
+        try writePromCounter(allocator, out, "onyx_quic_resumptions_total", "QUIC handshakes completed with PSK resumption", quic.resumptions.load(.monotonic));
+        try writePromCounter(allocator, out, "onyx_quic_early_data_accepted_total", "QUIC handshakes whose 0-RTT was accepted", quic.early_data_accepted.load(.monotonic));
+        try writePromCounter(allocator, out, "onyx_quic_early_data_rejected_total", "QUIC handshakes whose offered 0-RTT was rejected", quic.early_data_rejected.load(.monotonic));
+        try writePromCounter(allocator, out, "onyx_quic_stateless_resets_sent_total", "QUIC Stateless Reset datagrams sent", quic.stateless_resets_sent.load(.monotonic));
 
         // OCSP: `status` is exactly one of none/good/expired. `good` means the
         // staple is inside its validated window and is being stapled.
@@ -8575,6 +8637,18 @@ pub const LinuxServer = struct {
     ) !void {
         try out.print(allocator, "# HELP {s} {s}\n", .{ name, help });
         try out.print(allocator, "# TYPE {s} gauge\n", .{name});
+        try out.print(allocator, "{s} {d}\n", .{ name, value });
+    }
+
+    fn writePromCounter(
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        name: []const u8,
+        help: []const u8,
+        value: u64,
+    ) !void {
+        try out.print(allocator, "# HELP {s} {s}\n", .{ name, help });
+        try out.print(allocator, "# TYPE {s} counter\n", .{name});
         try out.print(allocator, "{s} {d}\n", .{ name, value });
     }
 
@@ -9883,12 +9957,14 @@ pub const LinuxServer = struct {
             .alpn_protocols = self.config.tls_alpn_protocols,
             .enable_cert_compression = self.config.tls_cert_compression,
             .enforce_cert_signature_algorithms = self.config.tls_enforce_cert_signature_algorithms,
+            .groups = self.config.tls_groups,
         };
         if (self.config.tls_ticket_lifetime_seconds) |seconds| cfg.ticket_lifetime_seconds = seconds;
         if (self.config.tls_ocsp_staple) |staple| {
             if (@divFloor(platform.realtimeMillis(), 1000) < self.ocsp_staple_valid_until_unix)
                 cfg.ocsp_staple = staple;
         }
+        cfg.delegated_credential = self.servableDelegatedCredential(@divFloor(platform.realtimeMillis(), 1000));
         if (self.config.tls_enable_resumption) {
             cfg.enable_session_tickets = true;
             cfg.ticket_key = self.tls_ticket_key;
@@ -10089,7 +10165,7 @@ pub const LinuxServer = struct {
         try self.linux_webtransport.prepareCandidate(self.allocator, self.config.crypto_io orelse return error.InvalidRuntime, .{
             .irc = try self.boundPort(),
             .webtransport = self.config.webtransport_port,
-        }, body, tls);
+        }, body, tls, self.config.webtransport_quic);
     }
 
     /// The WebTransport bridge's connected loopback socket must have exactly
@@ -10599,6 +10675,11 @@ pub const LinuxServer = struct {
         if (self.reload_ech_prev) |*e| e.deinit(self.allocator);
         for (self.reload_tls_retired.items) |*retired| retired.deinit(self.allocator);
         self.reload_tls_retired.deinit(self.allocator);
+        // Delegated credentials: every connection table is gone, so no
+        // handshake can borrow them any more.
+        if (self.dc_active) |active| self.freeDelegatedCredential(active);
+        for (self.dc_retired.items) |retired| self.freeDelegatedCredential(retired);
+        self.dc_retired.deinit(self.allocator);
         // Free all server-owned OCSP generations after the connection tables.
         if (self.ocsp_staple_owned) |owned| self.allocator.free(owned);
         if (self.ocsp_staple_prev) |prev| self.allocator.free(prev);
@@ -11523,6 +11604,10 @@ pub const LinuxServer = struct {
         }
         if (self.isMaintenanceReactor()) self.maybeReloadAcmeTls();
         if (self.isMaintenanceReactor()) self.maybeSwapOcspStaple();
+        if (self.isMaintenanceReactor() and self.config.tls_delegated_credentials != null)
+            self.maybeRotateDelegatedCredential(@divFloor(platform.realtimeMillis(), 1000));
+        if (self.isMaintenanceReactor() and self.dc_retired.items.len != 0)
+            self.pruneRetiredDelegatedCredentials();
         if (self.isMaintenanceReactor() and self.reload_tls_retired.items.len != 0)
             self.pruneRetiredTlsGenerations();
         if (self.isMaintenanceReactor() and self.ocsp_staple_retired.items.len != 0)
@@ -15324,6 +15409,13 @@ pub const LinuxServer = struct {
         _ = self.rx().clients.free(id);
     }
 
+    /// The RFC 8737 tls-alpn-01 store the implicit-TLS listener consults, or
+    /// null unless ACME renewal runs with `challenge = "tls-alpn-01"`. The
+    /// Service (and with it the store) outlives every client connection.
+    fn tlsAlpn01Store(self: *LinuxServer) ?*acme_runner.TlsAlpn01Store {
+        return self.acme_tls_alpn01_store;
+    }
+
     fn startAcceptedTls(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, arm_recv: bool) !bool {
         if (self.refuseSilentClient(id, conn)) return false;
         const tls = self.allocator.create(tls_conn.TlsConn) catch {
@@ -15347,6 +15439,7 @@ pub const LinuxServer = struct {
             tls.deinit();
             self.allocator.destroy(tls);
         }
+        tls.acme_store = self.tlsAlpn01Store();
         conn.tls = tls;
         conn.is_tls = true;
         self.injectSessionState(conn);
@@ -15746,6 +15839,10 @@ pub const LinuxServer = struct {
         if (conn.stats_ktls_counted) {
             conn.stats_ktls_counted = false;
             _ = self.tls_ktls_active.fetchSub(1, .monotonic);
+        }
+        if (conn.stats_ktls12_counted) {
+            conn.stats_ktls12_counted = false;
+            _ = self.tls_ktls12_active.fetchSub(1, .monotonic);
         }
         if (!conn.stats_client_counted) return;
         conn.stats_client_counted = false;
@@ -16843,6 +16940,10 @@ pub const LinuxServer = struct {
         if (conn.stats_ktls_counted) return;
         conn.stats_ktls_counted = true;
         _ = self.tls_ktls_active.fetchAdd(1, .monotonic);
+        if (conn.tls) |t| if (t.negotiatedVersion() == .tls12) {
+            conn.stats_ktls12_counted = true;
+            _ = self.tls_ktls12_active.fetchAdd(1, .monotonic);
+        };
     }
 
     fn failTls(self: *LinuxServer, conn: *ConnState, failure: anyerror) void {
@@ -22947,6 +23048,21 @@ pub const LinuxServer = struct {
             conn.io_activation_pending = true;
             conn.activation_recv_required = false;
         }
+        if (t.isAcmeTlsAlpn01()) {
+            // RFC 8737 §3: a tls-alpn-01 validation connection only completes
+            // the handshake with the acmeIdentifier certificate; no
+            // application data is exchanged and it never reaches IRC. Send the
+            // flight, then close once the handshake is done.
+            if (outcome.handshake_bytes.len != 0) rawAppendToConn(conn, outcome.handshake_bytes) catch {
+                conn.closing = true;
+                return;
+            };
+            if (t.handshakeDone() or outcome.plaintext.len != 0) {
+                conn.closing = true;
+                conn.close_reason = "ACME tls-alpn-01 validation";
+            }
+            return;
+        }
         if (handshake_pending and conn.tls.?.handshakeDone()) {
             self.recordElapsedLatency(.tls_handshake, started_at_ms);
             self.noteTlsHandshakeComplete(conn);
@@ -22971,13 +23087,14 @@ pub const LinuxServer = struct {
                 conn.session.tls_exporter = conn.tls_exporter_buf;
             } else |_| {}
         }
-        // kTLS TX offload (roadmap 3.1): once a TLS 1.3 handshake completes and
-        // offload is enabled, mark it pending — the attach itself waits for the
-        // send buffer to fully drain (below / at send-completion) so the kernel
-        // only ever takes over a clean, already-flushed send stream.
+        // kTLS TX offload (roadmap 3.1): once a TLS 1.3 or hardened TLS 1.2
+        // handshake completes and offload is enabled, mark it pending — the
+        // attach itself waits for the send buffer to fully drain (below / at
+        // send-completion) so the kernel only ever takes over a clean,
+        // already-flushed send stream.
         if (self.config.tls_ktls_tx and conn.tls.?.handshakeDone() and
             !conn.tls_tx_offloaded and !conn.ktls_attach_pending and
-            conn.tls.?.negotiatedVersion() == .tls13)
+            conn.tls.?.negotiatedVersion() != null)
         {
             conn.ktls_attach_pending = true;
         }
@@ -23023,7 +23140,7 @@ pub const LinuxServer = struct {
         // conn that still holds a partial inbound record stays on userspace RX.
         // After this, recv() returns plaintext (routed via driveClientBytes).
         if (self.config.tls_ktls_rx and conn.tls.?.handshakeDone() and
-            !conn.tls_rx_offloaded and conn.tls.?.negotiatedVersion() == .tls13 and
+            !conn.tls_rx_offloaded and conn.tls.?.negotiatedVersion() != null and
             !conn.tls.?.hasBufferedInbound())
         {
             if (conn.tls.?.enableKtlsRx(conn.fd)) |_| {
@@ -40790,18 +40907,7 @@ pub const LinuxServer = struct {
                     .kernel_tx_prefix_remaining = e.value.tls_kernel_prefix_remaining,
                 }) catch continue;
                 defer capture.deinit();
-                tls_blob = tls_snapshot.encode(self.allocator, .{
-                    .kernel_tx_prefix_remaining = capture.kernel_tx_prefix_remaining,
-                    .fd = e.value.fd,
-                    .state = capture.state,
-                    .pending_out = capture.pending_out,
-                    .certfp = if (e.value.session.tls_certfp) |fp| fp else &.{},
-                    .tx_offloaded = e.value.tls_tx_offloaded,
-                    .rx_offloaded = e.value.tls_rx_offloaded,
-                    .control_charge = @intCast(e.value.tls_control_charge),
-                    .deferred_ciphertext_charge = e.value.tls_deferred_charge,
-                    .deferred_plain = e.value.tls_deferred_plain.items,
-                }) catch continue;
+                tls_blob = tls_snapshot.encode(self.allocator, tlsCaptureSnapshot(e.value, &capture)) catch continue;
             }
             var snap = e.value.session.snapshot();
             snap.fd = e.value.fd; // re-attached by the successor
@@ -47281,6 +47387,25 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    /// The `.tls_session` row for one captured TLS client.
+    fn tlsCaptureSnapshot(conn: *const ConnState, capture: *const tls_conn.TlsConn.PreparedCapture) tls_snapshot.Snapshot {
+        return .{
+            .kernel_tx_prefix_remaining = capture.kernel_tx_prefix_remaining,
+            .fd = conn.fd,
+            .state = capture.state,
+            .pending_out = capture.pending_out,
+            .certfp = if (conn.session.tls_certfp) |fp| fp else &.{},
+            .tx_offloaded = conn.tls_tx_offloaded,
+            .rx_offloaded = conn.tls_rx_offloaded,
+            .control_charge = @intCast(conn.tls_control_charge),
+            .deferred_ciphertext_charge = conn.tls_deferred_charge,
+            .deferred_plain = conn.tls_deferred_plain.items,
+            // A resumed TLS 1.2 engine cannot re-derive the RFC 9266 binding
+            // (no master secret is carried), so the value itself is carried.
+            .tls12_channel_binding = if (capture.state.engine == .tls12) conn.session.tls_exporter else null,
+        };
+    }
+
     /// Rebuild a carried client's live TLS engine from its snapshot. On success
     /// the conn owns a resumed TlsConn and any unflushed predecessor ciphertext
     /// is re-queued verbatim. Returns false on ANY failure; the caller cleans the
@@ -47335,6 +47460,11 @@ pub const LinuxServer = struct {
         if (ts.state.engine == .tls13) {
             conn.tls_exporter_buf = exporter;
             conn.session.tls_exporter = exporter;
+        } else if (ts.tls12_channel_binding) |binding| {
+            // TLS 1.2: the binding derived by the predecessor at handshake
+            // time (EMS-bound). Absent (v3 row / no EMS) leaves -PLUS off.
+            conn.tls_exporter_buf = binding;
+            conn.session.tls_exporter = binding;
         }
         conn.session.tls_cipher = t.cipherName();
         success = true;
@@ -73362,6 +73492,152 @@ pub const LinuxServer = struct {
         }
         self.ocsp_staple_prev = self.ocsp_staple_owned;
         self.ocsp_staple_owned = next;
+    }
+
+    /// The delegated credential a new handshake may present: the active one,
+    /// only while it was minted for the serving leaf and has not expired
+    /// (RFC 9345 §4.1.3 checks 1 and 2 are the client's; never offer one
+    /// that must fail them).
+    fn servableDelegatedCredential(self: *const LinuxServer, now_unix: i64) ?tls_server.DelegatedCredential {
+        const active = self.dc_active orelse return null;
+        if (self.config.tls_cert_chain.len == 0) return null;
+        const leaf = self.config.tls_cert_chain[0];
+        if (leaf.ptr != self.dc_leaf.ptr or leaf.len != self.dc_leaf.len) return null;
+        if (now_unix >= active.expiry_unix) return null;
+        return active.serverCredential();
+    }
+
+    fn delegatedCredentialLeafKey(self: *const LinuxServer) ?dc_mint.LeafKey {
+        if (self.config.tls_rsa_signing_key) |key| return .{ .rsa = key };
+        if (self.config.tls_ecdsa_signing_key) |key| return .{ .ecdsa_p256 = key };
+        if (self.config.tls_signing_key) |key| return .{ .ed25519 = key };
+        return null;
+    }
+
+    fn freeDelegatedCredential(self: *LinuxServer, minted: *dc_mint.Minted) void {
+        minted.deinit(self.allocator);
+        self.allocator.destroy(minted);
+    }
+
+    fn delegatedCredentialBorrowed(self: *LinuxServer, minted: *const dc_mint.Minted) bool {
+        for (self.reactors) |*reactor| {
+            for (reactor.clients.slots.items) |*slot| {
+                if (!slot.occupied) continue;
+                const tls = slot.value.tls orelse continue;
+                if (tls.handshakeDone()) continue;
+                const held = tls.cfg13.delegated_credential orelse continue;
+                if (held.wire.ptr == minted.wire.ptr) return true;
+            }
+        }
+        return false;
+    }
+
+    fn pruneRetiredDelegatedCredentials(self: *LinuxServer) void {
+        var index: usize = 0;
+        while (index < self.dc_retired.items.len) {
+            if (self.delegatedCredentialBorrowed(self.dc_retired.items[index])) {
+                index += 1;
+            } else {
+                self.freeDelegatedCredential(self.dc_retired.orderedRemove(index));
+            }
+        }
+    }
+
+    /// Mint a fresh delegated credential when none is servable for the
+    /// current leaf or the active one entered its renewal window. A leaf
+    /// without DelegationUsage (RFC 9345 §4.2) or the digitalSignature key
+    /// usage is logged once and rotation stays off for that leaf; transient
+    /// failures retry after a minute. Every candidate is proven by a probe
+    /// `Server.init` before it is installed, so a bad credential can never
+    /// reach a handshake. Runs on the maintenance reactor only.
+    fn maybeRotateDelegatedCredential(self: *LinuxServer, now_unix: i64) void {
+        const settings = self.config.tls_delegated_credentials orelse return;
+        if (self.config.tls_cert_chain.len == 0) return;
+        const leaf = self.config.tls_cert_chain[0];
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(leaf, &digest, .{});
+        const leaf_current = self.dc_active != null and leaf.ptr == self.dc_leaf.ptr and
+            leaf.len == self.dc_leaf.len and std.mem.eql(u8, &digest, &self.dc_leaf_digest);
+        if (!leaf_current) if (self.dc_active) |stale| {
+            // The serving leaf changed (ACME renewal / reload): a credential is
+            // bound to the leaf DER, so stop presenting it now.
+            self.dc_retired.ensureUnusedCapacity(self.allocator, 1) catch return;
+            self.dc_retired.appendAssumeCapacity(stale);
+            self.dc_active = null;
+            self.dc_leaf = &.{};
+        };
+        const policy: dc_mint.RotationPolicy = .{
+            .lifetime_seconds = settings.valid_seconds,
+            .renew_before_seconds = settings.renew_before_seconds,
+            .dc_algorithm = switch (settings.algorithm) {
+                .ecdsa_p256 => .ecdsa_p256,
+                .ed25519 => .ed25519,
+            },
+        };
+        const active_expiry: ?i64 = if (leaf_current) if (self.dc_active) |active| active.expiry_unix else null else null;
+        if (!policy.due(active_expiry, now_unix)) return;
+        if (self.dc_refused_digest) |refused| if (std.mem.eql(u8, &refused, &digest)) return;
+        if (now_unix < self.dc_retry_after_unix) return;
+        const io = self.config.crypto_io orelse return;
+        const leaf_key = self.delegatedCredentialLeafKey() orelse return;
+        self.dc_retired.ensureUnusedCapacity(self.allocator, 1) catch {
+            self.dc_retry_after_unix = now_unix + 60;
+            return;
+        };
+        const fresh = self.allocator.create(dc_mint.Minted) catch {
+            self.dc_retry_after_unix = now_unix + 60;
+            return;
+        };
+        fresh.* = policy.mintNext(self.allocator, io, leaf, leaf_key, now_unix) catch |err| {
+            self.allocator.destroy(fresh);
+            switch (err) {
+                error.DelegationUsageMissing,
+                error.DigitalSignatureKeyUsageMissing,
+                error.LeafKeyMismatch,
+                error.UnsupportedLeafKey,
+                error.OutlivesCertificate,
+                => {
+                    self.dc_refused_digest = digest;
+                    srvLog("onyx-server: [tls] delegated_credentials disabled for the current certificate ({s}); serving without a delegated credential\n", .{@errorName(err)});
+                },
+                // CertificateNotYetValid is transient: a clock still behind
+                // the leaf's notBefore at boot must not disable rotation for
+                // the leaf's whole lifetime, so it retries like any other.
+                else => {
+                    self.dc_retry_after_unix = now_unix + 60;
+                    srvLog("onyx-server: [tls] delegated credential mint failed ({s}); retrying in 60s\n", .{@errorName(err)});
+                },
+            }
+            return;
+        };
+        var probe_cfg = self.tls13Config(false);
+        probe_cfg.delegated_credential = fresh.serverCredential();
+        probe_cfg.enable_session_tickets = false;
+        probe_cfg.max_early_data_size = 0;
+        probe_cfg.ocsp_staple = &.{};
+        if (tls_server.Server.init(self.allocator, probe_cfg)) |probe_server| {
+            var probe = probe_server;
+            probe.deinit();
+        } else |err| {
+            self.freeDelegatedCredential(fresh);
+            self.dc_retry_after_unix = now_unix + 60;
+            srvLog("onyx-server: [tls] minted delegated credential failed validation ({s}); not installed\n", .{@errorName(err)});
+            return;
+        }
+        // All fallible work is done: publish the new credential and retire
+        // the old one in a single step under the maintenance turn.
+        if (self.dc_active) |old| self.dc_retired.appendAssumeCapacity(old);
+        self.dc_active = fresh;
+        self.dc_leaf = leaf;
+        self.dc_leaf_digest = digest;
+        self.dc_retry_after_unix = 0;
+        srvLog("onyx-server: [tls] delegated credential installed (expires in {d}s)\n", .{fresh.expiry_unix - now_unix});
+    }
+
+    /// Seconds until the servable delegated credential expires, or null.
+    pub fn delegatedCredentialSecondsLeft(self: *const LinuxServer, now_unix: i64) ?i64 {
+        if (self.servableDelegatedCredential(now_unix) == null) return null;
+        return self.dc_active.?.expiry_unix - now_unix;
     }
 
     fn maybeReloadAcmeTls(self: *LinuxServer) void {
@@ -185253,4 +185529,434 @@ test "session publication retry: declared cohort reuses a stamped OFFER and coun
     // A revoke forgets the stamp, so no later retry can reuse across it.
     core.publishSessionReplicaRevoke(handle.token);
     try std.testing.expect(core.offer_retry_stamps.lookup(handle.token) == null);
+}
+
+// ---------------------------------------------------------------------------
+// Armor wave 3 (integrator): [tls] groups, delegated credentials, TLS 1.2
+// channel binding across Helix, per-node tickets, metrics.
+// ---------------------------------------------------------------------------
+
+fn armor3DelegationLeaf(buf: []u8, seed_byte: u8, delegation: bool) !struct { der: []const u8, kp: std.crypto.sign.Ed25519.KeyPair } {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+    const kp = try Ed25519.KeyPair.generateDeterministic(@as([Ed25519.KeyPair.seed_length]u8, @splat(seed_byte)));
+    const der = try x509_selfsign.buildSelfSigned(buf, .{
+        .common_name = "dc.test",
+        .not_before = 1_704_067_200,
+        .not_after = 4_102_444_800,
+        .serial = &.{ seed_byte, 0x02 },
+        .key_pair = kp,
+        .dns_names = &.{"dc.test"},
+        .delegation_usage = delegation,
+        .key_usage_digital_signature = true,
+    });
+    return .{ .der = der, .kp = kp };
+}
+
+test "armor3: [tls] groups reach every TLS 1.3 listener config; the default is the engine default" {
+    if (comptime !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try mintRehashTlsLeaf(&leaf_buf, 0xa1, "groups.test");
+    const chain = [_][]const u8{leaf.der};
+    const plain = initTlsPolicyTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &chain, .tls_signing_key = leaf.kp }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        plain.deinit();
+        allocator.destroy(plain);
+    }
+    try std.testing.expectEqualSlices(supported_groups.NamedGroup, &tls_server.default_groups, plain.tls13Config(false).groups);
+    const groups = [_]supported_groups.NamedGroup{ .secp256r1, .x25519 };
+    const tuned = initTlsPolicyTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &chain, .tls_signing_key = leaf.kp, .tls_groups = &groups }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        tuned.deinit();
+        allocator.destroy(tuned);
+    }
+    try std.testing.expectEqualSlices(supported_groups.NamedGroup, &groups, tuned.tls13Config(true).groups);
+    try std.testing.expectEqualSlices(supported_groups.NamedGroup, &groups, tuned.wsTls13Config().groups);
+    // The engine accepts the configured order.
+    var probe = try tls_server.Server.init(allocator, tuned.tls13Config(false));
+    probe.deinit();
+}
+
+test "armor3: delegated credentials rotate from the serving leaf, retire safely and expose expiry" {
+    if (comptime !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try armor3DelegationLeaf(&leaf_buf, 0xa2, true);
+    const chain = [_][]const u8{leaf.der};
+    const server = initTlsPolicyTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = leaf.kp,
+        .crypto_io = std.testing.io,
+        .tls_delegated_credentials = .{ .valid_seconds = 7200, .renew_before_seconds = 3600 },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    const now = @divFloor(platform.realtimeMillis(), 1000);
+    try std.testing.expect(server.tls13Config(false).delegated_credential == null);
+    try std.testing.expect(server.delegatedCredentialSecondsLeft(now) == null);
+
+    server.maybeRotateDelegatedCredential(now);
+    const first = server.dc_active orelse return error.TestUnexpectedResult;
+    const served = server.tls13Config(false).delegated_credential orelse return error.TestUnexpectedResult;
+    try std.testing.expect(served.wire.ptr == first.wire.ptr);
+    const left = server.delegatedCredentialSecondsLeft(now).?;
+    try std.testing.expect(left > 7000 and left <= 7200);
+    // A handshake engine accepts the installed credential.
+    var engine = try tls_server.Server.init(allocator, server.tls13Config(false));
+    engine.deinit();
+    // Not yet due: no re-mint.
+    server.maybeRotateDelegatedCredential(now + 10);
+    try std.testing.expect(server.dc_active.? == first);
+    // Inside the renewal window: a fresh credential, the old one retired and
+    // freed once no incomplete handshake borrows it.
+    server.maybeRotateDelegatedCredential(now + 3700);
+    try std.testing.expect(server.dc_active.? != first);
+    try std.testing.expectEqual(@as(usize, 1), server.dc_retired.items.len);
+    server.pruneRetiredDelegatedCredentials();
+    try std.testing.expectEqual(@as(usize, 0), server.dc_retired.items.len);
+    // An expired credential is never presented.
+    try std.testing.expect(server.servableDelegatedCredential(server.dc_active.?.expiry_unix) == null);
+
+    // The serving leaf changed (ACME renewal): the old credential stops
+    // immediately and one bound to the new leaf is minted.
+    var leaf2_buf: [1024]u8 = undefined;
+    const leaf2 = try armor3DelegationLeaf(&leaf2_buf, 0xa3, true);
+    const chain2 = [_][]const u8{leaf2.der};
+    server.config.tls_cert_chain = &chain2;
+    server.config.tls_signing_key = leaf2.kp;
+    try std.testing.expect(server.tls13Config(false).delegated_credential == null);
+    const before_change = server.dc_active.?;
+    server.maybeRotateDelegatedCredential(now);
+    try std.testing.expect(server.dc_active.? != before_change);
+    try std.testing.expect(server.tls13Config(false).delegated_credential != null);
+    var engine2 = try tls_server.Server.init(allocator, server.tls13Config(false));
+    engine2.deinit();
+
+    // A leaf without DelegationUsage: rotation logs once and stays off.
+    var plain_buf: [1024]u8 = undefined;
+    const plain = try armor3DelegationLeaf(&plain_buf, 0xa4, false);
+    const chain3 = [_][]const u8{plain.der};
+    server.config.tls_cert_chain = &chain3;
+    server.config.tls_signing_key = plain.kp;
+    server.maybeRotateDelegatedCredential(now);
+    try std.testing.expect(server.dc_active == null);
+    try std.testing.expect(server.dc_refused_digest != null);
+    try std.testing.expect(server.tls13Config(false).delegated_credential == null);
+    try std.testing.expect(server.delegatedCredentialSecondsLeft(now) == null);
+    server.pruneRetiredDelegatedCredentials();
+}
+
+test "armor3: RFC 8737 tls-alpn-01 store reaches the implicit-TLS listener through startAcceptedTls and driveTls" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const tls_client = @import("../crypto/tls_client.zig");
+    const acme_challenge = @import("../proto/acme_challenge.zig");
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try mintRehashTlsLeaf(&leaf_buf, 0xa6, "irc.example.test");
+    const chain = [_][]const u8{leaf.der};
+    const server = initTlsPolicyTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = leaf.kp,
+        .max_clones_per_ip = 8,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+
+    // The renewal Service's store, filled with a live challenge certificate.
+    var store: acme_runner.TlsAlpn01Store = .{};
+    var challenge_buf: [acme_challenge.max_tls_alpn01_cert_len]u8 = undefined;
+    var minted = try acme_runner.mintTlsAlpn01(std.testing.io, &challenge_buf, "irc.example.test", "token.thumbprint", 1_735_689_600);
+    defer ecdsa_p256.wipeKeyPair(&minted.key_pair);
+    try store.put("irc.example.test", minted.der, minted.key_pair);
+
+    const Admit = struct {
+        fn one(srv: *Server, addr_byte: u8) !struct { id: client_model.ClientId, conn: *ConnState } {
+            const id = try srv.rx().clients.alloc(ConnState.init(-1));
+            const conn = srv.rx().clients.get(id).?;
+            conn.token = try tokenFromId(id);
+            conn.overflow_allocator = std.testing.allocator;
+            conn.peer_addr = .{ .ipv4 = .{ 198, 51, 100, addr_byte } };
+            if (!try srv.startAcceptedTls(id, conn, false)) return error.TestUnexpectedResult;
+            return .{ .id = id, .conn = conn };
+        }
+        fn drop(srv: *Server, id: client_model.ClientId, conn: *ConnState) void {
+            if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
+            conn.send_overflow = .empty;
+            srv.rollbackAcceptedTransport(id, conn);
+        }
+    };
+
+    // Not wired (no tls-alpn-01 renewal): the listener has no store.
+    {
+        const admitted = try Admit.one(server, 60);
+        defer Admit.drop(server, admitted.id, admitted.conn);
+        try std.testing.expect(admitted.conn.tls.?.acme_store == null);
+    }
+
+    // Wired the way main.zig does on every platform.
+    server.acme_tls_alpn01_store = &store;
+    defer server.acme_tls_alpn01_store = null;
+    {
+        const admitted = try Admit.one(server, 61);
+        defer Admit.drop(server, admitted.id, admitted.conn);
+        const conn = admitted.conn;
+        try std.testing.expect(conn.tls.?.acme_store == &store);
+        var client = try tls_client.Client.init(allocator, .{ .server_name = "irc.example.test", .trust_anchors = &.{}, .alpn_protocols = &.{acme_challenge.acme_tls_alpn_protocol} });
+        defer client.deinit();
+        client.disableServerCertVerification();
+        const ch = try client.start();
+        defer allocator.free(ch);
+        const backlog_before = sendq.wireBacklog(conn);
+        try server.driveTls(admitted.id, conn, ch);
+        // The validation flight carries the challenge certificate, selects
+        // acme-tls/1 and never reaches IRC registration.
+        try std.testing.expect(conn.tls.?.isAcmeTlsAlpn01());
+        try std.testing.expectEqualStrings(acme_challenge.acme_tls_alpn_protocol, conn.tls.?.selectedAlpn().?);
+        try std.testing.expectEqualSlices(u8, minted.der, conn.tls.?.engine.tls13.config.cert_chain[0]);
+        try std.testing.expect(sendq.wireBacklog(conn) > backlog_before);
+    }
+
+    // An ordinary IRC hello to the same listener is untouched.
+    {
+        const admitted = try Admit.one(server, 62);
+        defer Admit.drop(server, admitted.id, admitted.conn);
+        const conn = admitted.conn;
+        var client = try tls_client.Client.init(allocator, .{ .server_name = "irc.example.test", .trust_anchors = &chain, .alpn_protocols = &.{"irc"} });
+        defer client.deinit();
+        client.disableServerCertVerification();
+        const ch = try client.start();
+        defer allocator.free(ch);
+        try server.driveTls(admitted.id, conn, ch);
+        try std.testing.expect(!conn.tls.?.isAcmeTlsAlpn01());
+        try std.testing.expectEqualSlices(u8, leaf.der, conn.tls.?.engine.tls13.config.cert_chain[0]);
+        try std.testing.expect(!conn.closing);
+    }
+}
+
+test "armor3: a clock behind the leaf notBefore retries delegated-credential rotation instead of refusing the leaf" {
+    if (comptime !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try armor3DelegationLeaf(&leaf_buf, 0xa5, true);
+    const chain = [_][]const u8{leaf.der};
+    const server = initTlsPolicyTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = leaf.kp,
+        .crypto_io = std.testing.io,
+        .tls_delegated_credentials = .{ .valid_seconds = 7200, .renew_before_seconds = 3600 },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    // The leaf's notBefore is 1_704_067_200 (armor3DelegationLeaf).
+    const behind: i64 = 1_704_067_200 - 1000;
+    server.maybeRotateDelegatedCredential(behind);
+    try std.testing.expect(server.dc_active == null);
+    try std.testing.expect(server.dc_refused_digest == null);
+    try std.testing.expectEqual(behind + 60, server.dc_retry_after_unix);
+    // Inside the back-off window nothing is attempted.
+    server.maybeRotateDelegatedCredential(behind + 30);
+    try std.testing.expect(server.dc_active == null);
+    // Once the clock is corrected the same leaf gets a credential.
+    const now = @divFloor(platform.realtimeMillis(), 1000);
+    server.maybeRotateDelegatedCredential(now);
+    try std.testing.expect(server.dc_active != null);
+    try std.testing.expect(server.tls13Config(false).delegated_credential != null);
+    server.pruneRetiredDelegatedCredentials();
+}
+
+test "armor3: TLS 1.2 RFC 9266 channel binding rides the tls_session row and is restored on adopt" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    const pair = try DaemonOutputTestPair.createSuite(.tls12, null);
+    defer pair.destroy();
+    const server = try createTestServer(a, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_cert_chain = &pair.chain13,
+        .tls_signing_key = pair.tls.cfg13.signing_key,
+        .tls12_cert_chain = &pair.chain12,
+        .tls12_signing_key = pair.tls.cfg12.?.ecdsa_p256_signing_key,
+    });
+    defer {
+        server.deinit();
+        a.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+    const sockets = try sameIPTestSocketPair();
+    defer closeFd(sockets[1]);
+    try os_runtime.setNonblocking(sockets[0]);
+    const id = try addTestLocalClient(server, "Tls12Owner", null);
+    const conn = server.rx().clients.get(id).?;
+    conn.session.restore(.{ .nick = "Tls12Owner", .username = "owner", .realname = "TLS12 owner" });
+    conn.test_sendq_capture = true;
+    const owned = try a.create(tls_conn.TlsConn);
+    owned.* = pair.tls;
+    pair.tls = tls_conn.TlsConn.initDual(a, pair.tls.cfg13, pair.tls.cfg12.?);
+    conn.fd = sockets[0];
+    conn.tls = owned;
+    conn.is_tls = true;
+
+    // The live path derives the binding once the handshake is done.
+    try server.driveTls(id, conn, &.{});
+    const binding = conn.session.tls_exporter orelse return error.TestUnexpectedResult;
+    var client_binding: [32]u8 = undefined;
+    try pair.client.tls12.channelBindingTlsExporter(&client_binding);
+    try std.testing.expectEqualSlices(u8, &client_binding, &binding);
+
+    var capture = try conn.tls.?.prepareCapture(a, .{
+        .fd = conn.fd,
+        .tx_offloaded = false,
+        .rx_offloaded = false,
+        .wire_chunks = &.{},
+        .deferred_plain = &.{},
+        .deferred_ciphertext_charge = 0,
+        .control_charge = 0,
+        .queue_cap = conn.sendq_cap,
+        .kernel_tx_prefix_remaining = 0,
+    });
+    defer capture.deinit();
+    const row = Server.tlsCaptureSnapshot(conn, &capture);
+    try std.testing.expectEqualSlices(u8, &binding, &row.tls12_channel_binding.?);
+    const wire = try tls_snapshot.encode(a, row);
+    defer a.free(wire);
+    const decoded = try tls_snapshot.decode(wire, tls_snapshot.schema_version);
+
+    const successor = try createTestServer(a, server.config);
+    defer {
+        successor.deinit();
+        a.destroy(successor);
+    }
+    current_reactor = &successor.reactors[0];
+    var client = conn.session.snapshot();
+    client.fd = conn.fd;
+    client.was_secured = true;
+    try std.testing.expect(successor.adoptInheritedClient(client, decoded, null, false));
+    conn.fd = -1;
+    var it = successor.reactors[0].clients.iterator();
+    const adopted = it.next().?.value;
+    try std.testing.expectEqualSlices(u8, &binding, &adopted.session.tls_exporter.?);
+    // The resumed 1.2 engine itself cannot re-derive it.
+    var scratch: [32]u8 = undefined;
+    try std.testing.expectError(error.BadState, adopted.tls.?.channelBindingTlsExporter(&scratch));
+}
+
+test "armor3: TLS ticket keys are per node, so a foreign node's ticket never resumes or replays 0-RTT" {
+    if (comptime !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const tls_client = @import("../crypto/tls_client.zig");
+    const allocator = std.testing.allocator;
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try mintRehashTlsLeaf(&leaf_buf, 0xa5, "irc.test");
+    const chain = [_][]const u8{leaf.der};
+    const cfg: Config = .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &chain, .tls_signing_key = leaf.kp, .tls_enable_resumption = true, .tls_early_data_max_size = 4096 };
+    const node_a = initTlsPolicyTestServer(allocator, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        node_a.deinit();
+        allocator.destroy(node_a);
+    }
+    const node_b = try initTlsPolicyTestServer(allocator, cfg);
+    defer {
+        node_b.deinit();
+        allocator.destroy(node_b);
+    }
+    // Each process draws its own random key; nothing in the mesh shares it.
+    try std.testing.expect(!std.mem.eql(u8, &node_a.tls_ticket_key, &node_b.tls_ticket_key));
+
+    var issuing = try tls_conn.TlsConn.init(allocator, node_a.tls13Config(false));
+    defer issuing.deinit();
+    var first = try tls_client.Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &chain });
+    defer first.deinit();
+    const ch = try first.start();
+    defer allocator.free(ch);
+    const flight = try issuing.onInbound(ch);
+    const fin = switch (try first.feed(flight.handshake_bytes)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    defer allocator.free(fin);
+    const nst = try issuing.onInbound(fin);
+    try std.testing.expectEqual(tls_client.AppRead.control, try first.decryptApp(nst.handshake_bytes));
+    const ticket = first.takeSessionTicket() orelse return error.TestUnexpectedResult;
+    defer allocator.free(ticket);
+
+    // Node B: the ticket does not decrypt, so the handshake is a full one and
+    // the 0-RTT flight is rejected (RFC 8446 §4.2.10, §8).
+    var foreign = try tls_client.Client.init(allocator, .{ .server_name = "irc.test", .trust_anchors = &chain });
+    defer foreign.deinit();
+    try foreign.setSessionTicket(ticket, 1000);
+    try foreign.setEarlyData("EARLY replay");
+    const foreign_hello = try foreign.start();
+    defer allocator.free(foreign_hello);
+    var at_b = try tls_conn.TlsConn.init(allocator, node_b.tls13Config(false));
+    defer at_b.deinit();
+    const b_flight = try at_b.onInbound(foreign_hello);
+    try std.testing.expect(b_flight.handshake_bytes.len != 0);
+    try std.testing.expect(!at_b.engine.tls13.acceptedSessionTicket());
+    try std.testing.expect(!at_b.engine.tls13.earlyDataAccepted());
+
+    // Node A (the issuer) does resume the same hello.
+    var at_a = try tls_conn.TlsConn.init(allocator, node_a.tls13Config(false));
+    defer at_a.deinit();
+    _ = try at_a.onInbound(foreign_hello);
+    try std.testing.expect(at_a.engine.tls13.acceptedSessionTicket());
+}
+
+test "armor3: TLS metrics expose kTLS 1.2, delegated credential expiry and QUIC counters" {
+    if (comptime !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try mintRehashTlsLeaf(&leaf_buf, 0xa6, "metrics.test");
+    const chain = [_][]const u8{leaf.der};
+    const server = initTlsPolicyTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &chain, .tls_signing_key = leaf.kp }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    _ = server.tls_ktls12_active.fetchAdd(2, .monotonic);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try server.writeTlsPrometheus(allocator, &out, @divFloor(platform.realtimeMillis(), 1000));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "onyx_tls_ktls12_active 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "onyx_tls_delegated_credential_expiry_seconds 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "# TYPE onyx_quic_resumptions_total counter\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "onyx_quic_early_data_accepted_total ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "onyx_quic_early_data_rejected_total ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "onyx_quic_stateless_resets_sent_total ") != null);
+    _ = server.tls_ktls12_active.fetchSub(2, .monotonic);
 }

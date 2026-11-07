@@ -19,6 +19,12 @@ const readSome = @import("native_io.zig").readSome;
 
 pub const max_tls_record = 16 * 1024 + 512;
 
+/// RFC 8701 GREASE stays on for this outbound TLS 1.3 client so peers that
+/// mishandle unknown values are found early; GREASE ECH stays off because the
+/// daemon holds no ECHConfig for these hosts (draft-ietf-tls-esni §6.2).
+pub const outbound_grease = true;
+pub const outbound_ech_grease = false;
+
 /// TLS 1.2 variant of `getTls` (hardened `tls12_client`). Used as the fallback
 /// when the TLS 1.3 handshake fails — broadens outbound reach to TLS-1.2-only
 /// hosts. Mirrors `getTls` but uses the 1.2 client's `decrypt` (no KeyUpdate).
@@ -120,6 +126,8 @@ pub fn getTls(
         .ct_logs = opts.ct_logs,
         .enforce_sct = opts.enforce_sct,
         .require_sct = opts.require_sct,
+        .grease = outbound_grease,
+        .ech_grease = outbound_ech_grease,
     });
     defer tc.deinit();
     if (opts.insecure_skip_verify) tc.disableServerCertVerification();
@@ -240,4 +248,13 @@ fn consumePrefix(list: *std.ArrayList(u8), n: usize) void {
     const rem = list.items.len - n;
     std.mem.copyForwards(u8, list.items[0..rem], list.items[n..]);
     list.shrinkRetainingCapacity(rem);
+}
+
+test "outbound TLS client keeps RFC 8701 GREASE on and GREASE ECH off" {
+    try std.testing.expect(outbound_grease);
+    try std.testing.expect(!outbound_ech_grease);
+    var tc = try tls_client.Client.init(std.testing.allocator, .{ .server_name = "example.test", .trust_anchors = &.{}, .grease = outbound_grease, .ech_grease = outbound_ech_grease });
+    defer tc.deinit();
+    try std.testing.expect(tc.grease != null);
+    try std.testing.expect(!tc.ech_grease);
 }

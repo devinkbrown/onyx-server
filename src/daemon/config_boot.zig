@@ -16,6 +16,7 @@ const config_format = @import("config_format.zig");
 const mooring_handshake = @import("../crypto/mooring_handshake.zig");
 const tls_client = @import("../crypto/tls_client.zig");
 const server = @import("server.zig");
+const webtransport_listener = @import("webtransport_listener.zig");
 const oper_mod = @import("oper.zig");
 const conn_class = @import("conn_class.zig");
 const cidr_mod = @import("../proto/cidr.zig");
@@ -232,6 +233,22 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
     out.news_count = cfg.news.count;
     out.geo_enabled = cfg.geo.enabled;
     out.geo_news_insecure_tls = cfg.geo.news_insecure_tls;
+    if (cfg.geo.news_ca_bundle) |v| out.geo_news_ca_bundle = v;
+    // [tls] groups / delegated_credentials and the [webtransport] QUIC policy.
+    // The groups slice borrows `cfg`, which main keeps for the process
+    // lifetime (TLS settings are boot-only).
+    if (cfg.tls.groups) |groups| out.tls_groups = groups;
+    out.tls_delegated_credentials = cfg.tls.delegated_credentials;
+    out.webtransport_quic = .{
+        .resumption = cfg.webtransport.resumption,
+        .early_data = cfg.webtransport.resumption and cfg.webtransport.early_data,
+        .ticket_lifetime_seconds = cfg.webtransport.ticket_lifetime_seconds,
+        .stateless_reset_key = cfg.webtransport.stateless_reset_key,
+        // Parse-time validation guarantees a QUIC-capable group whenever the
+        // WebTransport listener is configured; otherwise keep the default.
+        .group_order = webtransport_listener.quicGroupOrderFor(out.tls_groups) orelse out.webtransport_quic.group_order,
+    };
+    out.geo_news_ca_bundle_max_bytes = std.math.cast(usize, cfg.geo.news_ca_bundle_max_bytes) orelse std.math.maxInt(usize);
     out.geo_cmd_cooldown_ms = cfg.geo.cmd_cooldown_ms;
     if (cfg.geo.default_location) |v| out.geo_default_location = v;
     if (cfg.geo.news_cache_dir) |v| out.geo_news_cache_dir = v;
@@ -482,6 +499,43 @@ test "retired session fence boot projection borrows policy and clears inherited 
     parsed.mesh.retired_session_group_fences = &.{};
     const cleared = mapToServerConfig(parsed, mapped);
     try std.testing.expectEqual(@as(usize, 0), cleared.retired_session_group_fences.len);
+}
+
+test "geo news CA bundle path and bound reach the server config" {
+    var parsed: config_format.Config = .{};
+    const defaults = mapToServerConfig(parsed, .{ .port = 6680 });
+    try std.testing.expect(!defaults.geo_news_insecure_tls);
+    try std.testing.expectEqualStrings("/etc/ssl/certs/ca-certificates.crt", defaults.geo_news_ca_bundle);
+    try std.testing.expectEqual(@as(usize, 4 << 20), defaults.geo_news_ca_bundle_max_bytes);
+    parsed.geo.news_ca_bundle = "/etc/onyx/news-ca.pem";
+    parsed.geo.news_ca_bundle_max_bytes = 1 << 20;
+    const mapped = mapToServerConfig(parsed, .{ .port = 6680 });
+    try std.testing.expectEqualStrings("/etc/onyx/news-ca.pem", mapped.geo_news_ca_bundle);
+    try std.testing.expectEqual(@as(usize, 1 << 20), mapped.geo_news_ca_bundle_max_bytes);
+}
+
+test "tls groups, delegated credentials and the webtransport QUIC policy reach the server config" {
+    var parsed: config_format.Config = .{};
+    const defaults = mapToServerConfig(parsed, .{ .port = 6680 });
+    try std.testing.expectEqualSlices(@TypeOf(defaults.tls_groups[0]), &.{ .x25519mlkem768, .x25519, .secp256r1 }, defaults.tls_groups);
+    try std.testing.expect(defaults.tls_delegated_credentials == null);
+    try std.testing.expect(!defaults.webtransport_quic.resumption);
+    try std.testing.expect(!defaults.webtransport_quic.early_data);
+    try std.testing.expectEqual(@as(usize, 2), defaults.webtransport_quic.group_order.len);
+
+    const groups = [_]@TypeOf(defaults.tls_groups[0]){ .secp256r1, .x25519 };
+    parsed.tls.groups = &groups;
+    parsed.tls.delegated_credentials = .{ .valid_seconds = 7200, .renew_before_seconds = 3600 };
+    parsed.webtransport = .{ .resumption = true, .early_data = true, .ticket_lifetime_seconds = 600, .stateless_reset_key = @splat(7) };
+    const mapped = mapToServerConfig(parsed, .{ .port = 6680 });
+    try std.testing.expect(mapped.tls_groups.ptr == &groups);
+    try std.testing.expectEqual(@as(u32, 7200), mapped.tls_delegated_credentials.?.valid_seconds);
+    try std.testing.expect(mapped.webtransport_quic.resumption);
+    try std.testing.expect(mapped.webtransport_quic.early_data);
+    try std.testing.expectEqual(@as(u32, 600), mapped.webtransport_quic.ticket_lifetime_seconds);
+    try std.testing.expectEqual(@as([32]u8, @splat(7)), mapped.webtransport_quic.stateless_reset_key.?);
+    try std.testing.expectEqual(@as(usize, 1), mapped.webtransport_quic.group_order.len);
+    try std.testing.expectEqual(@TypeOf(mapped.webtransport_quic.group_order[0]).x25519, mapped.webtransport_quic.group_order[0]);
 }
 
 test "sqpoll idle boot projection reaches the real reactor and neutral preflight" {
