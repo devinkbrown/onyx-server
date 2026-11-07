@@ -594,6 +594,9 @@ pub const Client = struct {
     pre_extensions_max_inner_len: usize = 0,
     read_failed: bool = false,
     alert_taken: bool = false,
+    /// RFC 8446 §6.1: set once `closeNotify` produced our close_notify; the
+    /// write side is then closed and nothing further is sealed.
+    write_closed: bool = false,
 
     // --- Test-only client-certificate support (mutual TLS) ---
     // Existing behavior is fully preserved when no client cert is configured:
@@ -1202,7 +1205,7 @@ pub const Client = struct {
     }
 
     pub fn encrypt(self: *Client, appdata: []const u8) Error![]u8 {
-        if (self.read_failed or self.state != .connected) return error.BadState;
+        if (self.read_failed or self.write_closed or self.state != .connected) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
         const encrypted = try sealRecordBatchAlloc(self.allocator, suite, &self.client_app_keys, self.app_write_seq, .application_data, appdata, self.peer_record_size_limit);
         self.app_write_seq = encrypted.next_seq;
@@ -1212,7 +1215,8 @@ pub const Client = struct {
     /// At most one owned fatal software batch. Queued old-key KU precedes
     /// a new-key alert; no returned alert can overtake that retained ciphertext.
     pub fn takeAlert(self: *Client, failure: Error) ?[]u8 {
-        if (self.alert_taken) return null;
+        // RFC 8446 §6.1: nothing follows our close_notify on the write side.
+        if (self.alert_taken or self.write_closed) return null;
         const body = tls_record.fatalAlertBytes(failure) orelse return null;
         self.read_failed = true;
         self.alert_taken = true;
@@ -1230,6 +1234,38 @@ pub const Client = struct {
         @memcpy(owned[self.post_handshake_send.items.len..], record);
         self.post_handshake_send.clearRetainingCapacity();
         if (connected) self.app_write_seq = seq + 1 else self.hs_write_seq = seq + 1;
+        return owned;
+    }
+
+    /// RFC 8446 §6.1 graceful closure of our write side. Returns owned bytes
+    /// the caller writes before closing (or half-closing) the transport: any
+    /// queued post-handshake records first (a KeyUpdate sealed under the
+    /// previous write key must precede the new-key record), then a
+    /// close_notify alert sealed under the current application traffic key.
+    /// "Each party MUST send a close_notify alert before closing its write
+    /// side of the connection" — also in response to the peer's close_notify
+    /// (which `decryptApp` reports as `error.TlsAlert` with `last_alert`
+    /// `.close_notify`). Afterwards `encrypt`, `takeAlert` and a second
+    /// `closeNotify` are refused, and a peer KeyUpdate request is no longer
+    /// answered. Fails with `BadState` before our Finished is owned or after a
+    /// fatal alert was taken. OOM leaves the client unchanged.
+    pub fn closeNotify(self: *Client) Error![]u8 {
+        if (self.write_closed or self.alert_taken) return error.BadState;
+        if (self.state != .connected or self.hs_write_seq == 0) return error.BadState;
+        const suite = self.selected_suite orelse return error.BadState;
+        const seq = try tls_record.reserveAppSeq(self.app_write_seq);
+        // TLS 1.3 ignores the level (§6), but close_notify is sent as warning(1).
+        const body = [_]u8{ @backingInt(tls_alert.AlertLevel.warning), @backingInt(tls_alert.AlertDescription.close_notify) };
+        const record = try sealRecordAlloc(self.allocator, suite, &self.client_app_keys, seq, .alert, &body);
+        defer self.allocator.free(record);
+        const queued = self.post_handshake_send.items.len;
+        const total = std.math.add(usize, queued, record.len) catch return error.OutOfMemory;
+        const owned = try self.allocator.alloc(u8, total);
+        @memcpy(owned[0..queued], self.post_handshake_send.items);
+        @memcpy(owned[queued..], record);
+        self.post_handshake_send.clearRetainingCapacity();
+        self.app_write_seq = seq + 1;
+        self.write_closed = true;
         return owned;
     }
 
@@ -1337,7 +1373,8 @@ pub const Client = struct {
                 if (off != self.post_handshake_recv.items.len or msg.body[0] > 1) return error.BadHandshake;
                 try self.updateCandidateKey(&rx_secret, &rx_keys);
                 rx_seq = 0;
-                if (msg.body[0] == @backingInt(KeyUpdateRequest.requested)) {
+                // RFC 8446 §6.1: after our close_notify no reply is sealed.
+                if (msg.body[0] == @backingInt(KeyUpdateRequest.requested) and !self.write_closed) {
                     const reply_hs = [_]u8{ @backingInt(HandshakeType.key_update), 0, 0, 1, 0 };
                     const encrypted = try sealRecordBatchAlloc(self.allocator, suite, &tx_keys, tx_seq, .handshake, &reply_hs, self.peer_record_size_limit);
                     defer self.allocator.free(encrypted.bytes);
@@ -1414,7 +1451,7 @@ pub const Client = struct {
     /// queue it for the caller, then rotate the client→server application keys so
     /// the next application record uses the new keys (RFC 8446 §4.6.3).
     fn sendKeyUpdate(self: *Client, request: KeyUpdateRequest) Error!void {
-        if (self.read_failed) return error.BadState;
+        if (self.read_failed or self.write_closed) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
         const hs = [_]u8{ @backingInt(HandshakeType.key_update), 0, 0, 1, @backingInt(request) };
         const encrypted = try sealRecordBatchAlloc(self.allocator, suite, &self.client_app_keys, self.app_write_seq, .handshake, &hs, self.peer_record_size_limit);
@@ -2741,8 +2778,13 @@ pub const Client = struct {
         if (count == 0) return error.EmptyCertificateChain;
         const chain = chain_buf[0..count];
         try rejectDisallowedCerts(chain, self.disallowed_certs);
+        // The leaf's issuer for OCSP/CRL/CT: the one on the validated path
+        // (which may be out of wire order, or the external anchor itself).
+        // Without verification only the wire order is available.
+        var leaf_issuer_der: []const u8 = if (chain.len > 1) chain[1] else chain[0];
         if (!self.skip_cert_verify_for_test or self.windows_chain_policy) {
-            try verifyChainToTrustAnchors(chain, self.trust_anchors, self.effectiveVerifyName(), self.verify_time);
+            const path = try verifyChainToTrustAnchorsPath(chain, self.trust_anchors, self.effectiveVerifyName(), self.verify_time);
+            leaf_issuer_der = path.leafIssuer();
             if (self.windows_chain_policy) {
                 if (builtin.os.tag != .windows) return error.BadCertificate;
                 try windows_chain_policy.verify(chain, self.effectiveVerifyName());
@@ -2754,14 +2796,12 @@ pub const Client = struct {
         }
         if (leaf_ocsp_staple) |staple| {
             const leaf = try x509.parse(chain[0]);
-            const issuer_der = if (chain.len > 1) chain[1] else chain[0];
-            const issuer_parts = try extractCertParts(issuer_der);
+            const issuer_parts = try extractCertParts(leaf_issuer_der);
             try verifyOcspStapleForLeaf(staple, issuer_parts.spki_der, leaf.serial_der, self.verify_time);
         }
         if (self.crl) |crl_der| {
             const leaf = try x509.parse(chain[0]);
-            const issuer_der = if (chain.len > 1) chain[1] else chain[0];
-            const issuer_parts = try extractCertParts(issuer_der);
+            const issuer_parts = try extractCertParts(leaf_issuer_der);
             try checkCrlRevocation(crl_der, issuer_parts.spki_der, leaf.serial_der, self.verify_time, self.require_crl);
         }
         // Opt-in SCT (Certificate Transparency) verification, pooling SCTs from
@@ -2773,7 +2813,9 @@ pub const Client = struct {
         // ext-18 was ever advertised, and OCSP stapling is requested regardless
         // (so the OCSP source adds no wire change). `enforce_sct` adds tamper
         // detection; `require_sct` adds the presence + distinct-log quorum.
-        try verifyScts(chain, leaf_tls_ext_scts, leaf_ocsp_staple, self.ct_logs, self.enforce_sct, self.require_sct);
+        // CT reads only the leaf and its issuer (issuer_key_hash).
+        const sct_view = [_][]const u8{ chain[0], leaf_issuer_der };
+        try verifyScts(&sct_view, leaf_tls_ext_scts, leaf_ocsp_staple, self.ct_logs, self.enforce_sct, self.require_sct);
         self.leaf_key = try parsePublicKeyFromSpki((try extractCertParts(chain[0])).spki_der);
         try self.ownLeafRsaKey();
 
@@ -4131,6 +4173,17 @@ fn rejectDisallowedCerts(chain: []const []const u8, disallowed_certs: []const []
 }
 
 fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const u8, server_name: []const u8, now: ?i64) Error!void {
+    _ = try verifyChainToTrustAnchorsPath(chain, anchors, server_name, now);
+}
+
+/// RFC 8446 §4.4.2 / RFC 5280 §6 server certificate validation. The leaf's
+/// path-independent checks run first; then `x509_verify.buildServerPath`
+/// builds a path from the leaf to a configured anchor out of the presented
+/// certificates (tolerating extraneous certificates, cross-signed roots and
+/// arbitrary order) and applies every CA constraint to the path it chose.
+/// Returns that path so revocation and CT checks use the leaf's actual
+/// issuer rather than whatever certificate happened to be second on the wire.
+fn verifyChainToTrustAnchorsPath(chain: []const []const u8, anchors: []const []const u8, server_name: []const u8, now: ?i64) Error!x509_verify.TrustedPath {
     if (chain.len == 0) return error.EmptyCertificateChain;
     if (anchors.len == 0) return error.UnknownCa;
     const leaf = try x509.parse(chain[0]);
@@ -4144,67 +4197,12 @@ fn verifyChainToTrustAnchors(chain: []const []const u8, anchors: []const []const
     // KeyUsage, when present, must allow digitalSignature. This runs while the
     // Certificate message is checked, before CertificateVerify.
     if (leaf.key_usage_present and !leaf.key_usage_digital_signature) return error.BadCertificate;
-
-    var i: usize = 0;
-    while (i + 1 < chain.len) : (i += 1) {
-        try verifyIssuedBy(chain[i], chain[i + 1]);
-        const issuer = try x509.parse(chain[i + 1]);
-        if (!issuer.basic_constraints_ca) return error.BadCertificate;
-        // A CA's EKU, when present, constrains every server certificate below it.
-        if (issuer.eku_present and !issuer.eku_server_auth) return error.BadCertificate;
-        // A CA in the path must be allowed to sign certificates and be valid now.
-        if (issuer.key_usage_present and !issuer.key_usage_cert_sign) return error.BadCertificate;
-        if (now) |t| try x509_verify.validateParsedAt(issuer, t);
-    }
-    // Every presented CA's dNSName constraints bind each certificate below it,
-    // including an intermediate's own names. Shared with the TLS 1.2 client.
-    try x509_verify.enforcePresentedNameConstraintsFor(chain, server_name);
-
-    // RFC 5280 §4.2.1.10 / §6.1.4(m): pathLenConstraint enforcement, shared
-    // with the hardened TLS 1.2 client. Reduce the chain to per-cert facts
-    // (path limit + self-issued) then check with the pure `enforcePathLen`
-    // helper.
-    var facts_buf: [16]x509_verify.CaPathFact = undefined;
-    const fn_count = x509_verify.buildPathFacts(chain, &facts_buf);
-    try x509_verify.enforcePathLen(facts_buf[0..fn_count]);
-
-    // Anchor the chain tip: its issuer DN (or, for a self-issued tip, its own
-    // subject DN) must match a configured anchor's subject, and its signature must
-    // verify under that anchor's public key. A malformed anchor or a failed
-    // match/verify falls through to the next anchor — the search never aborts on
-    // one. The signature primitive delegates to `x509_verify.verifySignedBy`,
-    // which covers the full sig-alg set (RSA PKCS#1 SHA-256/384/512, RSASSA-PSS,
-    // ECDSA P-256/P-384, Ed25519), so real CA links signed with sha384WithRSA,
-    // RSASSA-PSS, or ecdsa-with-SHA384 anchor correctly.
-    const last = chain[chain.len - 1];
-    const last_info = try x509_verify.linkInfo(last);
-    for (anchors) |anchor_der| {
-        const anchor_info = x509_verify.linkInfo(anchor_der) catch continue;
-        if (!std.mem.eql(u8, last_info.issuer_der, anchor_info.subject_der) and
-            !std.mem.eql(u8, last_info.subject_der, anchor_info.subject_der))
-        {
-            continue;
-        }
-        x509_verify.verifySignedBy(last_info, anchor_info) catch |err| {
-            dbg("trust-anchor DN matched but signature check failed: {s}", .{@errorName(err)});
-            continue;
-        };
-        const anchor = x509.parse(anchor_der) catch continue;
-        if (anchor.eku_present and !anchor.eku_server_auth) continue;
-        // The anchor's own name constraints and pathLenConstraint bind the
-        // path even when that certificate is not resent in the chain.
-        try x509_verify.enforceExternalAnchorFor(chain, anchor_der, server_name);
-        return;
-    }
-    return error.UnknownCa;
-}
-
-fn verifyIssuedBy(child_der: []const u8, issuer_der: []const u8) Error!void {
-    const child = try x509_verify.linkInfo(child_der);
-    const issuer = try x509_verify.linkInfo(issuer_der);
-    if (!std.mem.eql(u8, child.issuer_der, issuer.subject_der)) return error.BadCertificate;
-    // Full sig-alg set via x509_verify (see verifyChainToTrustAnchors).
-    try x509_verify.verifySignedBy(child, issuer);
+    // Path building + per-path policy (basicConstraints, CA KeyUsage/EKU,
+    // validity, NameConstraints incl. the accepted name, pathLenConstraint,
+    // and the anchor's own constraints) are shared with the TLS 1.2 client.
+    // The signature primitive covers the full sig-alg set (RSA PKCS#1
+    // SHA-256/384/512, RSASSA-PSS, ECDSA P-256/P-384, Ed25519).
+    return x509_verify.buildServerPath(chain, anchors, server_name, now);
 }
 
 fn dnsNameMatchesCert(server_name: []const u8, cert: x509.Certificate) bool {
@@ -7141,7 +7139,7 @@ test "Client deep-copies pinned CT logs and frees them (no leak, no dangle)" {
 // ===========================================================================
 // Certificate-chain signature-algorithm coverage (roadmap 1.3, #46 follow-up).
 //
-// verifyChainToTrustAnchors / verifyIssuedBy delegate their signature primitive
+// verifyChainToTrustAnchors (via x509_verify.buildServerPath) delegates its signature primitive
 // to x509_verify.verifySignedBy, so the production TLS 1.3 client now anchors CA
 // links across the FULL sig-alg set (RSA PKCS#1 SHA-256/384/512, RSASSA-PSS,
 // ECDSA P-256/P-384, Ed25519) — the single, independently-tested x509_verify
@@ -9226,4 +9224,125 @@ test "ECH in a HelloRetryRequest: legal only after an ECH offer and only as an 8
         defer allocator.free(hrr);
         try std.testing.expectError(error.BadHandshake, client.feed(hrr));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Armor wave 3 (client-trust): RFC 5280 §6 / RFC 8446 §4.4.2 path building
+// and RFC 8446 §6.1 close_notify emission.
+// ---------------------------------------------------------------------------
+
+const TrustFixture13 = struct {
+    bufs: [5][1024]u8 = undefined,
+    root_r: []const u8 = &.{},
+    root_x: []const u8 = &.{},
+    r_by_x: []const u8 = &.{},
+    inter: []const u8 = &.{},
+    leaf: []const u8 = &.{},
+
+    fn init(self: *TrustFixture13) !void {
+        const Ed25519 = std.crypto.sign.Ed25519;
+        const r = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xe1)));
+        const x = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xe2)));
+        const i = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xe3)));
+        const l = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0xe4)));
+        const nb: i64 = 1_704_067_200;
+        const na: i64 = 1_924_991_999;
+        self.root_r = try x509_verify.mintEd25519CertExt(&self.bufs[0], "Trust R", "Trust R", r.public_key.toBytes(), r, nb, na, .{ .is_ca = true });
+        self.root_x = try x509_verify.mintEd25519CertExt(&self.bufs[1], "Trust X", "Trust X", x.public_key.toBytes(), x, nb, na, .{ .is_ca = true });
+        self.r_by_x = try x509_verify.mintEd25519CertExt(&self.bufs[2], "Trust X", "Trust R", r.public_key.toBytes(), x, nb, na, .{ .is_ca = true });
+        self.inter = try x509_verify.mintEd25519CertExt(&self.bufs[3], "Trust R", "Trust I", i.public_key.toBytes(), r, nb, na, .{ .is_ca = true });
+        self.leaf = try x509_verify.mintEd25519CertExt(&self.bufs[4], "Trust I", "trust.test", l.public_key.toBytes(), i, nb, na, .{ .dns_names = &.{"trust.test"} });
+    }
+};
+
+test "TLS 1.3 client builds a path past a trailing cross-signed root (RFC 8446 §4.4.2)" {
+    var f: TrustFixture13 = .{};
+    try f.init();
+    const now: i64 = 1_800_000_000;
+    // leaf, intermediate, "R signed by X": before path building the tail was
+    // the only anchoring candidate, so trusting R alone failed UnknownCa.
+    try verifyChainToTrustAnchors(&.{ f.leaf, f.inter, f.r_by_x }, &.{f.root_r}, "trust.test", now);
+    try verifyChainToTrustAnchors(&.{ f.leaf, f.inter, f.r_by_x }, &.{f.root_x}, "trust.test", now);
+    // Out of order (RFC 8446 §4.4.2 "arbitrary orderings").
+    try verifyChainToTrustAnchors(&.{ f.leaf, f.r_by_x, f.root_x, f.inter }, &.{f.root_r}, "trust.test", now);
+    // The issuer handed to OCSP/CRL/CT is the leaf's issuer on the path,
+    // not the second certificate on the wire.
+    const path = try verifyChainToTrustAnchorsPath(&.{ f.leaf, f.r_by_x, f.inter }, &.{f.root_r}, "trust.test", now);
+    try std.testing.expectEqualSlices(u8, f.inter, path.leafIssuer());
+    // Leaf-only chain anchored at the intermediate: the anchor is the issuer.
+    const direct = try verifyChainToTrustAnchorsPath(&.{f.leaf}, &.{f.inter}, "trust.test", now);
+    try std.testing.expectEqualSlices(u8, f.inter, direct.leafIssuer());
+    // Negative: the intermediate is missing, so no path reaches R; the
+    // hostname is still enforced.
+    try std.testing.expectError(error.UnknownCa, verifyChainToTrustAnchors(&.{ f.leaf, f.r_by_x, f.root_x }, &.{f.root_r}, "trust.test", now));
+    try std.testing.expectError(error.CertificateNameMismatch, verifyChainToTrustAnchors(&.{ f.leaf, f.inter }, &.{f.root_r}, "other.test", now));
+}
+
+test "TLS 1.3 client closeNotify seals warning close_notify and closes the write side (RFC 8446 §6.1)" {
+    const a = std.testing.allocator;
+    var client = try recordLimitConnectedClient(a, 16385);
+    defer client.deinit();
+    const wire = try client.closeNotify();
+    defer a.free(wire);
+    const opened = try openRecordAlloc(a, .tls_aes_128_gcm_sha256, &client.client_app_keys, 0, wire);
+    defer a.free(opened.content);
+    try std.testing.expectEqual(tls_record.ContentType.alert, opened.content_type);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0 }, opened.content);
+    try std.testing.expectEqual(@as(u64, 1), client.app_write_seq);
+    // Nothing is sealed after close_notify.
+    try std.testing.expectError(error.BadState, client.encrypt("late"));
+    try std.testing.expectError(error.BadState, client.closeNotify());
+    try std.testing.expect(client.takeAlert(error.BadRecord) == null);
+    try std.testing.expectError(error.BadState, client.sendKeyUpdateForTest());
+    // The read side still works and a peer KeyUpdate request gets no reply.
+    const ku = [_]u8{ @backingInt(HandshakeType.key_update), 0, 0, 1, 1 };
+    const ku_rec = try sealRecordAlloc(a, .tls_aes_128_gcm_sha256, &client.server_app_keys, 0, .handshake, &ku);
+    defer a.free(ku_rec);
+    try std.testing.expectEqual(AppRead.control, try client.decryptApp(ku_rec));
+    try std.testing.expect((try client.takePendingSend()) == null);
+
+    // Not before the handshake owns our Finished, nor after a fatal alert.
+    var idle = try Client.init(a, .{ .server_name = "example.com", .trust_anchors = &.{} });
+    defer idle.deinit();
+    try std.testing.expectError(error.BadState, idle.closeNotify());
+    var fatal = try recordLimitConnectedClient(a, 16385);
+    defer fatal.deinit();
+    const alert = fatal.takeAlert(error.BadRecord).?;
+    a.free(alert);
+    try std.testing.expectError(error.BadState, fatal.closeNotify());
+}
+
+test "TLS 1.3 client closeNotify flushes a queued old-key KeyUpdate first" {
+    const a = std.testing.allocator;
+    var client = try recordLimitConnectedClient(a, 16385);
+    defer client.deinit();
+    const old_keys = client.client_app_keys;
+    try client.sendKeyUpdateForTest();
+    const wire = try client.closeNotify();
+    defer a.free(wire);
+    const first_len = 5 + @as(usize, std.mem.readInt(u16, wire[3..5], .big));
+    const ku = try openRecordAlloc(a, .tls_aes_128_gcm_sha256, &old_keys, 0, wire[0..first_len]);
+    defer a.free(ku.content);
+    try std.testing.expectEqual(tls_record.ContentType.handshake, ku.content_type);
+    const cn = try openRecordAlloc(a, .tls_aes_128_gcm_sha256, &client.client_app_keys, 0, wire[first_len..]);
+    defer a.free(cn.content);
+    try std.testing.expectEqual(tls_record.ContentType.alert, cn.content_type);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0 }, cn.content);
+    try std.testing.expect((try client.takePendingSend()) == null);
+}
+
+test "TLS 1.3 client closeNotify OOM leaves the client unchanged" {
+    const a = std.testing.allocator;
+    var client = try recordLimitConnectedClient(a, 16385);
+    defer client.deinit();
+    for (0..2) |index| {
+        var fault = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        client.allocator = fault.allocator();
+        try std.testing.expectError(error.OutOfMemory, client.closeNotify());
+        client.allocator = a;
+        try std.testing.expect(!client.write_closed);
+        try std.testing.expectEqual(@as(u64, 0), client.app_write_seq);
+    }
+    const wire = try client.closeNotify();
+    a.free(wire);
 }

@@ -371,6 +371,219 @@ pub fn enforceExternalAnchorFor(chain: []const []const u8, anchor_der: []const u
     try enforcePathLen(facts_buf[0 .. n + 1]);
 }
 
+// ---------------------------------------------------------------------------
+// Certification path building (RFC 5280 §6, RFC 8446 §4.4.2, RFC 4158).
+//
+// A TLS server's Certificate message is a *bag* of certificates whose first
+// entry is the end-entity. RFC 8446 §4.4.2: "The sender's certificate MUST
+// come in the first CertificateEntry in the list. Each following certificate
+// SHOULD directly certify the one immediately preceding it. ... a server MAY
+// omit the self-signed certificate ..." and "clients SHOULD be prepared to
+// handle potentially extraneous certificates and arbitrary orderings from any
+// TLS version". RFC 5280 §6.1 validates one *path* from a trust anchor to the
+// end-entity, where a trust anchor is a (name, public key) pair; the anchor
+// is not itself part of the prospective path (§6.1, §6.2).
+//
+// `buildServerPath` therefore walks from the leaf: at every certificate it
+// first asks whether that certificate already IS a configured anchor (same
+// subject name and SubjectPublicKeyInfo) or is ISSUED by one (issuer name ==
+// anchor subject and the signature verifies under the anchor key). Otherwise
+// it recurses into every unused presented certificate whose subject chains to
+// the current issuer name and whose key verifies the current signature. Each
+// complete candidate is validated with the full policy (validity,
+// basicConstraints, KeyUsage, EKU, NameConstraints, pathLenConstraint and the
+// anchor's own constraints) and the first candidate that validates wins; a
+// candidate that fails validation does not stop the search, so a trailing
+// expired cross-sign, a stale duplicate intermediate, or an out-of-order bag
+// cannot mask the good path. Work is bounded: at most `max_presented_certs`
+// inputs, `max_path_certs` certificates per path and `max_path_work`
+// signature checks + node visits per search, and a certificate is never
+// reused within one path, so loops terminate.
+// ---------------------------------------------------------------------------
+
+/// Largest presented certificate list the path builder accepts. Larger bags
+/// fail closed with `BadCertificate` before any signature work.
+pub const max_presented_certs: usize = 16;
+/// Largest built path, leaf first, including a resent anchor at the tip.
+pub const max_path_certs: usize = 10;
+/// Combined budget of signature verifications and DFS node visits for one
+/// search; exhaustion ends the search (no path found → `UnknownCa`).
+pub const max_path_work: usize = 96;
+
+pub const PathError = Error || error{UnknownCa};
+
+/// A validated certification path. `certs[0]` is the leaf; `certs[len-1]` is
+/// either the configured anchor itself (when the anchor certificate, or a
+/// certificate with the anchor's subject and key, was presented) or a
+/// certificate issued by `anchor`.
+pub const TrustedPath = struct {
+    certs: [max_path_certs][]const u8 = undefined,
+    len: usize = 0,
+    /// DER of the configured trust anchor that terminates this path.
+    anchor: []const u8 = &.{},
+
+    pub fn slice(self: *const TrustedPath) []const []const u8 {
+        return self.certs[0..self.len];
+    }
+
+    /// The certificate that issued the leaf on this path: the next path
+    /// element, or the anchor when the leaf is directly anchored.
+    pub fn leafIssuer(self: *const TrustedPath) []const u8 {
+        return if (self.len > 1) self.certs[1] else self.anchor;
+    }
+};
+
+/// RFC 5280 §6.1 policy applied to one candidate path, shared by the TLS 1.3
+/// and TLS 1.2 clients. The leaf's own checks (hostname, validity, EKU, KU)
+/// are path independent and run once in the caller before the search.
+/// Signatures and name chaining were already verified link by link while the
+/// path was built.
+pub fn validateServerPath(path: []const []const u8, anchor_der: []const u8, server_name: ?[]const u8, now: ?i64) PathError!void {
+    var i: usize = 1;
+    while (i < path.len) : (i += 1) {
+        const issuer = try x509.parse(path[i]);
+        // RFC 5280 §6.1.4(k): every intermediate must be a CA.
+        if (!issuer.basic_constraints_ca) return error.BadCertificate;
+        // A CA's EKU, when present, constrains every server certificate below it.
+        if (issuer.eku_present and !issuer.eku_server_auth) return error.BadCertificate;
+        // §6.1.4(n): a CA in the path must be allowed to sign certificates.
+        if (issuer.key_usage_present and !issuer.key_usage_cert_sign) return error.BadCertificate;
+        // §6.1.3(a)(2): each path certificate must be within its validity.
+        if (now) |t| try validateParsedAt(issuer, t);
+    }
+    // Every path CA's dNSName constraints bind each certificate below it.
+    try enforcePresentedNameConstraintsFor(path, server_name);
+    // §4.2.1.9 / §6.1.4(m): pathLenConstraint over the chosen path.
+    var facts_buf: [max_path_certs]CaPathFact = undefined;
+    const n = buildPathFacts(path, &facts_buf);
+    try enforcePathLen(facts_buf[0..n]);
+    // An anchor whose EKU excludes serverAuth cannot anchor a TLS server path;
+    // this anchor is skipped (the search may still find another one).
+    const anchor = x509.parse(anchor_der) catch return error.UnknownCa;
+    if (anchor.eku_present and !anchor.eku_server_auth) return error.UnknownCa;
+    // §6.1.1(d): the anchor's own name constraints and pathLenConstraint
+    // initialize the state even when the anchor is not resent.
+    try enforceExternalAnchorFor(path, anchor_der, server_name);
+}
+
+/// Build and validate a path from `chain[0]` (the leaf, already checked by
+/// the caller) to one of `anchors`. Returns the first path that passes
+/// `validateServerPath`; otherwise the first validation error seen, or
+/// `UnknownCa` when no candidate reached an anchor.
+pub fn buildServerPath(chain: []const []const u8, anchors: []const []const u8, server_name: ?[]const u8, now: ?i64) PathError!TrustedPath {
+    if (chain.len == 0) return error.EmptyChain;
+    // Byte-identical repeats add no candidate paths, so they are collapsed;
+    // more than `max_presented_certs` DISTINCT certificates fail closed
+    // before any signature work. Each input is compared against at most
+    // `max_presented_certs` kept entries, so this pass is linear.
+    var distinct: [max_presented_certs][]const u8 = undefined;
+    var distinct_len: usize = 0;
+    next: for (chain) |der| {
+        for (distinct[0..distinct_len]) |kept| {
+            if (std.mem.eql(u8, kept, der)) continue :next;
+        }
+        if (distinct_len == max_presented_certs) return error.BadCertificate;
+        distinct[distinct_len] = der;
+        distinct_len += 1;
+    }
+    if (anchors.len == 0) return error.UnknownCa;
+    var search: PathSearch = .{
+        .chain = distinct[0..distinct_len],
+        .anchors = anchors,
+        .server_name = server_name,
+        .now = now,
+    };
+    search.infos[0] = try linkInfo(chain[0]);
+    for (search.chain[1..], 1..) |der, idx| {
+        // An unparseable extra certificate can never be a path member; it is
+        // ignored rather than allowed to veto an otherwise valid path.
+        search.infos[idx] = linkInfo(der) catch null;
+    }
+    search.used[0] = true;
+    search.path.certs[0] = chain[0];
+    search.path.len = 1;
+    if (search.visit(0)) return search.path;
+    return search.first_err orelse error.UnknownCa;
+}
+
+const PathSearch = struct {
+    chain: []const []const u8,
+    anchors: []const []const u8,
+    server_name: ?[]const u8,
+    now: ?i64,
+    infos: [max_presented_certs]?LinkInfo = @splat(null),
+    used: [max_presented_certs]bool = @splat(false),
+    path: TrustedPath = .{},
+    work: usize = max_path_work,
+    first_err: ?PathError = null,
+
+    fn spend(self: *PathSearch) bool {
+        if (self.work == 0) return false;
+        self.work -= 1;
+        return true;
+    }
+
+    /// Name chaining (§6.1.3(a)(4)) plus signature (§6.1.3(a)(1)).
+    fn issues(self: *PathSearch, child: LinkInfo, issuer: LinkInfo) bool {
+        if (!std.mem.eql(u8, child.issuer_der, issuer.subject_der)) return false;
+        if (!self.spend()) return false;
+        verifySignedBy(child, issuer) catch return false;
+        return true;
+    }
+
+    fn accept(self: *PathSearch, anchor_der: []const u8) bool {
+        validateServerPath(self.path.slice(), anchor_der, self.server_name, self.now) catch |err| {
+            // Report the most specific failure: a concrete policy violation
+            // on some candidate outranks "this anchor does not apply".
+            if (self.first_err == null or self.first_err.? == error.UnknownCa) self.first_err = err;
+            return false;
+        };
+        self.path.anchor = anchor_der;
+        return true;
+    }
+
+    /// `path` currently ends with `chain[cur]`.
+    fn visit(self: *PathSearch, cur: usize) bool {
+        if (!self.spend()) return false;
+        const cur_info = self.infos[cur].?;
+        const tip = self.path.len - 1;
+        for (self.anchors) |anchor_der| {
+            const anchor_info = linkInfo(anchor_der) catch continue;
+            // A presented CA that IS a configured anchor (byte-identical, or a
+            // re-issue / cross-sign carrying the anchor's subject and key).
+            // RFC 5280 trusts the anchor's name and key, not the presented
+            // copy, so the configured anchor certificate stands in at the tip.
+            // The leaf is exempt: an end-entity is always a path certificate
+            // whose signature must verify under an anchor key (§6.1.3(a)(1));
+            // a self-signed leaf that is itself an anchor passes `issues`.
+            const same_identity = tip != 0 and (std.mem.eql(u8, self.chain[cur], anchor_der) or
+                (std.mem.eql(u8, cur_info.subject_der, anchor_info.subject_der) and
+                    std.mem.eql(u8, cur_info.spki_der, anchor_info.spki_der)));
+            if (same_identity) {
+                self.path.certs[tip] = anchor_der;
+                if (self.accept(anchor_der)) return true;
+                self.path.certs[tip] = self.chain[cur];
+                continue;
+            }
+            if (self.issues(cur_info, anchor_info) and self.accept(anchor_der)) return true;
+        }
+        if (self.path.len == max_path_certs) return false;
+        var j: usize = 1;
+        while (j < self.chain.len) : (j += 1) {
+            if (self.used[j]) continue;
+            const cand = self.infos[j] orelse continue;
+            if (!self.issues(cur_info, cand)) continue;
+            self.used[j] = true;
+            self.path.certs[self.path.len] = self.chain[j];
+            self.path.len += 1;
+            if (self.visit(j)) return true;
+            self.path.len -= 1;
+            self.used[j] = false;
+        }
+        return false;
+    }
+};
+
 /// Enforce an issuing CA's NameConstraints (dNSName) against the subject's SAN
 /// dNSNames (RFC 5280 §4.2.1.10). Each name must match no excluded subtree
 /// and, when permitted dNSName subtrees exist, at least one permitted subtree.
@@ -2160,4 +2373,193 @@ test "parsePssParams is fail-closed on SHA-1, MGF/hash mismatch, oversized salt,
         .salt_content = &[_]u8{0x80},
     });
     try std.testing.expectError(error.BadSignature, parsePssParams(g));
+}
+
+// ===========================================================================
+// Path building (RFC 5280 §6, RFC 8446 §4.4.2). Fixtures: roots R and X,
+// intermediate I (issued by R), leaf L (issued by I, SAN path.test), and a
+// cross-sign of R by X ("R" subject + R key, issuer "X") as public CAs ship
+// (e.g. "GTS Root R1" signed by "GlobalSign Root CA").
+// ===========================================================================
+
+const pb_nb: i64 = 1_704_067_200; // 2024-01-01
+const pb_na: i64 = 1_924_991_999; // 2030-12-31
+const pb_now: i64 = 1_800_000_000; // 2027-01-15
+const pb_expired_na: i64 = 1_750_000_000; // 2025-06-15
+
+fn pbCert(out: []u8, issuer_cn: []const u8, subject_cn: []const u8, subject_seed: u8, signer_seed: u8, na: i64, opts: CertExtOpts) ![]const u8 {
+    const subject = try ed25519KpFromSeed(subject_seed);
+    const signer = try ed25519KpFromSeed(signer_seed);
+    return mintEd25519CertExt(out, issuer_cn, subject_cn, subject.public_key.toBytes(), signer, pb_nb, na, opts);
+}
+
+const PbFixture = struct {
+    bufs: [6][1024]u8 = undefined,
+    root_r: []const u8 = &.{},
+    root_x: []const u8 = &.{},
+    r_by_x: []const u8 = &.{},
+    r_by_x_expired: []const u8 = &.{},
+    inter: []const u8 = &.{},
+    leaf: []const u8 = &.{},
+
+    fn init(self: *PbFixture) !void {
+        self.root_r = try pbCert(&self.bufs[0], "PB Root R", "PB Root R", 0xa1, 0xa1, pb_na, .{ .is_ca = true });
+        self.root_x = try pbCert(&self.bufs[1], "PB Root X", "PB Root X", 0xa2, 0xa2, pb_na, .{ .is_ca = true });
+        self.r_by_x = try pbCert(&self.bufs[2], "PB Root X", "PB Root R", 0xa1, 0xa2, pb_na, .{ .is_ca = true });
+        self.r_by_x_expired = try pbCert(&self.bufs[3], "PB Root X", "PB Root R", 0xa1, 0xa2, pb_expired_na, .{ .is_ca = true });
+        self.inter = try pbCert(&self.bufs[4], "PB Root R", "PB Inter", 0xa3, 0xa1, pb_na, .{ .is_ca = true });
+        self.leaf = try pbCert(&self.bufs[5], "PB Inter", "path.test", 0xa4, 0xa3, pb_na, .{ .dns_names = &.{"path.test"} });
+    }
+};
+
+fn expectPath(got: TrustedPath, want: []const []const u8, anchor: []const u8) !void {
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got.slice()) |w, g| try std.testing.expectEqualSlices(u8, w, g);
+    try std.testing.expectEqualSlices(u8, anchor, got.anchor);
+}
+
+test "path building: trailing cross-signed root does not break anchoring at the inner root" {
+    var f: PbFixture = .{};
+    try f.init();
+    // Shipped as leaf, intermediate, cross-signed root. The previous verifier
+    // anchored only the tail (R signed by X) and failed with UnknownCa when
+    // only R was trusted.
+    const chain = [_][]const u8{ f.leaf, f.inter, f.r_by_x };
+    const path = try buildServerPath(&chain, &.{f.root_r}, "path.test", pb_now);
+    try expectPath(path, &.{ f.leaf, f.inter }, f.root_r);
+    try std.testing.expectEqualSlices(u8, f.inter, path.leafIssuer());
+    // A legacy store trusting only X uses the cross-sign.
+    const legacy = try buildServerPath(&chain, &.{f.root_x}, "path.test", pb_now);
+    try expectPath(legacy, &.{ f.leaf, f.inter, f.r_by_x }, f.root_x);
+    // Trailing self-signed X after the cross-sign is extraneous too.
+    const long_chain = [_][]const u8{ f.leaf, f.inter, f.r_by_x, f.root_x };
+    try expectPath(try buildServerPath(&long_chain, &.{f.root_r}, "path.test", pb_now), &.{ f.leaf, f.inter }, f.root_r);
+}
+
+test "path building: presented anchors and intermediate anchors terminate the path" {
+    var f: PbFixture = .{};
+    try f.init();
+    // The trusted root resent at the tail is not needed on the path.
+    const resent = [_][]const u8{ f.leaf, f.inter, f.root_r };
+    try expectPath(try buildServerPath(&resent, &.{f.root_r}, "path.test", pb_now), &.{ f.leaf, f.inter }, f.root_r);
+    // An intermediate configured as an anchor terminates the path at it,
+    // whether or not it is also resent.
+    const p2 = try buildServerPath(&resent, &.{f.inter}, "path.test", pb_now);
+    try expectPath(p2, &.{f.leaf}, f.inter);
+    try std.testing.expectEqualSlices(u8, f.inter, p2.leafIssuer());
+    try expectPath(try buildServerPath(&.{f.leaf}, &.{f.inter}, "path.test", pb_now), &.{f.leaf}, f.inter);
+    // A self-signed leaf that is itself the anchor.
+    try expectPath(try buildServerPath(&.{f.root_r}, &.{f.root_r}, null, pb_now), &.{f.root_r}, f.root_r);
+    // A CA-issued leaf listed as an anchor is not trusted by being listed:
+    // its own signature must still verify under an anchor key.
+    try std.testing.expectError(error.UnknownCa, buildServerPath(&.{f.leaf}, &.{f.leaf}, "path.test", pb_now));
+}
+
+test "path building: intermediate-only and out-of-order chains" {
+    var f: PbFixture = .{};
+    try f.init();
+    try expectPath(try buildServerPath(&.{ f.leaf, f.inter }, &.{f.root_r}, "path.test", pb_now), &.{ f.leaf, f.inter }, f.root_r);
+    // Leaf alone, its issuer neither presented nor trusted.
+    try std.testing.expectError(error.UnknownCa, buildServerPath(&.{f.leaf}, &.{f.root_r}, "path.test", pb_now));
+    // RFC 8446 §4.4.2 arbitrary order: roots before the intermediate.
+    const shuffled = [_][]const u8{ f.leaf, f.r_by_x, f.root_x, f.inter };
+    try expectPath(try buildServerPath(&shuffled, &.{f.root_r}, "path.test", pb_now), &.{ f.leaf, f.inter }, f.root_r);
+    try expectPath(try buildServerPath(&shuffled, &.{f.root_x}, "path.test", pb_now), &.{ f.leaf, f.inter, f.r_by_x }, f.root_x);
+
+    // Two intermediates presented in reverse order.
+    var b: [3][1024]u8 = undefined;
+    const mid1 = try pbCert(&b[0], "PB Root R", "PB I1", 0xb1, 0xa1, pb_na, .{ .is_ca = true });
+    const mid2 = try pbCert(&b[1], "PB I1", "PB I2", 0xb2, 0xb1, pb_na, .{ .is_ca = true });
+    const leaf2 = try pbCert(&b[2], "PB I2", "path.test", 0xb3, 0xb2, pb_na, .{ .dns_names = &.{"path.test"} });
+    try expectPath(try buildServerPath(&.{ leaf2, mid1, mid2 }, &.{f.root_r}, "path.test", pb_now), &.{ leaf2, mid2, mid1 }, f.root_r);
+}
+
+test "path building: an expired trailing cert or stale duplicate does not mask the valid path" {
+    var f: PbFixture = .{};
+    try f.init();
+    // An expired cross-sign trails the chain. Anchored at R it is not on the
+    // chosen path; anchored at X it is the only path, which is expired.
+    const chain = [_][]const u8{ f.leaf, f.inter, f.r_by_x_expired };
+    try expectPath(try buildServerPath(&chain, &.{f.root_r}, "path.test", pb_now), &.{ f.leaf, f.inter }, f.root_r);
+    try std.testing.expectError(error.Expired, buildServerPath(&chain, &.{f.root_x}, "path.test", pb_now));
+    // Both cross-signs present, expired one first: the search continues
+    // after the first candidate fails validation.
+    const both = [_][]const u8{ f.leaf, f.inter, f.r_by_x_expired, f.r_by_x };
+    try expectPath(try buildServerPath(&both, &.{f.root_x}, "path.test", pb_now), &.{ f.leaf, f.inter, f.r_by_x }, f.root_x);
+    // A stale (expired) duplicate of the intermediate sent first.
+    var b: [1024]u8 = undefined;
+    const inter_old = try pbCert(&b, "PB Root R", "PB Inter", 0xa3, 0xa1, pb_expired_na, .{ .is_ca = true });
+    const dup = [_][]const u8{ f.leaf, inter_old, f.inter };
+    try expectPath(try buildServerPath(&dup, &.{f.root_r}, "path.test", pb_now), &.{ f.leaf, f.inter }, f.root_r);
+    try std.testing.expectError(error.Expired, buildServerPath(&.{ f.leaf, inter_old }, &.{f.root_r}, "path.test", pb_now));
+}
+
+test "path building: constraints apply to the chosen path" {
+    var f: PbFixture = .{};
+    try f.init();
+    var b: [3][1024]u8 = undefined;
+    // A non-CA "intermediate" between the leaf and R is refused.
+    const not_ca = try pbCert(&b[0], "PB Root R", "PB NotCA", 0xc1, 0xa1, pb_na, .{});
+    const leaf_nc = try pbCert(&b[1], "PB NotCA", "path.test", 0xc2, 0xc1, pb_na, .{ .dns_names = &.{"path.test"} });
+    try std.testing.expectError(error.BadCertificate, buildServerPath(&.{ leaf_nc, not_ca }, &.{f.root_r}, "path.test", pb_now));
+    // A name-constrained copy of the intermediate binds the accepted name.
+    const nc = try pbCert(&b[2], "PB Root R", "PB Inter", 0xa3, 0xa1, pb_na, .{ .is_ca = true, .permitted_dns = &.{"other.test"} });
+    try std.testing.expectError(error.BadCertificate, buildServerPath(&.{ f.leaf, nc }, &.{f.root_r}, "path.test", pb_now));
+    // An unconstrained copy later in the bag is a valid alternative path.
+    try expectPath(try buildServerPath(&.{ f.leaf, nc, f.inter }, &.{f.root_r}, "path.test", pb_now), &.{ f.leaf, f.inter }, f.root_r);
+}
+
+test "path building: untrusted root, loops and oversized chains fail closed" {
+    var f: PbFixture = .{};
+    try f.init();
+    var b: [4][1024]u8 = undefined;
+    // Only an unrelated root is trusted.
+    const other = try pbCert(&b[0], "PB Other", "PB Other", 0xd0, 0xd0, pb_na, .{ .is_ca = true });
+    try std.testing.expectError(error.UnknownCa, buildServerPath(&.{ f.leaf, f.inter, f.root_r }, &.{other}, "path.test", pb_now));
+    try std.testing.expectError(error.UnknownCa, buildServerPath(&.{ f.leaf, f.inter, f.root_r }, &.{}, "path.test", pb_now));
+
+    // Two CAs that certify each other (A <-> B), leaf under A, nothing trusted.
+    const ca_a = try pbCert(&b[1], "PB Loop B", "PB Loop A", 0xd1, 0xd2, pb_na, .{ .is_ca = true });
+    const ca_b = try pbCert(&b[2], "PB Loop A", "PB Loop B", 0xd2, 0xd1, pb_na, .{ .is_ca = true });
+    const leaf_loop = try pbCert(&b[3], "PB Loop A", "path.test", 0xd3, 0xd1, pb_na, .{ .dns_names = &.{"path.test"} });
+    try std.testing.expectError(error.UnknownCa, buildServerPath(&.{ leaf_loop, ca_a, ca_b, ca_a, ca_b }, &.{other}, "path.test", pb_now));
+
+    // More distinct presented certificates than the builder accepts.
+    var junk_bufs: [max_presented_certs][1024]u8 = undefined;
+    var many: [max_presented_certs + 1][]const u8 = undefined;
+    many[0] = f.leaf;
+    many[1] = f.inter;
+    for (2..many.len) |k| {
+        many[k] = try pbCert(&junk_bufs[k - 2], "PB Junk", "PB Junk", @intCast(0x10 + k), @intCast(0x10 + k), pb_na, .{ .is_ca = true });
+    }
+    try std.testing.expectError(error.BadCertificate, buildServerPath(&many, &.{f.root_r}, "path.test", pb_now));
+    // Exactly the cap is admitted (the junk is simply unused).
+    try expectPath(try buildServerPath(many[0..max_presented_certs], &.{f.root_r}, "path.test", pb_now), &.{ f.leaf, f.inter }, f.root_r);
+    // Byte-identical repeats collapse and do not count against the cap.
+    var repeats: [4 * max_presented_certs][]const u8 = @splat(f.inter);
+    repeats[0] = f.leaf;
+    try expectPath(try buildServerPath(&repeats, &.{f.root_r}, "path.test", pb_now), &.{ f.leaf, f.inter }, f.root_r);
+}
+
+test "path building: a path longer than max_path_certs is not built" {
+    // R -> C0 -> C1 -> ... -> C9 -> leaf, presented leaf first in order:
+    // certs = { leaf, C9, ..., C0 }.
+    const depth = max_path_certs;
+    var bufs: [depth + 1][1024]u8 = undefined;
+    var names: [depth][16]u8 = undefined;
+    var name_slices: [depth][]const u8 = undefined;
+    var certs: [depth + 1][]const u8 = undefined;
+    for (0..depth) |k| name_slices[k] = try std.fmt.bufPrint(&names[k], "PB Deep {d}", .{k});
+    var f: PbFixture = .{};
+    try f.init();
+    for (0..depth) |k| {
+        const issuer_cn = if (k == 0) "PB Root R" else name_slices[k - 1];
+        const signer: u8 = if (k == 0) 0xa1 else @intCast(0x40 + k - 1);
+        certs[depth - k] = try pbCert(&bufs[k], issuer_cn, name_slices[k], @intCast(0x40 + k), signer, pb_na, .{ .is_ca = true });
+    }
+    certs[0] = try pbCert(&bufs[depth], name_slices[depth - 1], "path.test", 0x70, @intCast(0x40 + depth - 1), pb_na, .{ .dns_names = &.{"path.test"} });
+    // Leaf + 10 CAs below R exceeds the bound.
+    try std.testing.expectError(error.UnknownCa, buildServerPath(&certs, &.{f.root_r}, "path.test", pb_now));
+    // Leaf + 9 CAs anchored at C0 is exactly max_path_certs and is built.
+    try expectPath(try buildServerPath(certs[0..depth], &.{certs[depth]}, "path.test", pb_now), certs[0..depth], certs[depth]);
 }
