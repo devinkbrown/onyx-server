@@ -40405,36 +40405,66 @@ pub const LinuxServer = struct {
             // WS, or IRC handshake would close it at exec and violate Helix's
             // connected-client guarantee.
             counts.clients_expected += 1;
-            if (!e.value.session.registered()) continue;
+            // Name every client that keeps the cut incomplete. Without this an
+            // operator only sees "not every registered client could be sealed".
+            const sealed_before = counts.clients;
+            var skip: []const u8 = "snapshot, sidecar or allocation failure";
+            defer if (counts.clients == sealed_before) logUpgradeSealSkip(e.value, skip);
+            if (!e.value.session.registered()) {
+                skip = "not registered yet (handshake in progress)";
+                continue;
+            }
             // Older preregistration dispatch could admit this now-reserved
             // synthetic namespace. Refuse capture until that client renames.
-            if (std.mem.startsWith(u8, e.value.session.displayName(), "=")) continue;
+            if (std.mem.startsWith(u8, e.value.session.displayName(), "=")) {
+                skip = "reserved '=' nick";
+                continue;
+            }
             // An open draft/multiline batch owns accepted chunks that are not
             // part of the session capsule. Refuse the whole upgrade until the
             // batch closes, instead of losing its prefix after COMMIT.
-            if (e.value.multiline != null) continue;
+            if (e.value.multiline != null) {
+                skip = "open multiline batch";
+                continue;
+            }
             // The current capsule does not carry discard-until-LF framing.
             // Keep this transport live and refuse the whole upgrade until its
             // oversized line ends; adopting its suffix as a fresh command would
             // change the accepted input stream.
-            if (e.value.recvq_discarding) continue;
+            if (e.value.recvq_discarding) {
+                skip = "discarding an oversized input line";
+                continue;
+            }
             var flood_carry: ?flood_guard.CarryState = null;
-            if (e.value.flood_guard) |*guard| flood_carry = guard.exportCarry() catch continue;
+            if (e.value.flood_guard) |*guard| flood_carry = guard.exportCarry() catch {
+                skip = "flood-guard state not exportable";
+                continue;
+            };
             // A carried client's socket fd is the exact join key for every
             // transport and per-client sidecar. Synthetic/half-constructed
             // entries with no live descriptor make the seal incomplete; never
             // let a signed cast turn -1 into an unrelated u64 owner id.
-            if (e.value.fd < 0) continue;
+            if (e.value.fd < 0) {
+                skip = "no live descriptor";
+                continue;
+            }
             // A carried client is snapshotted only after the owner reaped both
             // original CQEs and their exact-cancel provenance. An in-flight
             // CONNECT still borrows the inline sockaddr and is likewise refused;
             // listener ACCEPT owns no ConnState storage and stays outside this
             // per-connection boundary.
             if (e.value.recv_armed or e.value.send_armed or e.value.send_submitted_len != 0 or e.value.send_submitted_offset != 0 or e.value.connect_armed or
-                e.value.recv_cancel_pending or e.value.send_cancel_pending or e.value.connect_cancel_pending) continue;
+                e.value.recv_cancel_pending or e.value.send_cancel_pending or e.value.connect_cancel_pending)
+            {
+                skip = "socket I/O in flight (send/recv armed or cancel pending)";
+                continue;
+            }
             std.debug.assert(!e.value.recv_armed and !e.value.send_armed and !e.value.connect_armed);
             std.debug.assert(!e.value.recv_cancel_pending and !e.value.send_cancel_pending and !e.value.connect_cancel_pending);
-            if (e.value.closing) continue;
+            if (e.value.closing) {
+                skip = "closing";
+                continue;
+            }
             // wss browser client: carry it whenever its
             // WebSocket adapter is past the HTTP Upgrade (phase=open) — the
             // adapter's partial framing state (a mid-frame deframer + a partial
@@ -40445,14 +40475,20 @@ pub const LinuxServer = struct {
             // popped-event-pending state that cannot exist between reactor
             // turns — makes the seal incomplete and refuses UPGRADE before exec.
             const carry_ws = if (e.value.ws) |wsst| wsCarryable(wsst) else false;
-            if (e.value.ws != null and !carry_ws) continue;
+            if (e.value.ws != null and !carry_ws) {
+                skip = "WebSocket still in HTTP handshake";
+                continue;
+            }
             // TLS client: export the live engine state FIRST. If it cannot be
             // exported, the exact client count remains incomplete and UPGRADE is
             // refused before exec. A TLS socket must never reach the successor
             // without its crypto state.
             var tls_blob: ?[]u8 = null;
             if (e.value.tls) |t| {
-                if (e.value.tls_ingress_active or e.value.tls_progress_active or e.value.tls_alert_pending or e.value.tls_discard_unsent) continue;
+                if (e.value.tls_ingress_active or e.value.tls_progress_active or e.value.tls_alert_pending or e.value.tls_discard_unsent) {
+                    skip = "TLS record processing or alert in progress";
+                    continue;
+                }
                 const wire_chunks = [_][]const u8{
                     e.value.send_buf[e.value.send_offset..e.value.send_len],
                     e.value.send_overflow.items,
@@ -40738,7 +40774,10 @@ pub const LinuxServer = struct {
                     break :carry_sil;
                 };
             }
-            if (!sidecars_complete) continue;
+            if (!sidecars_complete) {
+                skip = "MONITOR/SILENCE/sidecar capture incomplete";
+                continue;
+            }
             if (tls_blob != null) counts.tls += 1;
             if (carry_ws) counts.ws += 1;
             // Preserve the client socket so the successor re-attaches it.
@@ -92357,6 +92396,11 @@ fn readFd(fd: linux.fd_t, buf: []u8) ServerError!usize {
 /// in-process Helix handoff, and shutdown() would disable every duplicate.
 fn closeListenerFd(fd: linux.fd_t) void {
     os_runtime.close(fd);
+}
+
+fn logUpgradeSealSkip(conn: *const ConnState, reason: []const u8) void {
+    const transport: []const u8 = if (conn.ws != null) (if (conn.tls != null) "wss" else "ws") else if (conn.tls != null) "tls" else "tcp";
+    srvLog("onyx-server: UPGRADE — client not sealable fd={d} nick=\"{s}\" transport={s} reason={s}\n", .{ conn.fd, conn.session.displayName(), transport, reason });
 }
 
 fn closeFd(fd: linux.fd_t) void {
