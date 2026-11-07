@@ -7,6 +7,9 @@ deployment acceptance and explicit limits. The previous
 [0.9.0 release and test-speed verification](release-and-test-speed-2026-11-03.md)
 retains the measured runtime and the token-recovery acceptance.
 
+The [Armor security and feature audit, 2026-11-07](armor-2026-11-07.md)
+records verified TLS/crypto findings and the Armor roadmap.
+
 [Production status](../ops/onyx-server-paths.md) owns current fleet identity;
 [testing](../guide/testing.md) owns the verification workflow. Neither a dated
 report nor a passing unit test proves every roadmap requirement complete.
