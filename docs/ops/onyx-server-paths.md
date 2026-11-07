@@ -4,7 +4,7 @@
 
 This is the canonical current-topology document. It was refreshed from the
 running processes, `/proc/<pid>/exe`, executable hashes, and loopback metrics
-on **2026-11-06**. eshmaki.me is Alpine and supervises the daemon with OpenRC.
+on **2026-11-07**. eshmaki.me is Alpine and supervises the daemon with OpenRC.
 ircx.us supervises it with systemd. Re-run the commands below after any
 deployment; release notes preserve the exact historical inputs and are not
 substitutes for this table.
@@ -21,17 +21,39 @@ substitutes for this table.
 | **WebTransport** | UDP `:4433` | UDP `:4433` |
 | **Operational log** | `/home/kain/onyx-server-run/onyx-server.log` (`0600`) | journal for `onyx-server.service` |
 
-## Verified fleet baseline (2026-11-07)
+## Verified fleet baseline (2026-11-07, 0.11.0)
 
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
 | Service state | OpenRC `started` | systemd `active` |
-| Running image | `0.10.4+e202c6cf…` | `0.10.4+e202c6cf…` |
-| Executable SHA-256 | `b9fcf90d5c7b0ae17a9e6f373df32c5d7c76476f36f744b8a72a10e3eeca0143` | same |
-| Process ID at acceptance | `9223` | `2980332` |
+| Running image | `0.11.0+130b02bbebe7` | `0.11.0+130b02bbebe7` |
+| Executable SHA-256 | `3431379f28a7b8618a4563a03baec6eab538403e098685600e77ef2f1d6ebe0e` | same |
+| Process ID at acceptance | `21843` | `2980332` |
 | `tcp_active` | `1` | `1` |
 | `links_active` / `peers_up` | `1 / 1` | `1 / 1` |
 | `partitioned` | `0` | `0` |
+
+0.11.0 (`130b02bb`, Armor hardening) was built from a clean worktree and
+`packaging/verify-release.sh` rebuilt it byte-for-byte. Both live configs
+passed `--check-config` with the new binary before the swap.
+
+- **ircx.us:** Helix reload from 0.10.4. PID 2980332 and issuer epoch 12 were
+  kept; 4 TLS clients re-attached (held TLS 1.3 and TLS 1.2 probes answered
+  PING afterwards) and the mesh link resumed (`helix-resume`).
+- **eshmaki.me:** the 0.10.4 predecessor refused Helix four times over about
+  ten minutes with "remote visible identity and physical notification
+  frontiers has live process-owned state with no exact Helix checkpoint"
+  (`scanUpgradeContinuityBlockersLocked`: a local QUIT capture, pending remote
+  host records/departures, or uncheckpointed attachment-delivery output that
+  did not drain). Every refusal was before exec and kept all connections. It
+  was then cold-restarted onto 0.11.0 through OpenRC (3 client connections
+  dropped; presence authority opened cold at epoch 12). A same-image Helix
+  reload on 0.11.0 afterwards kept PID 21843 and epoch 12 and re-attached
+  3 TLS + 1 WSS clients, with held TLS 1.3 and TLS 1.2 probes surviving.
+
+Mesh health and the CA-verified cross-node TLS chat smoke passed after both
+swaps. The 0.10.4 binary is kept as `onyx-server.0.10.4-b9fcf90d`; for a hot
+rollback follow [Helix rollback to 0.10.4](#helix-rollback-to-0104).
 
 0.10.4 (`e202c6cf`) went live by Helix reload alone, with no cold restart.
 Both nodes kept their PID (9223 and 2980332), and the issuer epochs stayed at

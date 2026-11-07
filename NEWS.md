@@ -11,7 +11,7 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
-## 0.11.0 — Armor hardening (source, 2026-11-07)
+## 0.11.0 — Armor hardening (2026-11-07)
 
 This release works through the Armor security and feature audit
 ([`docs/audit/armor-2026-11-07.md`](docs/audit/armor-2026-11-07.md)) in
