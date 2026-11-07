@@ -11,6 +11,74 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
+## Unreleased — Armor hardening
+
+Work from the Armor security and feature audit
+([`docs/audit/armor-2026-11-07.md`](docs/audit/armor-2026-11-07.md)). IDs match
+the audit's findings. Only items marked **merged** are in source; the rest are
+planned and may change before release.
+
+**Security fixes**
+- **A1, QUIC handshake cap (merged, High).** The QUIC/WebTransport handshake
+  used to buffer every in-order CRYPTO byte before authentication, waiting on a
+  declared message length of up to 16 MiB. Buffers and declared lengths are now
+  capped at 64 KiB and fail with `HandshakeTooLarge`, for the server and for our
+  QUIC client. A regression test streams an in-order 16 MiB ClientHello.
+- **A2, post-quantum hybrid preferred (merged).** The TCP TLS 1.3 and QUIC
+  servers now prefer X25519MLKEM768, then X25519, then P-256, both for the key
+  share they select and for the group an HRR requests. Clients that send hybrid
+  and X25519 shares (Chrome, Firefox) now get the PQ exchange.
+- **A3, RSA-CRT fault check (planned).** `rsa_sign.privateOp` will verify
+  `s^e mod n == m` before returning a CRT signature and fail with a typed error
+  on mismatch, closing the Bellcore fault attack on RSA certificate keys.
+- **A5, ECDSA key wipe (planned).** `ecdsa_p256` gains key wiping, and
+  `armor genpkey -algorithm ec` will wipe every copy of the private scalar.
+- **A6, HPKE RFC 9180 label (planned, ECH wire change).** HPKE's DHKEM will use
+  the RFC 9180 `"eae_prk"` label instead of `"dh"`, so standard ECH clients can
+  interoperate. ECH configs from older builds will not open under the fixed
+  label, so the change is gated behind a new ECH config version; republish ECH
+  configs after upgrading.
+- **A7, duplicate QUIC transport parameters (planned).** Rejected with
+  TRANSPORT_PARAMETER_ERROR (RFC 9000 §18.1) instead of keeping the last value.
+- **A8, QUIC client connection-ID checks (planned).** Our QUIC client will
+  compare `original_destination_connection_id` and
+  `initial_source_connection_id`. The production server already sends both.
+- **A9, TLS 1.2 conformance (planned).** Enforce the `record_size_limit` upper
+  bound in the TLS 1.2 server.
+- **A10, rename (planned).** `skipServerCertVerifyForTest` becomes
+  `disableServerCertVerification`, because operator `insecure_skip_verify`
+  reaches it in production `http_fetch`.
+
+**Assurance (planned)**
+- Record-layer unification: production TLS 1.3 record protection moves onto one
+  audited seal/open path, so the tamper, truncation and overflow corpus tests
+  the code that ships, including AES-128-GCM.
+- Wycheproof corpora for AES-GCM, ChaCha20-Poly1305, X25519, ECDH-P256,
+  ECDSA-P256, RSA-PSS and HKDF; known-answer tests for X-Wing, X25519MLKEM768
+  and ECH.
+- End-to-end fuzzing of the TLS 1.3 server and client engines, QUIC Initial
+  handling and DTLS.
+
+**Features and operations (planned)**
+- ALPN on the IRC listener, and a TOML knob for RFC 8879 certificate
+  compression.
+- ECH `retry_configs`. The engine supports them, but the daemon does not send
+  them today.
+- Hot reload of SNI certificates and ECH keys on REHASH and ACME renewal.
+- TLS metrics beyond `onyx_tls_handshake_us`: failures by reason, version,
+  suite and group, resumption and 0-RTT, kTLS, OCSP staple state and
+  certificate expiry.
+
+**Documentation**
+- `docs/architecture/crypto.md` and `docs/guide/tls.md` now give the hybrid-first
+  group order. They name `[tls].mooring_max_meshpass_len` correctly and note
+  that the daemon never applies it. They state that ECH `retry_configs` are
+  engine-only and that `early_data_age_skew_ms` is not a TOML key, and they cite
+  RFC 8446 for HRR. The `src/daemon/tls_certs.zig` header now lists ECDSA-P256
+  keys and the 365-day bootstrap leaf.
+
+---
+
 ## 0.10.4 — Presence store carried on every Helix platform (source, 2026-11-07)
 
 - **OpenBSD** native Helix now carries the durable mesh presence store. The
