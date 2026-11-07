@@ -9,6 +9,9 @@ const std = @import("std");
 
 const Ed25519 = std.crypto.sign.Ed25519;
 const Es256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+/// ES256 signing goes through the constant-time signer, never std's
+/// `KeyPair.sign` (whose P256.mul leaks the nonce; see `p256_ct.zig`).
+const ecdsa_p256 = @import("ecdsa_p256.zig");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 pub const Error = error{
@@ -68,7 +71,7 @@ pub fn encodeSign1Es256(
     defer allocator.free(protected);
     const to_sign = try sigStructure(allocator, protected, external_aad, payload);
     defer allocator.free(to_sign);
-    const sig = try key_pair.sign(to_sign, null);
+    const sig = try ecdsa_p256.sign(to_sign, key_pair);
     return encodeSign1(allocator, protected, payload, &sig.toBytes());
 }
 
@@ -566,13 +569,32 @@ test "build and verify COSE_Sign1 EdDSA" {
 
 test "COSE_Sign1 ES256 verifies" {
     const allocator = std.testing.allocator;
-    const kp = try Es256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x33)));
+    const kp = try ecdsa_p256.generateDeterministic(@as([32]u8, @splat(0x33)));
     const sec1 = kp.public_key.toUncompressedSec1();
     const cose = try encodeSign1Es256(allocator, "p256 payload", "ctx", kp);
     defer allocator.free(cose);
     try std.testing.expect(try verifySign1(allocator, cose, "ctx", .{
         .p256 = .{ .x = sec1[1..33].*, .y = sec1[33..65].* },
     }));
+}
+
+test "COSE_Sign1 ES256 signs in constant time: std-identical bytes and fail-closed secret" {
+    const allocator = std.testing.allocator;
+    const kp = try ecdsa_p256.generateDeterministic(@as([32]u8, @splat(0x34)));
+    const cose = try encodeSign1Es256(allocator, "p256 payload", "ctx", kp);
+    defer allocator.free(cose);
+    // The 64-byte r||s signature is the last CBOR item; with null noise it is
+    // byte-identical to std's deterministic signer over the Sig_structure.
+    const protected = try protectedHeader(allocator, .es256);
+    defer allocator.free(protected);
+    const to_sign = try sigStructure(allocator, protected, "ctx", "p256 payload");
+    defer allocator.free(to_sign);
+    const want = (try kp.sign(to_sign, null)).toBytes();
+    try std.testing.expectEqualSlices(u8, &want, cose[cose.len - 64 ..]);
+    // std's signer accepted d = 0; the constant-time signer refuses it
+    // (SEC 1 v2 sec. 3.2.1), so a corrupt key can never emit a signature.
+    const zero_kp: Es256.KeyPair = .{ .secret_key = try Es256.SecretKey.fromBytes(@splat(0)), .public_key = kp.public_key };
+    try std.testing.expectError(error.IdentityElement, encodeSign1Es256(allocator, "p", "", zero_kp));
 }
 
 test "tampered payload and protected header are rejected" {
@@ -601,7 +623,7 @@ test "COSE_Key parse for OKP Ed25519 and EC2 P-256" {
     const okp = try parseCoseKey(allocator, okp_list.items);
     try std.testing.expectEqualSlices(u8, &ed.public_key.toBytes(), &okp.ed25519);
 
-    const ec = try Es256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x12)));
+    const ec = try ecdsa_p256.generateDeterministic(@as([32]u8, @splat(0x12)));
     const sec1 = ec.public_key.toUncompressedSec1();
     var ec2_list: std.ArrayList(u8) = .empty;
     defer ec2_list.deinit(allocator);

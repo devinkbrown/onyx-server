@@ -527,7 +527,7 @@ fn validateInputs(inputs: ColdInputs) !void {
     if (parsed.webpush.enabled) {
         if (inputs.core.accounts == null or !inputs.core.config.sasl_enabled or parsed.sasl.account_db == null) return error.WebpushRequiresAccounts;
         const delivery = inputs.webpush_delivery.?;
-        const derived = try ecdsa.KeyPair.fromSecretKey(delivery.vapid.secret_key);
+        const derived = try ecdsa.keyPairFromSecretKey(delivery.vapid.secret_key);
         const public_key = delivery.vapid.public_key.toUncompressedSec1();
         const expected_key = derived.public_key.toUncompressedSec1();
         if (!std.mem.eql(u8, &public_key, &expected_key)) return error.InvalidVapidKey;
@@ -1300,7 +1300,7 @@ test "configured runtime: enabled real Webpush uses source demanded options and 
     defer tmp.cleanup();
     var store = try @import("store.zig").OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "accounts.wal");
     defer store.deinit();
-    const pair = try ecdsa.KeyPair.fromSecretKey(try ecdsa.SecretKey.fromBytes(@splat(1)));
+    const pair = try ecdsa.keyPairFromSecretKey(try ecdsa.SecretKey.fromBytes(@splat(1)));
     const vapid: webpush.Vapid = .{ .key_pair = pair };
     var pubkey: [webpush.vapid_pub_b64_len]u8 = undefined;
     var inputs = testInputs(1);
@@ -1701,7 +1701,7 @@ test "configured runtime: configured Webpush and WebTransport publish their real
     defer tmp.cleanup();
     var store = try @import("store.zig").OroStore.open(std.testing.allocator, std.testing.io, tmp.dir, "accounts.wal");
     defer store.deinit();
-    const pair = try ecdsa.KeyPair.fromSecretKey(try ecdsa.SecretKey.fromBytes(@splat(1)));
+    const pair = try ecdsa.keyPairFromSecretKey(try ecdsa.SecretKey.fromBytes(@splat(1)));
     const vapid: webpush.Vapid = .{ .key_pair = pair };
     var pubkey: [webpush.vapid_pub_b64_len]u8 = undefined;
     var inputs = testInputs(2);
@@ -1870,7 +1870,7 @@ test "configured runtime: seeded original Webpush outputs survive Store OOM with
     if (comptime !supported) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const pair = try ecdsa.KeyPair.fromSecretKey(try ecdsa.SecretKey.fromBytes(@splat(1)));
+    const pair = try ecdsa.keyPairFromSecretKey(try ecdsa.SecretKey.fromBytes(@splat(1)));
     {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
         var store = try @import("store.zig").OroStore.open(failing.allocator(), std.testing.io, tmp.dir, "runtime-prune.wal");

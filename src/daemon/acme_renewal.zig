@@ -292,7 +292,7 @@ pub const Service = struct {
         if (account.created) {
             dlog.log("onyx-server: acme created account key {s}; registering a new ACME account (RFC 8555 §7.3)\n", .{account_path});
         }
-        var cert_key = ecdsa_p256.KeyPair.generate(self.io);
+        var cert_key = ecdsa_p256.generate(self.io);
         defer ecdsa_p256.wipeKeyPair(&cert_key);
 
         var store = http01.TokenStore.init(self.allocator);

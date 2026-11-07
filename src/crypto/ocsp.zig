@@ -1505,8 +1505,8 @@ test "isStapleServable accepts a delegated OCSP responder (issuer-signed + OCSPS
     const allocator = std.testing.allocator;
 
     // CA (issuer) and the delegated responder each get their own P-256 key.
-    const issuer_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
-    const responder_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    const issuer_kp = ecdsa_p256.generate(std.testing.io);
+    const responder_kp = ecdsa_p256.generate(std.testing.io);
 
     // The CA cert — we authorize the responder against ITS public key (SPKI).
     var ca_buf: [1024]u8 = undefined;
@@ -1544,7 +1544,7 @@ test "isStapleServable accepts a delegated OCSP responder (issuer-signed + OCSPS
     // Accepted: authorized responder, matched ResponderID, good + in window.
     try std.testing.expect(isStapleServable(response, ca.spki_der, &[_]u8{0x44}, in_window, 0));
     // Rejected under a DIFFERENT issuer key (the responder was not delegated by it).
-    const other_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    const other_kp = ecdsa_p256.generate(std.testing.io);
     var other_buf: [1024]u8 = undefined;
     const other_der = try x509_selfsign.buildSelfSignedEcdsaP256(&other_buf, .{
         .common_name = "other.ca.test",
@@ -1562,8 +1562,8 @@ test "isStapleServable rejects a responder cert lacking id-kp-OCSPSigning" {
     const x509_selfsign = @import("../proto/x509_selfsign.zig");
     const allocator = std.testing.allocator;
 
-    const issuer_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
-    const responder_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    const issuer_kp = ecdsa_p256.generate(std.testing.io);
+    const responder_kp = ecdsa_p256.generate(std.testing.io);
 
     var ca_buf: [1024]u8 = undefined;
     const ca_der = try x509_selfsign.buildSelfSignedEcdsaP256(&ca_buf, .{
@@ -1605,8 +1605,8 @@ test "delegated OCSP: byName + EXPLICIT-byKey accept; ResponderID-mismatch and w
     const allocator = std.testing.allocator;
     const serial = &[_]u8{0x44};
 
-    const issuer_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
-    const responder_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+    const issuer_kp = ecdsa_p256.generate(std.testing.io);
+    const responder_kp = ecdsa_p256.generate(std.testing.io);
 
     var ca_buf: [1024]u8 = undefined;
     const ca_der = try x509_selfsign.buildSelfSignedEcdsaP256(&ca_buf, .{
@@ -1667,7 +1667,7 @@ test "delegated OCSP: byName + EXPLICIT-byKey accept; ResponderID-mismatch and w
     // (4) Response signed by a key OTHER than the responder's → passes (a)-(d) but
     //     the response-signature check (e) fails. Isolates (e).
     {
-        const wrong_kp = ecdsa_p256.KeyPair.generate(std.testing.io);
+        const wrong_kp = ecdsa_p256.generate(std.testing.io);
         const rid = try ridByKeyPrimitive(allocator, &kh);
         defer allocator.free(rid);
         const resp = try testDelegatedOcspResponse(allocator, wrong_kp, responder_der, rid, serial, "20260202030405Z");

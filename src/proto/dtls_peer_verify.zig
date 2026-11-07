@@ -456,7 +456,7 @@ pub const EngineIdentity = struct {
         const der = self.cert_der[0..self.cert_len];
         if (!digestEql(expected_digest, certDigest(der))) return error.ConfigMismatch;
         try self.random.validate();
-        var key = try ecdsa.KeyPair.fromSecretKey(try ecdsa.SecretKey.fromBytes(self.secret_key));
+        var key = try ecdsa.keyPairFromSecretKey(try ecdsa.SecretKey.fromBytes(self.secret_key));
         defer std.crypto.secureZero(u8, std.mem.asBytes(&key));
         if (!std.crypto.timing_safe.eql([65]u8, key.public_key.toUncompressedSec1(), self.public_key)) return error.InvalidSnapshot;
         const cert = try x509.parse(der);

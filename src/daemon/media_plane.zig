@@ -4549,7 +4549,7 @@ pub const IdleDtls = struct {
         if (self.cert_len == 0 or self.cert_len > self.cert_der.len) return error.InvalidSnapshot;
         for (self.cert_der[self.cert_len..]) |byte| if (byte != 0) return error.InvalidSnapshot;
         try self.csprng.validate();
-        var key = try ecdsa.KeyPair.fromSecretKey(try ecdsa.SecretKey.fromBytes(self.secret_key));
+        var key = try ecdsa.keyPairFromSecretKey(try ecdsa.SecretKey.fromBytes(self.secret_key));
         defer std.crypto.secureZero(u8, std.mem.asBytes(&key));
         if (!std.crypto.timing_safe.eql([65]u8, key.public_key.toUncompressedSec1(), self.public_key)) return error.InvalidSnapshot;
         const der = self.cert_der[0..self.cert_len];
@@ -4560,7 +4560,7 @@ pub const IdleDtls = struct {
     }
     fn restore(self: *const IdleDtls, term: anytype, sessions: anytype) void {
         for (sessions) |*session| session.* = .{};
-        term.* = .{ .sessions = sessions, .cert_der = self.cert_der, .cert_len = self.cert_len, .cert_key = ecdsa.KeyPair.fromSecretKey(ecdsa.SecretKey.fromBytes(self.secret_key) catch unreachable) catch unreachable, .cookie_secret = self.cookie_secret, .csprng = self.csprng.restore(), .request_client_cert = self.request_client_cert };
+        term.* = .{ .sessions = sessions, .cert_der = self.cert_der, .cert_len = self.cert_len, .cert_key = ecdsa.keyPairFromSecretKey(ecdsa.SecretKey.fromBytes(self.secret_key) catch unreachable) catch unreachable, .cookie_secret = self.cookie_secret, .csprng = self.csprng.restore(), .request_client_cert = self.request_client_cert };
         term.verify_bindings.tick = self.binding_tick;
         term.verify_bindings.exhausted = self.binding_exhausted;
     }

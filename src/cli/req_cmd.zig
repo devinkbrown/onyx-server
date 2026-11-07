@@ -116,7 +116,7 @@ pub fn buildCsrPem(key_text: []const u8, cn: []const u8, dns_names: []const []co
         var scalar = try ec_pkcs.parseScalar(key_der);
         defer std.crypto.secureZero(u8, &scalar);
         const sk = try ecdsa_p256.SecretKey.fromBytes(scalar);
-        const kp = try ecdsa_p256.KeyPair.fromSecretKey(sk);
+        const kp = try ecdsa_p256.keyPairFromSecretKey(sk);
 
         const spki = ecP256Spki(kp.public_key.toUncompressedSec1());
         const cri = try csr.certificationRequestInfo(&cri_buf, .{

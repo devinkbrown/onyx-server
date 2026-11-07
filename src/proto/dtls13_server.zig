@@ -388,7 +388,7 @@ pub const Terminator = struct {
 
     pub fn prepareRestore(allocator: std.mem.Allocator, snapshot: *const Snapshot, policy: peer_verify.EnginePolicy) !Restoration {
         try snapshot.validate(policy);
-        var key = try ecdsa_p256.KeyPair.fromSecretKey(try ecdsa_p256.SecretKey.fromBytes(snapshot.identity.secret_key));
+        var key = try ecdsa_p256.keyPairFromSecretKey(try ecdsa_p256.SecretKey.fromBytes(snapshot.identity.secret_key));
         defer std.crypto.secureZero(u8, std.mem.asBytes(&key));
         var random = try snapshot.identity.random.restore();
         defer std.crypto.secureZero(u8, std.mem.asBytes(&random));
@@ -1273,7 +1273,7 @@ const TestTerminator = struct {
 
 fn makeTerminator(seed_byte: u8) !TestTerminator {
     const key_seed: [ecdsa_p256.KeyPair.seed_length]u8 = @splat(seed_byte);
-    const kp = try ecdsa_p256.KeyPair.generateDeterministic(key_seed);
+    const kp = try ecdsa_p256.generateDeterministic(key_seed);
     var cert_buf: [cert_der_cap]u8 = undefined;
     const serial = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
     const der = try x509_selfsign.buildSelfSignedEcdsaP256(&cert_buf, .{
@@ -1428,7 +1428,7 @@ const Flight13Mode = enum { normal, omit_cert, tamper_cv, fp_mismatch };
 /// material (DER borrows `cert_buf`, which must outlive the handshake).
 fn makeClientAuth13(seed_byte: u8, cert_buf: []u8) !ClientAuth13 {
     const key_seed: [ecdsa_p256.KeyPair.seed_length]u8 = @splat(seed_byte);
-    const kp = try ecdsa_p256.KeyPair.generateDeterministic(key_seed);
+    const kp = try ecdsa_p256.generateDeterministic(key_seed);
     const serial = [_]u8{ 0x0e, 0x0f, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
     const der = try x509_selfsign.buildSelfSignedEcdsaP256(cert_buf, .{
         .common_name = "webrtc-client-13",

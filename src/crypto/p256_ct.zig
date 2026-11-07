@@ -374,6 +374,20 @@ pub const Point = struct {
         return .{ .x = x3, .y = y3, .z = z3 };
     }
 
+    /// Lift a PUBLIC affine point given as canonical big-endian coordinates.
+    /// Fails closed (null) unless 0 <= x, y < p and y^2 = x^3 - 3x + b
+    /// (SEC 1 v2 sec. 3.2.2.1 steps 2-3). The identity has no affine form, so
+    /// it can never be returned. The inputs are public, so branching on the
+    /// verdict reveals nothing secret.
+    pub fn fromAffine(x_bytes: [32]u8, y_bytes: [32]u8) ?Point {
+        const x = Fe.fromBytes(x_bytes) orelse return null;
+        const y = Fe.fromBytes(y_bytes) orelse return null;
+        const lhs = y.sq();
+        const rhs = x.sq().mul(x).sub(x.dbl().add(x)).add(curve_b);
+        if (lhs.sub(rhs).isZeroBit() != 1) return null;
+        return .{ .x = x, .y = y, .z = Fe.one };
+    }
+
     fn cmov(p: *Point, q: Point, bit: u64) void {
         p.x.cmov(q.x, bit);
         p.y.cmov(q.y, bit);
@@ -390,7 +404,7 @@ pub const Point = struct {
         return .{ .x = p.x.mul(zinv).toBytes(), .y = p.y.mul(zinv).toBytes() };
     }
 
-    fn wipe(p: *Point) void {
+    pub fn wipe(p: *Point) void {
         p.x.wipe();
         p.y.wipe();
         p.z.wipe();
@@ -425,6 +439,19 @@ pub fn mulCt(p: Point, k: [32]u8) Point {
 /// [k]G for the P-256 generator.
 pub fn mulBaseCt(k: [32]u8) Point {
     return mulCt(Point.base, k);
+}
+
+/// ECDH primitive (SEC 1 v2 sec. 3.3.1, RFC 8446 sec. 7.4.2 / RFC 4492 sec.
+/// 5.10): the big-endian x-coordinate of [k]P for a validated public point
+/// `peer` and a secret scalar `k`, computed in constant time. Returns null
+/// only if [k]P is the identity (k = 0 mod n), which SEC 1 says to reject.
+/// The intermediate point and the y-coordinate are wiped.
+pub fn ecdhX(peer: Point, k: [32]u8) ?[32]u8 {
+    var product = mulCt(peer, k);
+    defer product.wipe();
+    var aff = product.affine() orelse return null;
+    defer std.crypto.secureZero(u8, &aff.y);
+    return aff.x;
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -510,6 +537,41 @@ test "mulBaseCt agrees with std basePoint.mul over random and edge scalars" {
         try testing.expectEqualSlices(u8, &want.x.toBytes(.big), &got.x);
         try testing.expectEqualSlices(u8, &want.y.toBytes(.big), &got.y);
     }
+}
+
+test "ecdhX on a variable base agrees with std P256.mul over random points and scalars" {
+    var prng = std.Random.DefaultPrng.init(0x6563646878);
+    const rnd = prng.random();
+    for (0..48) |_| {
+        var a: [32]u8 = undefined;
+        var b: [32]u8 = undefined;
+        rnd.bytes(&a);
+        rnd.bytes(&b);
+        a[0] &= 0x7f;
+        b[0] &= 0x7f;
+        // Peer point = [a]G (public), our scalar = b.
+        const peer_std = try StdP256.basePoint.mul(a, .big);
+        const peer_aff = peer_std.affineCoordinates();
+        const peer = Point.fromAffine(peer_aff.x.toBytes(.big), peer_aff.y.toBytes(.big)).?;
+        const want = (try peer_std.mul(b, .big)).affineCoordinates().x.toBytes(.big);
+        try testing.expectEqualSlices(u8, &want, &ecdhX(peer, b).?);
+    }
+    // Scalar n maps to the identity and is refused.
+    var nb: [32]u8 = undefined;
+    std.mem.writeInt(u256, &nb, n_int, .big);
+    try testing.expect(ecdhX(Point.base, nb) == null);
+}
+
+test "fromAffine fails closed on off-curve and non-canonical coordinates" {
+    const g = Point.base.affine().?;
+    try testing.expect(Point.fromAffine(g.x, g.y) != null);
+    var bad_y = g.y;
+    bad_y[31] ^= 1;
+    try testing.expect(Point.fromAffine(g.x, bad_y) == null);
+    var p_bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &p_bytes, p_int, .big);
+    try testing.expect(Point.fromAffine(p_bytes, g.y) == null);
+    try testing.expect(Point.fromAffine(@splat(0), @splat(0)) == null);
 }
 
 test "mulBaseCt maps 0 and n to the identity" {

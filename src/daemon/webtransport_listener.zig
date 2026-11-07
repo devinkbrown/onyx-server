@@ -3976,7 +3976,9 @@ fn validateTls(tls: TlsConfig) !void {
         },
         .ecdsa_p256 => |key| {
             if (public != .ecdsa_p256 or !std.mem.eql(u8, public.ecdsa_p256, &key.public_key.toUncompressedSec1())) return error.ConfigMismatch;
-            const sig = try key.sign(challenge, null);
+            // Constant-time signer: std's KeyPair.sign leaks the nonce through
+            // P256.mul timing (see crypto/p256_ct.zig).
+            const sig = try @import("../crypto/ecdsa_p256.zig").sign(challenge, key);
             try sig.verify(challenge, key.public_key);
         },
         .rsa => |key| {

@@ -36,6 +36,9 @@
 //!     not differ in what the branch predictor and caches can learn.
 //!   * ECDSA-P256 key derivation — secret = the private scalar (d·G), via the
 //!     constant-time `keyPairFromSecretKey`.
+//!   * ECDH-P256 shared secret — secret = the private scalar d in [d]Q, via
+//!     `ecdh_p256.sharedSecret` (constant-time `p256_ct.mulCt`). The peer
+//!     point Q is the same constant in both classes; only d differs.
 //!   * X25519 scalarmult — secret = the private scalar (Montgomery ladder).
 //!   * RSA-2048 private op (PKCS#1 v1.5 sign, CRT + base blinding). RSA key
 //!     generation is not exposed here, so we cannot randomize the KEY across the
@@ -57,6 +60,13 @@
 //! `src/crypto/p256_ct.zig`, which keeps those selects branch-free, and the
 //! check passes with |t| < 3.
 //!
+//! ECDH-P256 (2026-11-07): `ecdh_p256.sharedSecret` and key derivation moved
+//! from std `P256.mul` onto `p256_ct.mulCt`. Five runs on a shared 40-core
+//! host (load ~3.5) gave max|t| 1.1-2.9 for ECDH. In the same runs, keygen
+//! gave 1.9-5.0 with one 10.3 outlier (40 ns of 255 us, with the fixed class
+//! slower, which is the opposite of the branch-predictor leak). Re-run on a
+//! quiet host before treating a single excursion as a leak.
+//!
 //! Tunable via environment variables:
 //!   * CT_ITERS      — samples per class for ECDSA/X25519 (default 25000).
 //!   * CT_RSA_ITERS  — samples per class for RSA          (default 500).
@@ -65,6 +75,7 @@ const std = @import("std");
 const onyx_server = @import("onyx_server");
 
 const ecdsa = onyx_server.crypto.ecdsa_p256;
+const ecdh_p256 = onyx_server.crypto.ecdh_p256;
 const kx = onyx_server.crypto.kx;
 const rsa_sign = onyx_server.crypto.rsa_sign;
 const rsa_verify = onyx_server.crypto.rsa_verify;
@@ -105,6 +116,7 @@ pub fn main() !void {
 
     all_pass = (try runEcdsa(alloc, &drbg, ec_iters)) and all_pass;
     all_pass = (try runEcdsaKeygen(alloc, &drbg, ec_iters)) and all_pass;
+    all_pass = (try runEcdhP256(alloc, &drbg, ec_iters)) and all_pass;
     all_pass = (try runX25519(alloc, &drbg, ec_iters)) and all_pass;
     all_pass = (try runRsa(alloc, &drbg, rsa_iters)) and all_pass;
 
@@ -238,6 +250,64 @@ fn runEcdsaKeygen(alloc: std.mem.Allocator, drbg: *random.Drbg, count: usize) !b
     }
 
     return report(alloc, "ECDSA-P256 keygen    (secret = private scalar, d*G)", fixed_t, random_t);
+}
+
+// -- ECDH-P256 shared secret -------------------------------------------------
+
+fn runEcdhP256(alloc: std.mem.Allocator, drbg: *random.Drbg, count: usize) !bool {
+    // A fixed, valid peer public key that both classes multiply against.
+    const peer = try ecdh_p256.generateDeterministic(@as([32]u8, @splat(0x5a)));
+    const peer_public = peer.public_sec1;
+
+    // Fixed class: one canonical scalar (the same one the ECDSA checks use).
+    const fixed_secret = [_]u8{
+        0x3b, 0x9a, 0xca, 0x00, 0x11, 0x22, 0x33, 0x44,
+        0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+        0xdd, 0xee, 0xff, 0x01, 0x02, 0x03, 0x04, 0x05,
+        0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+    };
+
+    // Random class: a fresh valid scalar per measurement. Reusing the
+    // ECDSA key sampler keeps the scalars in [1, n-1], so `sharedSecret`
+    // never takes its rejection branch in either class.
+    const random_secrets = try alloc.alloc([32]u8, count);
+    defer alloc.free(random_secrets);
+    for (random_secrets) |*s| s.* = (try randomEcdsaKeyPair(drbg)).secret_key.bytes;
+
+    const fixed_t = try alloc.alloc(u64, count);
+    defer alloc.free(fixed_t);
+    const random_t = try alloc.alloc(u64, count);
+    defer alloc.free(random_t);
+
+    const schedule = try buildSchedule(alloc, drbg, count);
+    defer alloc.free(schedule);
+
+    var w: usize = 0;
+    while (w < 512) : (w += 1) {
+        std.mem.doNotOptimizeAway(ecdh_p256.sharedSecret(fixed_secret, peer_public) catch unreachable);
+    }
+
+    // Hot reused slot, as in the ECDSA loops.
+    var work: [32]u8 = undefined;
+    var fi: usize = 0;
+    var ri: usize = 0;
+    for (schedule) |is_fixed| {
+        work = if (is_fixed) fixed_secret else random_secrets[ri];
+        std.mem.doNotOptimizeAway(&work);
+        const t0 = monotonicNanos();
+        const ss = ecdh_p256.sharedSecret(work, peer_public) catch |e| std.debug.panic("ecdh p256: {s}", .{@errorName(e)});
+        const t1 = monotonicNanos();
+        std.mem.doNotOptimizeAway(ss);
+        if (is_fixed) {
+            fixed_t[fi] = t1 -% t0;
+            fi += 1;
+        } else {
+            random_t[ri] = t1 -% t0;
+            ri += 1;
+        }
+    }
+
+    return report(alloc, "ECDH-P256 shared     (secret = private scalar, d*Q)", fixed_t, random_t);
 }
 
 // -- X25519 scalar multiplication --------------------------------------------

@@ -283,7 +283,7 @@ pub const Vapid = struct {
         }
         const file = try os_runtime.createPrivateExclusiveWindows(parent, name);
         defer file.close(io);
-        var kp = ecdsa.KeyPair.generate(io);
+        var kp = ecdsa.generate(io);
         errdefer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
         var hex = std.fmt.bytesToHex(kp.secret_key.toBytes(), .lower);
         defer std.crypto.secureZero(u8, &hex);
@@ -318,7 +318,7 @@ pub const Vapid = struct {
         defer std.crypto.secureZero(u8, &secret);
         _ = std.fmt.hexToBytes(&secret, trimmed) catch return error.InvalidVapidKey;
         const sk = ecdsa.SecretKey.fromBytes(secret) catch return error.InvalidVapidKey;
-        return .{ .key_pair = ecdsa.KeyPair.fromSecretKey(sk) catch return error.InvalidVapidKey };
+        return .{ .key_pair = ecdsa.keyPairFromSecretKey(sk) catch return error.InvalidVapidKey };
     }
 
     /// Owner-only on platforms with POSIX modes. Windows uses the protected
@@ -342,7 +342,7 @@ pub const Vapid = struct {
             else => return err,
         }
 
-        var kp = ecdsa.KeyPair.generate(io);
+        var kp = ecdsa.generate(io);
         errdefer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
         var hex = std.fmt.bytesToHex(kp.secret_key.toBytes(), .lower);
         defer std.crypto.secureZero(u8, &hex);
@@ -371,7 +371,7 @@ pub const Vapid = struct {
         defer std.crypto.secureZero(u8, &secret);
         _ = std.fmt.hexToBytes(&secret, trimmed) catch return error.InvalidVapidKey;
         const sk = ecdsa.SecretKey.fromBytes(secret) catch return error.InvalidVapidKey;
-        return .{ .key_pair = ecdsa.KeyPair.fromSecretKey(sk) catch return error.InvalidVapidKey };
+        return .{ .key_pair = ecdsa.keyPairFromSecretKey(sk) catch return error.InvalidVapidKey };
     }
 
     /// The base64url public key clients pass to `pushManager.subscribe`.
@@ -640,7 +640,7 @@ pub const Worker = struct {
         const resolver = self.system_resolver orelse return error.NotPrepared;
         const actual = resolver.resolver();
         if (actual.ctx != self.resolver.ctx or actual.resolveFn != self.resolver.resolveFn) return error.ConfigMismatch;
-        const derived = try ecdsa.KeyPair.fromSecretKey(self.vapid.secret_key);
+        const derived = try ecdsa.keyPairFromSecretKey(self.vapid.secret_key);
         const public_key = self.vapid.public_key.toUncompressedSec1();
         const expected_key = derived.public_key.toUncompressedSec1();
         if (!std.mem.eql(u8, &public_key, &expected_key)) return error.ConfigMismatch;
@@ -1187,7 +1187,7 @@ test "webpush Windows HTTPS delivers encrypted POST and records 201 and 410" {
     var resolver_ctx: u8 = 0;
     var worker = Worker{
         .allocator = testing.allocator,
-        .vapid = try ecdsa.KeyPair.fromSecretKey(vapid_secret),
+        .vapid = try ecdsa.keyPairFromSecretKey(vapid_secret),
         .subject = "mailto:push@example.test",
         .resolver = .{ .ctx = &resolver_ctx, .resolveFn = StaticResolver.resolve },
         .trust_anchors = &chain,
@@ -1406,7 +1406,7 @@ test "worker enqueue/shutdown never blocks and bounds the queue" {
     var ctx_byte: u8 = 0;
     var w = Worker{
         .allocator = testing.allocator,
-        .vapid = ecdsa.KeyPair.generate(testing.io),
+        .vapid = ecdsa.generate(testing.io),
         .subject = "mailto:t@example.net",
         .resolver = .{ .ctx = @ptrCast(&ctx_byte), .resolveFn = FailResolver.resolve },
         .trust_anchors = &.{},
@@ -1449,7 +1449,7 @@ test "DST GAP-D8 webpush queue overflow increments a metric and emits an oper ev
     };
     var w = Worker{
         .allocator = testing.allocator,
-        .vapid = ecdsa.KeyPair.generate(testing.io),
+        .vapid = ecdsa.generate(testing.io),
         .subject = "mailto:t@example.net",
         .resolver = .{ .ctx = @ptrCast(&ctx_byte), .resolveFn = FailResolver.resolve },
         .trust_anchors = &.{},
@@ -1558,7 +1558,7 @@ const DeliveryFixture = if (builtin.is_test) struct {
 
 fn retainedTestWorker(allocator: Allocator, resolver: *acme_runner.SystemResolver) !Worker {
     const secret = try ecdsa.SecretKey.fromBytes(@splat(1));
-    return .{ .allocator = allocator, .vapid = try ecdsa.KeyPair.fromSecretKey(secret), .subject = "mailto:retained@example.invalid", .resolver = resolver.resolver(), .trust_anchors = &.{} };
+    return .{ .allocator = allocator, .vapid = try ecdsa.keyPairFromSecretKey(secret), .subject = "mailto:retained@example.invalid", .resolver = resolver.resolver(), .trust_anchors = &.{} };
 }
 fn retainedTestSeed(worker: *Worker) !void {
     const key = worker.vapid.public_key.toUncompressedSec1();
@@ -1797,7 +1797,7 @@ test "webpush snapshot bounds and configuration mismatches refuse before clone" 
     resolver.resolv_conf_max_bytes += 1;
     try testing.expectError(error.ConfigMismatch, target.restoreSnapshot(&snapshot, retained_test_bounds));
     resolver.resolv_conf_max_bytes -= 1;
-    target.vapid = try ecdsa.KeyPair.fromSecretKey(try ecdsa.SecretKey.fromBytes(@splat(2)));
+    target.vapid = try ecdsa.keyPairFromSecretKey(try ecdsa.SecretKey.fromBytes(@splat(2)));
     try testing.expectError(error.ConfigMismatch, target.restoreSnapshot(&snapshot, retained_test_bounds));
     target.vapid.secret_key = source.vapid.secret_key; // inconsistent key pair must also refuse
     try testing.expectError(error.ConfigMismatch, target.restoreSnapshot(&snapshot, retained_test_bounds));
@@ -1990,7 +1990,7 @@ test "webpush dormant cancellation joins without entering delivery or consuming 
 fn loadExistingRetainedOom(allocator: Allocator, dir: std.Io.Dir) !void {
     var value = try Vapid.loadExisting(testing.io, allocator, dir, "retained.key");
     defer std.crypto.secureZero(u8, std.mem.asBytes(&value));
-    const expected = try ecdsa.KeyPair.fromSecretKey(try ecdsa.SecretKey.fromBytes(@splat(1)));
+    const expected = try ecdsa.keyPairFromSecretKey(try ecdsa.SecretKey.fromBytes(@splat(1)));
     try testing.expectEqualSlices(u8, &expected.public_key.toUncompressedSec1(), &value.key_pair.public_key.toUncompressedSec1());
 }
 

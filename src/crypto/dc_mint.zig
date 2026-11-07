@@ -159,7 +159,7 @@ pub const Minted = struct {
 /// Mint one delegated credential. See the module header for every check.
 pub fn mint(allocator: std.mem.Allocator, io: std.Io, opts: MintOptions) Error!Minted {
     var dc_key: DcPrivateKey = switch (opts.dc_algorithm) {
-        .ecdsa_p256 => .{ .ecdsa_p256 = ecdsa_p256.KeyPair.generate(io) },
+        .ecdsa_p256 => .{ .ecdsa_p256 = ecdsa_p256.generate(io) },
         .ed25519 => blk: {
             var seed: [Ed25519.KeyPair.seed_length]u8 = undefined;
             defer std.crypto.secureZero(u8, &seed);
@@ -501,7 +501,7 @@ test "dc_mint fails closed without DelegationUsage, digitalSignature, or a match
         .now_unix = now,
         .lifetime_seconds = 3600,
     }));
-    const ec = ecdsa_p256.KeyPair.generate(testing.io);
+    const ec = ecdsa_p256.generate(testing.io);
     try testing.expectError(error.LeafKeyMismatch, mint(testing.allocator, testing.io, .{
         .leaf_der = good,
         .leaf_key = .{ .ecdsa_p256 = ec },
@@ -519,7 +519,7 @@ test "dc_mint checkLeafKey and checkDcKey compare whole public keys, not only ke
     try checkLeafKey(leaf, .{ .ed25519 = kp });
     // Same type (Ed25519), different key.
     try testing.expectError(error.LeafKeyMismatch, checkLeafKey(leaf, .{ .ed25519 = other }));
-    try testing.expectError(error.LeafKeyMismatch, checkLeafKey(leaf, .{ .ecdsa_p256 = ecdsa_p256.KeyPair.generate(testing.io) }));
+    try testing.expectError(error.LeafKeyMismatch, checkLeafKey(leaf, .{ .ecdsa_p256 = ecdsa_p256.generate(testing.io) }));
 
     var minted = try mint(testing.allocator, testing.io, .{
         .leaf_der = leaf,
@@ -530,7 +530,7 @@ test "dc_mint checkLeafKey and checkDcKey compare whole public keys, not only ke
     defer minted.deinit(testing.allocator);
     try checkDcKey(minted.wire, minted.private_key);
     // Same type (P-256), different key.
-    try testing.expectError(error.DcKeyMismatch, checkDcKey(minted.wire, .{ .ecdsa_p256 = ecdsa_p256.KeyPair.generate(testing.io) }));
+    try testing.expectError(error.DcKeyMismatch, checkDcKey(minted.wire, .{ .ecdsa_p256 = ecdsa_p256.generate(testing.io) }));
     try testing.expectError(error.DcKeyMismatch, checkDcKey(minted.wire, .{ .ed25519 = other }));
 }
 
@@ -568,7 +568,7 @@ test "dc_mint enforces the seven-day cap and the certificate window" {
 }
 
 test "dc_mint ECDSA leaf signs with ecdsa_secp256r1_sha256 and Ed25519 DC keys work" {
-    const leaf_kp = ecdsa_p256.KeyPair.generate(testing.io);
+    const leaf_kp = ecdsa_p256.generate(testing.io);
     var buf: [2048]u8 = undefined;
     const leaf = try x509_selfsign.buildSelfSignedEcdsaP256(&buf, .{
         .common_name = "dc.example.test",
