@@ -8,12 +8,16 @@
 //! boot-time ULP probing, `TCP_ULP`/`TLS_TX`/`TLS_RX` attach and reinstall,
 //! kernel tuple reads, typed control-record sends, and `recvmsg` demux of
 //! kernel-decrypted control records. The daemon's TLS adapter supplies live
-//! TLS 1.3 traffic material; TLS 1.2 kTLS remains unsupported.
+//! TLS 1.3 traffic material (`tls13CryptoInfo`) or TLS 1.2 AEAD material
+//! (`tls12CryptoInfo`).
 //!
 //! The serialized layout is iv, key, salt, then the big-endian record
 //! sequence after the 4-byte `tls_crypto_info` header. The TLS 1.3 nonce
 //! split uses salt = static_iv[0..4] and iv = static_iv[4..12] for AES-GCM;
-//! ChaCha20-Poly1305 has no salt and uses the full 12-byte IV.
+//! ChaCha20-Poly1305 has no salt and uses the full 12-byte IV. TLS 1.2 AES-GCM
+//! uses salt = the 4-byte implicit key-block IV and iv = the 8-byte explicit
+//! nonce (pinned to the record sequence); TLS 1.2 ChaCha20-Poly1305 is laid out
+//! exactly like TLS 1.3 (RFC 7905 §2 uses the RFC 8446 nonce construction).
 //!
 //! The daemon is 64-bit little-endian only (x86_64 / aarch64); the `u16`
 //! `version`/`cipher_type` fields are encoded in native (little) endianness,
@@ -187,6 +191,59 @@ pub fn tls13CryptoInfo(cipher: Cipher, static_iv: []const u8, key: []const u8, s
         .key = key,
         .rec_seq = seqToBytes(seq),
     };
+}
+
+/// Build the TLS 1.2 `CryptoInfo` (`version = TLS_1_2_VERSION`) for one
+/// direction of a completed TLS 1.2 AEAD session.
+///
+/// * `fixed_iv` is the key-block IV of that direction: 4 bytes for AES-GCM (the
+///   RFC 5288 §3 implicit `salt`), 12 bytes for ChaCha20-Poly1305 (RFC 7905 §2).
+/// * `key` is that direction's write key; `seq` its next record sequence number.
+/// * `explicit_iv` is caller-owned storage the returned `iv` slice aliases; it
+///   must outlive the `CryptoInfo` (typically until `encode`).
+///
+/// AES-GCM nonce discipline (RFC 5288 §3, RFC 5116 §3.2: a nonce must never
+/// repeat under one key). The Linux TLS 1.2 GCM path places the `iv` field on
+/// the wire as `GCMNonce.nonce_explicit` and, after every record, increments
+/// both `rec_seq` and `iv` (`tls_advance_record_sn`). Our userspace engine
+/// always sends nonce_explicit = sequence number (`tls12.gcmExplicitNonce`), so
+/// installing `iv = rec_seq = seq` keeps the kernel on the identical
+/// `salt ‖ seq` line: every pre-handoff record used explicit nonce < seq and
+/// every kernel record uses ≥ seq, so no nonce can collide after handoff. On
+/// RX the kernel takes the explicit nonce from each record (RFC 5288 §3) and
+/// only uses `salt`; `iv` is still set to `seq` so a later `getsockopt` tuple
+/// reads back with the same `iv == rec_seq` invariant (`validateTls12Epoch`).
+///
+/// ChaCha20-Poly1305 (RFC 7905 §2) has no explicit nonce: the per-record nonce
+/// is `fixed_iv XOR (0^4 ‖ seq)`, which the kernel derives from `iv` (all 12
+/// bytes, no salt) and `rec_seq` exactly as for TLS 1.3.
+pub fn tls12CryptoInfo(cipher: Cipher, fixed_iv: []const u8, key: []const u8, seq: u64, explicit_iv: *[rec_seq_len]u8) Error!CryptoInfo {
+    if (key.len != cipher.keyLen()) return error.BadLength;
+    switch (cipher) {
+        .aes_gcm_128, .aes_gcm_256 => {
+            if (fixed_iv.len != cipher.saltLen()) return error.BadLength;
+            explicit_iv.* = seqToBytes(seq);
+            return .{
+                .version = TLS_1_2_VERSION,
+                .cipher = cipher,
+                .salt = fixed_iv,
+                .iv = explicit_iv,
+                .key = key,
+                .rec_seq = seqToBytes(seq),
+            };
+        },
+        .chacha20_poly1305 => {
+            if (fixed_iv.len != cipher.ivLen()) return error.BadLength;
+            return .{
+                .version = TLS_1_2_VERSION,
+                .cipher = cipher,
+                .salt = fixed_iv[0..0],
+                .iv = fixed_iv,
+                .key = key,
+                .rec_seq = seqToBytes(seq),
+            };
+        },
+    }
 }
 
 // ── Boot-time capability probe (design Phase 0) ─────────────────────────────
@@ -446,19 +503,48 @@ pub const KernelTuple = struct {
         if (expected.len != self.len or self.len < 8 or
             std.crypto.timing_safe.compare(u8, self.bytes[0 .. self.len - 8], expected[0 .. expected.len - 8], .big) != .eq) return error.TupleMismatch;
     }
+
+    /// TLS 1.2 epoch check. For AES-GCM the kernel advances the `iv` field
+    /// (explicit nonce) with `rec_seq`, so `validateEpoch` would always mismatch
+    /// after the first record. Instead compare header, key and salt with
+    /// `expected` (an encoded `tls12CryptoInfo`) in constant time, and require the
+    /// live tuple's `iv == rec_seq` — the exact nonce-discipline invariant
+    /// `tls12CryptoInfo` installs. ChaCha20-Poly1305 has a fixed `iv`, so the
+    /// whole prefix except `rec_seq` must match, as for TLS 1.3.
+    pub fn validateTls12Epoch(self: *const KernelTuple, cipher: Cipher, expected: []const u8) ControlError!void {
+        if (expected.len != self.len or self.len != cipher.cryptoInfoLen()) return error.TupleMismatch;
+        if (std.mem.readInt(u16, self.bytes[0..2], native_endian) != TLS_1_2_VERSION) return error.TupleMismatch;
+        switch (cipher) {
+            .chacha20_poly1305 => return self.validateEpoch(expected),
+            .aes_gcm_128, .aes_gcm_256 => {
+                const iv_end = crypto_info_header_len + cipher.ivLen();
+                const seq_off = self.len - rec_seq_len;
+                const header_ok = std.crypto.timing_safe.compare(u8, self.bytes[0..crypto_info_header_len], expected[0..crypto_info_header_len], .big) == .eq;
+                const key_salt_ok = std.crypto.timing_safe.compare(u8, self.bytes[iv_end..seq_off], expected[iv_end..seq_off], .big) == .eq;
+                const nonce_ok = std.mem.eql(u8, self.bytes[crypto_info_header_len..iv_end], self.bytes[seq_off..self.len]);
+                if (!header_ok or !key_salt_ok or !nonce_ok) return error.TupleMismatch;
+            },
+        }
+    }
 };
 
 pub const Direction = enum { tx, rx };
 pub const ControlError = error{ Unsupported, GetFailed, TupleMismatch, BadLength, WouldBlock, SendFailed };
 
 pub fn getTuple(fd: linux.fd_t, direction: Direction, cipher: Cipher) ControlError!KernelTuple {
+    return getTupleVersion(fd, direction, cipher, TLS_1_3_VERSION);
+}
+
+/// `getTuple` for an explicit protocol version (`TLS_1_2_VERSION` for a TLS 1.2
+/// offload). A tuple whose version or cipher differs is `TupleMismatch`.
+pub fn getTupleVersion(fd: linux.fd_t, direction: Direction, cipher: Cipher, version: u16) ControlError!KernelTuple {
     if (comptime builtin.os.tag != .linux) return error.Unsupported;
     var tuple: KernelTuple = .{ .len = cipher.cryptoInfoLen() };
     errdefer tuple.wipe();
     var len: linux.socklen_t = @intCast(tuple.len);
     const rc = linux.getsockopt(fd, @intCast(SOL_TLS), if (direction == .tx) TLS_TX else TLS_RX, &tuple.bytes, &len);
     if (posix.errno(rc) != .SUCCESS) return error.GetFailed;
-    if (len != tuple.len or std.mem.readInt(u16, tuple.bytes[0..2], native_endian) != TLS_1_3_VERSION or
+    if (len != tuple.len or std.mem.readInt(u16, tuple.bytes[0..2], native_endian) != version or
         std.mem.readInt(u16, tuple.bytes[2..4], native_endian) != cipher.cipherType().toInt()) return error.TupleMismatch;
     return tuple;
 }
@@ -759,4 +845,362 @@ test "kernel accepts our encoded crypto_info via TLS_TX (validates layout vs rea
     // kernels — validate their layout where supported, tolerate genuine absence.
     expectKernelAcceptsTx(.aes_gcm_256, 32) catch |e| if (e != error.KtlsTxUnsupported) return e;
     expectKernelAcceptsTx(.chacha20_poly1305, 32) catch |e| if (e != error.KtlsTxUnsupported) return e;
+}
+
+// ── TLS 1.2 kTLS ────────────────────────────────────────────────────────────
+
+test "tls12CryptoInfo AES-GCM: salt = implicit IV, iv = explicit nonce = rec_seq" {
+    const salt = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    const key128 = @as([16]u8, @splat(0x5A));
+    var explicit: [rec_seq_len]u8 = undefined;
+    const info = try tls12CryptoInfo(.aes_gcm_128, &salt, &key128, 0x0102030405060708, &explicit);
+    try testing.expectEqual(TLS_1_2_VERSION, info.version);
+    try testing.expectEqualSlices(u8, &salt, info.salt);
+    try testing.expectEqualSlices(u8, &seqToBytes(0x0102030405060708), info.iv);
+    try testing.expectEqualSlices(u8, &info.rec_seq, info.iv);
+
+    var buf: [max_crypto_info_len]u8 = undefined;
+    const out = try info.encode(&buf);
+    // struct tls12_crypto_info_aes_gcm_128 { info; iv[8]; key[16]; salt[4]; rec_seq[8]; }
+    try testing.expectEqual(@as(usize, 40), out.len);
+    try testing.expectEqual(@as(u16, 0x0303), std.mem.readInt(u16, out[0..2], native_endian));
+    try testing.expectEqual(@as(u16, 51), std.mem.readInt(u16, out[2..4], native_endian));
+    try testing.expectEqualSlices(u8, &seqToBytes(0x0102030405060708), out[4..12]);
+    try testing.expectEqualSlices(u8, &key128, out[12..28]);
+    try testing.expectEqualSlices(u8, &salt, out[28..32]);
+    try testing.expectEqualSlices(u8, &seqToBytes(0x0102030405060708), out[32..40]);
+
+    // AES-256-GCM: same split, 32-byte key, total 56.
+    const key256 = @as([32]u8, @splat(0x6B));
+    const info256 = try tls12CryptoInfo(.aes_gcm_256, &salt, &key256, 9, &explicit);
+    const out256 = try info256.encode(&buf);
+    try testing.expectEqual(@as(usize, 56), out256.len);
+    try testing.expectEqual(@as(u16, 52), std.mem.readInt(u16, out256[2..4], native_endian));
+    try testing.expectEqualSlices(u8, &seqToBytes(9), out256[4..12]);
+    try testing.expectEqualSlices(u8, &key256, out256[12..44]);
+    try testing.expectEqualSlices(u8, &salt, out256[44..48]);
+    try testing.expectEqualSlices(u8, &seqToBytes(9), out256[48..56]);
+}
+
+test "tls12CryptoInfo ChaCha20-Poly1305: no salt, full 12-byte fixed IV" {
+    var fixed: [12]u8 = undefined;
+    for (&fixed, 0..) |*b, i| b.* = @intCast(0xA0 + i);
+    const key = @as([32]u8, @splat(0x7C));
+    var explicit: [rec_seq_len]u8 = @splat(0xEE);
+    const info = try tls12CryptoInfo(.chacha20_poly1305, &fixed, &key, 3, &explicit);
+    try testing.expectEqual(@as(usize, 0), info.salt.len);
+    var buf: [max_crypto_info_len]u8 = undefined;
+    const out = try info.encode(&buf);
+    try testing.expectEqual(@as(usize, 56), out.len);
+    try testing.expectEqual(@as(u16, 0x0303), std.mem.readInt(u16, out[0..2], native_endian));
+    try testing.expectEqual(@as(u16, 54), std.mem.readInt(u16, out[2..4], native_endian));
+    try testing.expectEqualSlices(u8, &fixed, out[4..16]);
+    try testing.expectEqualSlices(u8, &key, out[16..48]);
+    try testing.expectEqualSlices(u8, &seqToBytes(3), out[48..56]);
+}
+
+test "tls12CryptoInfo rejects wrong fixed-IV and key lengths" {
+    var explicit: [rec_seq_len]u8 = undefined;
+    const k16 = @as([16]u8, @splat(0));
+    const k32 = @as([32]u8, @splat(0));
+    // A TLS 1.3-style 12-byte static IV is NOT a TLS 1.2 GCM salt.
+    try testing.expectError(error.BadLength, tls12CryptoInfo(.aes_gcm_128, &@as([12]u8, @splat(0)), &k16, 0, &explicit));
+    try testing.expectError(error.BadLength, tls12CryptoInfo(.aes_gcm_256, &@as([3]u8, @splat(0)), &k32, 0, &explicit));
+    try testing.expectError(error.BadLength, tls12CryptoInfo(.aes_gcm_128, &@as([4]u8, @splat(0)), &k32, 0, &explicit));
+    try testing.expectError(error.BadLength, tls12CryptoInfo(.chacha20_poly1305, &@as([4]u8, @splat(0)), &k32, 0, &explicit));
+    try testing.expectError(error.BadLength, tls12CryptoInfo(.chacha20_poly1305, &@as([12]u8, @splat(0)), &k16, 0, &explicit));
+}
+
+test "validateTls12Epoch accepts an advanced GCM tuple only while iv == rec_seq" {
+    const salt = [_]u8{ 1, 2, 3, 4 };
+    const key = @as([16]u8, @splat(0x42));
+    var explicit: [rec_seq_len]u8 = undefined;
+    var exp_buf: [max_crypto_info_len]u8 = undefined;
+    const expected = try (try tls12CryptoInfo(.aes_gcm_128, &salt, &key, 5, &explicit)).encode(&exp_buf);
+
+    // The kernel advanced 3 records: iv and rec_seq both moved to 8.
+    var live: KernelTuple = .{ .len = expected.len };
+    @memcpy(live.bytes[0..expected.len], expected);
+    live.bytes[4..12].* = seqToBytes(8);
+    live.bytes[32..40].* = seqToBytes(8);
+    try live.validateTls12Epoch(.aes_gcm_128, expected);
+    try testing.expectEqual(@as(u64, 8), live.sequence());
+    // The TLS 1.3 whole-prefix comparison would reject this legitimate state.
+    try testing.expectError(error.TupleMismatch, live.validateEpoch(expected));
+
+    // Diverged nonce counter: a nonce-reuse hazard, refused.
+    live.bytes[4..12].* = seqToBytes(7);
+    try testing.expectError(error.TupleMismatch, live.validateTls12Epoch(.aes_gcm_128, expected));
+    live.bytes[4..12].* = seqToBytes(8);
+    // A different key or salt is a different epoch.
+    live.bytes[12] ^= 1;
+    try testing.expectError(error.TupleMismatch, live.validateTls12Epoch(.aes_gcm_128, expected));
+    live.bytes[12] ^= 1;
+    live.bytes[28] ^= 1;
+    try testing.expectError(error.TupleMismatch, live.validateTls12Epoch(.aes_gcm_128, expected));
+    live.bytes[28] ^= 1;
+    // A TLS 1.3 tuple never validates as TLS 1.2.
+    std.mem.writeInt(u16, live.bytes[0..2], TLS_1_3_VERSION, native_endian);
+    try testing.expectError(error.TupleMismatch, live.validateTls12Epoch(.aes_gcm_128, expected));
+}
+
+const tls12_test = struct {
+    const tls12_server = @import("../crypto/tls12_server.zig");
+    const tls12_client = @import("../crypto/tls12_client.zig");
+    const ecdsa_p256 = @import("../crypto/ecdsa_p256.zig");
+    const x509_selfsign = @import("../proto/x509_selfsign.zig");
+
+    const Suite = enum { aes128, aes256, chacha };
+
+    const Pair = struct {
+        listen_fd: linux.fd_t,
+        client_fd: linux.fd_t,
+        server_fd: linux.fd_t,
+
+        fn close(self: Pair) void {
+            _ = linux.close(self.server_fd);
+            _ = linux.close(self.client_fd);
+            _ = linux.close(self.listen_fd);
+        }
+    };
+
+    /// ESTABLISHED 127.0.0.1 TCP pair with a 5 s receive timeout on both ends so
+    /// a kernel/engine mismatch fails instead of hanging. Skips when sockets are
+    /// unavailable (sandbox).
+    fn loopbackPair() !Pair {
+        const listen_fd = try tcpSocketOrSkip();
+        errdefer _ = linux.close(listen_fd);
+        var addr = linux.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+        if (posix.errno(linux.bind(listen_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+        if (posix.errno(linux.listen(listen_fd, 1)) != .SUCCESS) return error.SkipZigTest;
+        var storage: posix.sockaddr.storage = undefined;
+        var slen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        if (posix.errno(linux.getsockname(listen_fd, @ptrCast(&storage), &slen)) != .SUCCESS) return error.SkipZigTest;
+        addr.port = (@as(*const linux.sockaddr.in, @ptrCast(@alignCast(&storage)))).port;
+        const client_fd = try tcpSocketOrSkip();
+        errdefer _ = linux.close(client_fd);
+        if (posix.errno(linux.connect(client_fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+        const accept_rc = linux.accept4(listen_fd, null, null, 0);
+        if (posix.errno(accept_rc) != .SUCCESS) return error.SkipZigTest;
+        const server_fd: linux.fd_t = @intCast(accept_rc);
+        const tv = linux.timeval{ .sec = 5, .usec = 0 };
+        for ([_]linux.fd_t{ client_fd, server_fd }) |fd| {
+            _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&tv).ptr, @sizeOf(linux.timeval));
+        }
+        return .{ .listen_fd = listen_fd, .client_fd = client_fd, .server_fd = server_fd };
+    }
+
+    fn writeAll(fd: linux.fd_t, bytes: []const u8) !void {
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+            switch (posix.errno(rc)) {
+                .SUCCESS => off += rc,
+                .INTR => continue,
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+
+    fn readSome(fd: linux.fd_t, buf: []u8) !usize {
+        while (true) {
+            const rc = linux.read(fd, buf.ptr, buf.len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return error.TestUnexpectedResult;
+                    return rc;
+                },
+                .INTR => continue,
+                else => return error.TestUnexpectedResult, // includes RCVTIMEO expiry
+            }
+        }
+    }
+
+    /// Read exactly one complete TLS record (header + fragment) off the raw
+    /// (non-kTLS) peer socket into `buf`, keeping any surplus for the next call.
+    fn readRecord(fd: linux.fd_t, buf: []u8, have: *usize) ![]u8 {
+        while (true) {
+            if (have.* >= 5) {
+                const total = 5 + @as(usize, std.mem.readInt(u16, buf[3..5], .big));
+                if (have.* >= total) return buf[0..total];
+            }
+            have.* += try readSome(fd, buf[have.*..]);
+        }
+    }
+
+    fn consume(buf: []u8, have: *usize, n: usize) void {
+        std.mem.copyForwards(u8, buf[0 .. have.* - n], buf[n..have.*]);
+        have.* -= n;
+    }
+
+    fn kernelCipher(c: tls12_server.Server.KtlsCipher) Cipher {
+        return switch (c) {
+            .aes_128_gcm => .aes_gcm_128,
+            .aes_256_gcm => .aes_gcm_256,
+            .chacha20_poly1305 => .chacha20_poly1305,
+        };
+    }
+
+    fn encodeParams(p: tls12_server.Server.KtlsParams, explicit: *[rec_seq_len]u8, out: []u8) ![]u8 {
+        const info = try tls12CryptoInfo(kernelCipher(p.cipher), p.fixed_iv, p.key, p.seq, explicit);
+        return info.encode(out);
+    }
+
+    /// Full userspace TLS 1.2 handshake (server engine ⇄ client engine), then
+    /// hand the SERVER's both directions to the real kernel (TLS_TX + TLS_RX,
+    /// `TLS_1_2_VERSION`) and drive application data between kernel-encrypted
+    /// records and the userspace client engine on the raw peer socket.
+    fn run(suite: Suite) !void {
+        const allocator = testing.allocator;
+        const key = ecdsa_p256.KeyPair.generate(testing.io);
+        var cert_buf: [2048]u8 = undefined;
+        const cert = try x509_selfsign.buildSelfSignedEcdsaP256(&cert_buf, .{
+            .common_name = "localhost",
+            .not_before = 1_704_067_200,
+            .not_after = 1_893_456_000,
+            .serial = &.{ 7, 7, 7, 1 },
+            .key_pair = key,
+            .dns_names = &.{"localhost"},
+            .is_ca = true,
+        });
+        const chain = [_][]const u8{cert};
+        var server = try tls12_server.Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = key });
+        defer server.deinit();
+        var client = try tls12_client.Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &chain, .now_unix_seconds = 1_735_689_600 });
+        defer client.deinit();
+        switch (suite) {
+            .aes128 => client.offerOnlyAes128ForTest(),
+            .aes256 => client.offerOnlyAes256ForTest(),
+            .chacha => client.offerOnlyChaChaForTest(),
+        }
+        try testing.expect(server.ktlsTxParams() == null); // never before the handshake
+        try testing.expect(server.ktlsRxParams() == null);
+
+        const ch = try client.start();
+        defer allocator.free(ch);
+        const sf = switch (try server.feed(ch)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer allocator.free(sf);
+        const cf = switch (try client.feed(sf)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer allocator.free(cf);
+        const sfin = switch (try server.feed(cf)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer allocator.free(sfin);
+        _ = try client.feed(sfin);
+        try testing.expect(server.handshakeDone() and client.handshakeDone());
+
+        // Advance both directions in userspace first so the handoff happens at a
+        // nonzero sequence (Finished was seq 0; this record is seq 1).
+        {
+            const s2c = try server.encrypt("userspace s2c");
+            defer allocator.free(s2c);
+            const got = try client.decrypt(s2c);
+            defer allocator.free(got);
+            try testing.expectEqualStrings("userspace s2c", got);
+            const c2s = try client.encrypt("userspace c2s");
+            defer allocator.free(c2s);
+            const got2 = try server.decrypt(c2s);
+            defer allocator.free(got2);
+            try testing.expectEqualStrings("userspace c2s", got2);
+        }
+
+        const tx = server.ktlsTxParams() orelse return error.TestUnexpectedResult;
+        const rx = server.ktlsRxParams() orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(u64, 2), tx.seq);
+        try testing.expectEqual(@as(u64, 2), rx.seq);
+        const cipher = kernelCipher(tx.cipher);
+
+        const pair = try loopbackPair();
+        defer pair.close();
+        attachUlp(pair.server_fd) catch return error.SkipZigTest; // no CONFIG_TLS ⇒ skip
+
+        var tx_explicit: [rec_seq_len]u8 = undefined;
+        var tx_buf: [max_crypto_info_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &tx_buf);
+        const tx_info = try encodeParams(tx, &tx_explicit, &tx_buf);
+        // AES-128-GCM TLS 1.2 TX has existed since kTLS's first release (4.13): a
+        // rejection there is a real layout bug. Newer suites may be absent.
+        attachTx(pair.server_fd, tx_info) catch |e| {
+            if (suite == .aes128) return e;
+            return error.SkipZigTest;
+        };
+        var rx_explicit: [rec_seq_len]u8 = undefined;
+        var rx_buf: [max_crypto_info_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &rx_buf);
+        const rx_info = try encodeParams(rx, &rx_explicit, &rx_buf);
+        attachRx(pair.server_fd, rx_info) catch |e| {
+            if (suite == .aes128) return e;
+            return error.SkipZigTest;
+        };
+
+        // Kernel TX → userspace client engine. Each write() is one record.
+        var raw: [2 * (5 + 16 * 1024 + 256)]u8 = undefined;
+        var have: usize = 0;
+        const msgs = [_][]const u8{ "kernel record one", "kernel record two" };
+        for (msgs, 0..) |msg, i| {
+            try writeAll(pair.server_fd, msg);
+            const rec = try readRecord(pair.client_fd, &raw, &have);
+            try testing.expectEqual(@as(u8, 23), rec[0]);
+            try testing.expectEqual(@as(u16, 0x0303), std.mem.readInt(u16, rec[1..3], .big));
+            if (cipher != .chacha20_poly1305) {
+                // RFC 5288 §3 explicit nonce: the kernel continues the engine's
+                // nonce line exactly at the handoff sequence — no reuse.
+                try testing.expectEqualSlices(u8, &seqToBytes(2 + i), rec[5..13]);
+            } else {
+                try testing.expectEqual(@as(usize, 5 + msg.len + 16), rec.len);
+            }
+            const plain = try client.decrypt(rec);
+            defer allocator.free(plain);
+            try testing.expectEqualStrings(msg, plain);
+            consume(&raw, &have, rec.len);
+        }
+        try testing.expectEqual(@as(u64, 4), client.app_read_seq);
+
+        // Userspace client engine → kernel RX: plain read() returns plaintext.
+        const up = [_][]const u8{ "client record one", "client record two" };
+        for (up) |msg| {
+            const rec = try client.encrypt(msg);
+            defer allocator.free(rec);
+            try writeAll(pair.client_fd, rec);
+            var plain: [64]u8 = undefined;
+            var got: usize = 0;
+            while (got < msg.len) got += try readSome(pair.server_fd, plain[got..]);
+            try testing.expectEqualStrings(msg, plain[0..got]);
+        }
+
+        // The kernel tuples read back as the installed epoch, advanced by two
+        // records, with the GCM explicit-nonce counter locked to rec_seq.
+        var tx_live = try getTupleVersion(pair.server_fd, .tx, cipher, TLS_1_2_VERSION);
+        defer tx_live.wipe();
+        try tx_live.validateTls12Epoch(cipher, tx_info);
+        try testing.expectEqual(@as(u64, 4), tx_live.sequence());
+        var rx_live = try getTupleVersion(pair.server_fd, .rx, cipher, TLS_1_2_VERSION);
+        defer rx_live.wipe();
+        try rx_live.validateTls12Epoch(cipher, rx_info);
+        try testing.expectEqual(@as(u64, 4), rx_live.sequence());
+        // The TLS 1.3 accessor refuses a TLS 1.2 tuple.
+        try testing.expectError(error.TupleMismatch, getTuple(pair.server_fd, .tx, cipher));
+    }
+};
+
+test "kernel TLS 1.2 TX+RX interoperates with the userspace tls12 engine (AES-128-GCM)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try tls12_test.run(.aes128);
+}
+
+test "kernel TLS 1.2 TX+RX interoperates with the userspace tls12 engine (AES-256-GCM)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try tls12_test.run(.aes256);
+}
+
+test "kernel TLS 1.2 TX+RX interoperates with the userspace tls12 engine (ChaCha20-Poly1305)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try tls12_test.run(.chacha);
 }
