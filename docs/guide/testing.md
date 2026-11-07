@@ -210,7 +210,7 @@ They need external tools, so they stay out of `zig build test`.
 |---|---|---|
 | `tools/bogo.sh` | BoringSSL `ssl/test/runner`, pinned commit | Exact pass/skip baseline in `tools/bogo/expected-baseline.txt` (121 pass, 3 skip). |
 | `tools/bogo.sh -test '*'` | same | Exploratory full run, for triage. It fails while known Armor defects remain (listed below). |
-| `tools/openssl_interop.sh [onyx-server]` | system `openssl` 3.x, `s_client` and `s_server` | All 35 cases pass. |
+| `tools/openssl_interop.sh [onyx-server]` | system `openssl` 3.x, `s_client` and `s_server` | 34 cases pass and 1 is `KNOWN` (the ALPN mismatch, see below). With `ONYX_INTEROP_STRICT=1`, any `SKIP` counts as a failure. |
 | `python3 tools/browser_tls_smoke.py [onyx-server]` | headless Chromium over `wss://` | The IRC session registers, and the NetLog shows TLS 1.3 with group `X25519MLKEM768` (4588). |
 
 **BoGo.** The shim (`tools/bogo_shim.zig`) drives the daemon's `TlsConn`, the
@@ -257,11 +257,15 @@ negotiated.
 Two server behaviors show up in the output:
 
 - On an ALPN mismatch the daemon continues without selecting a protocol. RFC
-  7301 §3.2 says a server SHALL send a `no_application_protocol` alert, so this
-  leniency is recorded as observed behavior.
+  7301 §3.2 says a server SHALL send a `no_application_protocol` alert. The
+  script records this deviation as `KNOWN`. It is never counted as `PASS`, and
+  it becomes `PASS` once the engine sends the alert.
 - With no OCSP responder configured, the daemon does not staple a response.
 
-`INTEROP_KEEP=1` keeps the logs.
+A group that the local OpenSSL lacks is recorded as `SKIP`. That passes in a
+normal run but fails under `ONYX_INTEROP_STRICT=1`, which the release gate
+sets. `INTEROP_KEEP=1` keeps the logs. Relative binary paths are resolved
+against the caller's directory.
 
 **Browser.** Chromium has no Ed25519 certificate support. The smoke therefore
 issues an ECDSA leaf from a throwaway CA. It trusts that leaf only through
@@ -275,9 +279,12 @@ Welch |t| per primitive and gates at 10.
 **Release gates** in `packaging/release.sh` are all off by default. Each one
 fails closed when requested:
 
-- `ONYX_RELEASE_CT_CHECK=1` runs `zig build ct-check`.
-- `ONYX_RELEASE_INTEROP=1` runs the OpenSSL and browser lanes against the
-  freshly built artifact. The host must be able to execute the target.
+- `ONYX_RELEASE_CT_CHECK=1` runs `zig build ct-check` with the release's
+  `-Dtarget` and `-Dcpu=baseline`, so it measures the shipped code generation.
+  The host must be able to execute the target.
+- `ONYX_RELEASE_INTEROP=1` runs the OpenSSL lane in strict mode, then the
+  browser lane, against the absolute path of the freshly built artifact. The
+  host must be able to execute the target.
 - `ONYX_RELEASE_BOGO=1` runs `tools/bogo.sh`.
 
 **BoGo triage (pinned runner, 2026-11-07).** The full run gives 121 passed,

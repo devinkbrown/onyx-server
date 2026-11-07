@@ -30,14 +30,20 @@
 #                       with `zig build -Doptimize=ReleaseSafe` when missing)
 #   OPENSSL             openssl binary (default: openssl on PATH)
 #   INTEROP_KEEP=1      keep the temp dir (logs, PKI) for inspection
+#   ONYX_INTEROP_STRICT=1  release-gate mode: any SKIP is a FAIL
 #
 # Exit 0 = every required case passed. Optional cases (a group this OpenSSL
-# lacks) are reported as SKIP and never fail the run.
+# lacks) are reported as SKIP and fail the run only in strict mode. KNOWN marks
+# a documented Armor deviation from an RFC (reported, never counted as PASS).
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OPENSSL="${OPENSSL:-openssl}"
 ONYX_BIN="${1:-${ONYX_BIN:-${repo_root}/zig-out/bin/onyx-server}}"
+# The daemon is exec'd from its own temp dir, so a relative path must be
+# anchored to the caller's cwd now.
+[[ "${ONYX_BIN}" == /* ]] || ONYX_BIN="${PWD}/${ONYX_BIN}"
+STRICT="${ONYX_INTEROP_STRICT:-0}"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/onyx-openssl-interop.XXXXXX")"
 pids=()
@@ -57,15 +63,22 @@ trap cleanup EXIT
 pass=0
 fail=0
 skip=0
+known=0
 results=()
-record() { # record PASS|FAIL|SKIP "name" "detail"
-  results+=("$(printf '%-4s %-46s %s' "$1" "$2" "${3:-}")")
-  case "$1" in
+record() { # record PASS|FAIL|SKIP|KNOWN "name" "detail"
+  local status="$1" detail="${3:-}"
+  if [[ "${status}" == SKIP && "${STRICT}" == "1" ]]; then
+    status=FAIL
+    detail="${detail} (SKIP is a failure under ONYX_INTEROP_STRICT=1)"
+  fi
+  results+=("$(printf '%-5s %-46s %s' "${status}" "$2" "${detail}")")
+  case "${status}" in
     PASS) pass=$((pass + 1)) ;;
     FAIL) fail=$((fail + 1)) ;;
     SKIP) skip=$((skip + 1)) ;;
+    KNOWN) known=$((known + 1)) ;;
   esac
-  printf '[interop] %-4s %s %s\n' "$1" "$2" "${3:-}"
+  printf '[interop] %-5s %s %s\n' "${status}" "$2" "${detail}"
 }
 
 die() {
@@ -305,8 +318,10 @@ run_server_side() {
   # (-brief omits the ALPN line, so these use the full summary.)
   server_case "s_client tls1.3 ALPN irc" "ALPN protocol: irc" -tls1_3 -alpn irc
   server_case "s_client tls1.2 ALPN irc" "ALPN protocol: irc" -tls1_2 -alpn irc
-  # RFC 7301 §3.2: no overlap ⇒ the server either ignores ALPN (no protocol
-  # selected) or aborts with no_application_protocol. Record which.
+  # RFC 7301 §3.2: with no overlap the server SHALL abort with the
+  # no_application_protocol alert. Armor currently proceeds without selecting
+  # a protocol; that documented deviation is KNOWN, never PASS, and flips to
+  # PASS once the engine sends the alert.
   local alpn_out="${work}/s_client.alpn_mismatch.log"
   s_client_irc "${alpn_out}" -tls1_3 -alpn h2
   if expect_in "${alpn_out}" "no application protocol"; then
@@ -314,7 +329,7 @@ run_server_side() {
   elif expect_in "${alpn_out}" "ALPN protocol:"; then
     record FAIL "s_client tls1.3 ALPN mismatch" "server selected an unoffered protocol"
   elif grep -qE '^:[^ ]+ 001 ' "${alpn_out}"; then
-    record PASS "s_client tls1.3 ALPN mismatch" "no protocol selected; connection proceeds"
+    record KNOWN "s_client tls1.3 ALPN mismatch" "RFC 7301 §3.2 deviation: no alert; no protocol selected, connection proceeds"
   else
     record FAIL "s_client tls1.3 ALPN mismatch" "$(grep -m1 -iE 'error|alert' "${alpn_out}" | tr -d '\r')"
   fi
@@ -406,5 +421,5 @@ run_client_side
 echo
 echo "[interop] ===== summary (${ossl_version}) ====="
 printf '%s\n' "${results[@]}"
-echo "[interop] ${pass} passed; ${fail} failed; ${skip} skipped"
+echo "[interop] ${pass} passed; ${fail} failed; ${skip} skipped; ${known} known deviations"
 ((fail == 0 && pass > 0))

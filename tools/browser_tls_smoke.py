@@ -208,7 +208,9 @@ def main() -> int:
     if not chromium or not openssl:
         log("SKIP: need chromium and openssl")
         return SKIP
-    daemon = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ONYX_BIN", ROOT / "zig-out/bin/onyx-server"))
+    # Resolved now: the daemon is started with cwd=<temp dir>, where a relative
+    # path would no longer name the binary.
+    daemon = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ONYX_BIN", ROOT / "zig-out/bin/onyx-server")).resolve()
     if not daemon.is_file():
         log(f"FAIL: daemon binary not found: {daemon} (zig build -Doptimize=ReleaseSafe)")
         return 1
