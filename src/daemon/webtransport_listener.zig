@@ -143,8 +143,16 @@ const quic_transport_params = @import("../proto/quic_transport_params.zig");
 const quic_handshake = @import("../proto/quic_handshake.zig");
 const tls_resumption = @import("../crypto/tls_resumption.zig");
 
-/// Process-wide single-use guard for accepted QUIC 0-RTT binders (RFC 8446 §8).
-var quic_replay_guard: tls_resumption.ReplayGuard = .{};
+/// Process-wide time-bounded single-use guard for accepted QUIC 0-RTT binders
+/// (RFC 8446 §8). It is deliberately NOT carried across Helix: every listener
+/// construction (cold start, `initRestored`) instead arms a quiet window of one
+/// replay-retention period during which all 0-RTT is rejected (the handshake
+/// still resumes at 1-RTT), so a flight captured before the restart cannot be
+/// replayed into the new process (`armEarlyDataQuietWindow`).
+var quic_replay_guard: quic_handshake.EarlyDataReplayGuard = .{};
+/// RFC 8446 §8.3 ticket-age tolerance used for QUIC 0-RTT; also sizes the
+/// replay guard's retention and the post-restart quiet window.
+const quic_early_data_skew_ms: u32 = 10_000;
 const proxy_protocol = @import("../proto/proxy_protocol.zig");
 const media_socket = @import("../substrate/media_socket.zig");
 const dualstack_udp = @import("dualstack_udp.zig");
@@ -355,13 +363,17 @@ pub const WebTransportListener = struct {
     quic_previous_ticket_key: ?[32]u8 = null,
     quic_ticket_lifetime_seconds: u32 = 86_400,
     /// 0-RTT (RFC 9001 §4.6). OFF by default; needs `quic_ticket_key` too.
-    /// The replay guard is process-wide (`quic_replay_guard`); multi-node
-    /// replay protection still relies on the ticket-age window.
+    /// The replay guard is process-wide (`quic_replay_guard`, time-bounded,
+    /// with a post-start quiet window); it is per node, so multi-node replay
+    /// protection needs a per-node ticket key (RFC 8446 §8 / RFC 9001 §9.2).
+    /// NOTE: no config loader sets the `quic_*` / `stateless_reset_key`
+    /// fields yet and they are not carried in `Snapshot` (integrator work).
     quic_enable_early_data: bool = false,
     /// Server key-exchange group order (HRR + key_share choice).
     quic_group_order: []const quic_handshake.KeyExchangeGroup = &quic_handshake.default_group_order,
 
     pub fn init(allocator: std.mem.Allocator, tls: TlsConfig, irc_port: u16) WebTransportListener {
+        armEarlyDataQuietWindow(wallClockSeconds());
         return .{ .allocator = allocator, .tls = tls, .irc_port = irc_port };
     }
 
@@ -1157,7 +1169,7 @@ pub const WebTransportListener = struct {
     /// The process-wide 0-RTT replay guard. A global (not a listener field)
     /// so listener struct copies across Helix/candidate handling never alias
     /// or double-free it; it is internally synchronized.
-    fn replayGuard(_: *WebTransportListener) ?*tls_resumption.ReplayGuard {
+    fn replayGuard(_: *WebTransportListener) ?*quic_handshake.EarlyDataReplayGuard {
         return &quic_replay_guard;
     }
 
@@ -1565,7 +1577,7 @@ pub const WebTransportListener = struct {
         // closes with TRANSPORT_PARAMETER_ERROR (0x08) if it is missing/wrong —
         // both must point at the stable per-connection storage above.
         const reset_key = self.staticResetKey();
-        const early_guard: ?*tls_resumption.ReplayGuard = if (self.quic_enable_early_data and self.quic_ticket_key != null) self.replayGuard() else null;
+        const early_guard: ?*quic_handshake.EarlyDataReplayGuard = if (self.quic_enable_early_data and self.quic_ticket_key != null) self.replayGuard() else null;
         qconn.* = quic_conn.Conn.initServer(self.allocator, .{
             .cert_chain = self.tls.cert_chain,
             .signing_key = self.tls.signing_key,
@@ -1582,6 +1594,7 @@ pub const WebTransportListener = struct {
             .now_unix_seconds = wallClockSeconds(),
             .enable_early_data = early_guard != null,
             .replay_guard = early_guard,
+            .early_data_age_skew_ms = quic_early_data_skew_ms,
         }) catch {
             self.allocator.destroy(qconn);
             self.allocator.destroy(conn);
@@ -1730,6 +1743,14 @@ fn deriveResetKeyFromSigningKey(key: quic_handshake.SigningKey) [32]u8 {
         },
     };
     return quic_retry.deriveStaticResetKey(ikm);
+}
+
+/// Reject all QUIC 0-RTT for one replay-retention window from `now_s`: this
+/// process's guard has not seen what a predecessor (crashed process or Helix
+/// source) accepted, and a replay of such a flight can pass the ticket-age
+/// check for up to 2·skew after its first acceptance (RFC 8446 §8.3).
+fn armEarlyDataQuietWindow(now_s: i64) void {
+    quic_replay_guard.refuseUntil(now_s + quic_handshake.EarlyDataReplayGuard.retentionSeconds(quic_early_data_skew_ms));
 }
 
 /// Wall-clock Unix seconds for ticket issue/expiry (the QUIC engine reads no
@@ -3053,6 +3074,24 @@ test "stateless reset — tokens come from a static key and are advertised in th
     // Resumption and 0-RTT are off unless configured.
     try testing.expect(conn.conn.handshake.server.config.ticket_key == null);
     try testing.expect(!conn.conn.handshake.server.config.enable_early_data);
+}
+
+test "0-RTT replay guard — every listener construction (cold start or Helix initRestored) arms a quiet window" {
+    const now = wallClockSeconds();
+    var fx: PolicyFixture = undefined;
+    try fx.init(.never);
+    defer fx.deinit();
+    const retention = quic_handshake.EarlyDataReplayGuard.retentionSeconds(quic_early_data_skew_ms);
+    // A binder a predecessor process accepted is unknown to this guard; it is
+    // still refused for the whole window in which its replay could pass the
+    // ticket-age check.
+    var binder: [32]u8 = @splat(0xc3);
+    std.mem.writeInt(i64, binder[0..8], now, .little);
+    try testing.expect(!quic_replay_guard.checkAndRecord(&binder, now, retention));
+    try testing.expect(!quic_replay_guard.checkAndRecord(&binder, now + retention - 1, retention));
+    // After the window the guard works normally (single use).
+    try testing.expect(quic_replay_guard.checkAndRecord(&binder, now + retention + 1, retention));
+    try testing.expect(!quic_replay_guard.checkAndRecord(&binder, now + retention + 1, retention));
 }
 
 // ===========================================================================

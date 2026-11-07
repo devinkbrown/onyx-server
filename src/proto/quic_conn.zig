@@ -327,7 +327,7 @@ pub const ServerConfig = struct {
     ticket_lifetime_seconds: u32 = 86_400,
     now_unix_seconds: ?i64 = null,
     enable_early_data: bool = false,
-    replay_guard: ?*@import("../crypto/tls_resumption.zig").ReplayGuard = null,
+    replay_guard: ?*quic_handshake.EarlyDataReplayGuard = null,
     early_data_age_skew_ms: u32 = 10_000,
     stateless_reset_token: ?[16]u8 = null,
 };
@@ -856,6 +856,14 @@ pub const ConnSnapshot = struct {
         // ready when captured by this version (48-byte current secrets in the
         // handshake ap-secret slots) or idle when captured by a version that
         // had no SHA-384 key update; restore seeds the latter at generation 0.
+        // Compatibility is one-way by design: the wire schema is unchanged,
+        // but a binary predating SHA-384 key update requires `ready == false`
+        // for this suite and so fails closed (aborting the transactional
+        // adopt) on any live TLS_AES_256_GCM_SHA384 connection captured here.
+        // Emitting the legacy idle form instead would drop the §6.6 AEAD
+        // confidentiality-limit counters across each such handoff, so Helix
+        // DOWNGRADE across this change is unsupported for SHA-384 connections
+        // (SHA-384 is chosen only when the client does not offer AES-128-GCM).
         const wide = self.handshake.suite == .tls_aes_256_gcm_sha384;
         if (!wide and !self.key_update.ready)
             return invalidServerSnapshot("key update readiness");
@@ -5262,7 +5270,7 @@ test "quic conn 0-RTT — accepted early STREAM data is delivered; a replayed fl
     const alloc = testing.allocator;
     var fp: FeatPair = undefined;
     try fp.init();
-    var guard: @import("../crypto/tls_resumption.zig").ReplayGuard = .{};
+    var guard: quic_handshake.EarlyDataReplayGuard = .{};
     var scfg = fp.serverConfig();
     scfg.enable_early_data = true;
     scfg.replay_guard = &guard;
@@ -5311,7 +5319,7 @@ test "quic conn 0-RTT — a forbidden frame in a 0-RTT packet is a PROTOCOL_VIOL
     const alloc = testing.allocator;
     var fp: FeatPair = undefined;
     try fp.init();
-    var guard: @import("../crypto/tls_resumption.zig").ReplayGuard = .{};
+    var guard: quic_handshake.EarlyDataReplayGuard = .{};
     var scfg = fp.serverConfig();
     scfg.enable_early_data = true;
     scfg.replay_guard = &guard;

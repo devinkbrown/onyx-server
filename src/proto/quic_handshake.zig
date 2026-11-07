@@ -61,7 +61,8 @@
 //!     the server's remembered transport parameters and ALPN (RFC 9000 §7.4.1).
 //!     Early data is accepted only for the first PSK, inside the ticket-age
 //!     window, with unchanged ALPN, no reduced limits, and a fresh binder in the
-//!     replay guard; otherwise it is *rejected* (EncryptedExtensions omits
+//!     time-bounded `EarlyDataReplayGuard` (no entry is evicted while a replay
+//!     of it could still pass the age check); otherwise it is *rejected* (EncryptedExtensions omits
 //!     `early_data`) and the handshake continues at 1-RTT.
 //!
 //! Intentionally deferred (out of scope): client certificates / mTLS, psk_ke
@@ -174,6 +175,99 @@ pub const max_ticket_lifetime_seconds: u32 = 604_800;
 /// RFC 9001 §4.6.1: a QUIC server that permits 0-RTT sends `early_data` with
 /// `max_early_data_size` 0xffffffff; any other value is a PROTOCOL_VIOLATION.
 pub const quic_max_early_data_size: u32 = 0xffff_ffff;
+
+/// Time-bounded single-use guard for accepted QUIC 0-RTT binders (RFC 8446
+/// §8, RFC 9001 §9.2). Unlike a plain FIFO it never evicts an entry while a
+/// replay of it could still pass the ticket-age check: a ClientHello accepted
+/// at time T with |reported - measured| <= skew can only pass again while the
+/// measured age has drifted by at most 2·skew, so every entry is retained for
+/// `retentionSeconds(skew)`. When the ring is full of live entries, early data
+/// is *rejected* (the handshake still resumes at 1-RTT, RFC 8446 §4.2.10), so
+/// flooding the guard can only deny 0-RTT, never re-admit an evicted binder.
+///
+/// A fresh guard (process start, Helix successor) has forgotten what its
+/// predecessor accepted; `refuseUntil` makes it reject all early data for one
+/// retention window so a flight captured before the restart cannot be
+/// replayed into the new process.
+///
+/// Internally synchronized (spin/yield mutex) so one guard can be shared by
+/// every reactor thread; it reads no clock (the caller passes Unix seconds).
+pub const EarlyDataReplayGuard = EarlyDataReplayGuardType(2048);
+
+pub fn EarlyDataReplayGuardType(comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+        pub const capacity: usize = cap;
+        pub const max_binder_len: usize = max_hash_len;
+
+        mutex: std.atomic.Mutex = .unlocked,
+        binders: [cap][max_binder_len]u8 = @splat(@splat(0)),
+        lens: [cap]u8 = @splat(0),
+        inserted_s: [cap]i64 = @splat(0),
+        /// Ring index of the oldest live entry.
+        head: usize = 0,
+        count: usize = 0,
+        /// All early data is rejected while `now_s < not_before_s`.
+        not_before_s: i64 = std.math.minInt(i64),
+
+        /// Seconds an accepted binder must be remembered for a given ticket-age
+        /// skew: 2·skew (rounded up to whole seconds, the caller's clock unit)
+        /// plus 2 s for second-granularity truncation at both observations.
+        pub fn retentionSeconds(skew_ms: u32) i64 {
+            const skew_s: i64 = @divFloor(@as(i64, skew_ms) + 999, 1000);
+            return 2 * skew_s + 2;
+        }
+
+        /// Reject all early data until `deadline_s` (monotone: never shortens).
+        pub fn refuseUntil(self: *Self, deadline_s: i64) void {
+            lockSpin(&self.mutex);
+            defer self.mutex.unlock();
+            if (deadline_s > self.not_before_s) self.not_before_s = deadline_s;
+        }
+
+        /// True when `binder` is fresh, the guard is not in its post-restart
+        /// quiet window, and a slot is free (or the oldest entry is past
+        /// `retention_s`); the binder is then recorded. False rejects early
+        /// data: a replay, a malformed binder, a quiet window, or a guard full
+        /// of unexpired entries. A wall clock that steps backwards keeps
+        /// entries alive longer (fail closed).
+        pub fn checkAndRecord(self: *Self, binder: []const u8, now_s: i64, retention_s: i64) bool {
+            if (binder.len == 0 or binder.len > max_binder_len) return false;
+            lockSpin(&self.mutex);
+            defer self.mutex.unlock();
+            if (now_s < self.not_before_s) return false;
+            var i: usize = 0;
+            while (i < self.count) : (i += 1) {
+                const slot = (self.head + i) % cap;
+                if (self.lens[slot] == binder.len and
+                    std.crypto.timing_safe.eql([max_binder_len]u8, padBinder(self.binders[slot][0..binder.len]), padBinder(binder)))
+                    return false;
+            }
+            if (self.count == cap) {
+                if (now_s - self.inserted_s[self.head] <= retention_s) return false;
+                self.head = (self.head + 1) % cap;
+                self.count -= 1;
+            }
+            const slot = (self.head + self.count) % cap;
+            std.crypto.secureZero(u8, &self.binders[slot]);
+            @memcpy(self.binders[slot][0..binder.len], binder);
+            self.lens[slot] = @intCast(binder.len);
+            self.inserted_s[slot] = now_s;
+            self.count += 1;
+            return true;
+        }
+
+        fn padBinder(b: []const u8) [max_binder_len]u8 {
+            var out: [max_binder_len]u8 = @splat(0);
+            @memcpy(out[0..b.len], b);
+            return out;
+        }
+    };
+}
+
+fn lockSpin(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.Thread.yield() catch {};
+}
 
 /// Upper bound on PSK identities examined per ClientHello (each costs one
 /// ticket AEAD open). Identities past this are ignored, never an error.
@@ -332,9 +426,10 @@ pub const Config = struct {
     /// Allow 0-RTT (RFC 9001 §4.6). OFF by default; also requires a
     /// `replay_guard` and `now_unix_seconds` or early data is always rejected.
     enable_early_data: bool = false,
-    /// Shared single-use binder guard (RFC 8446 §8). Borrowed; must outlive the
-    /// handshake and be shared by every connection that accepts 0-RTT.
-    replay_guard: ?*tls_resumption.ReplayGuard = null,
+    /// Shared time-bounded single-use binder guard (RFC 8446 §8). Borrowed;
+    /// must outlive the handshake and be shared by every connection that
+    /// accepts 0-RTT. A full guard rejects (never fails) early data.
+    replay_guard: ?*EarlyDataReplayGuard = null,
     /// RFC 8446 §8.3 ticket-age freshness tolerance for 0-RTT, milliseconds.
     early_data_age_skew_ms: u32 = 10_000,
     /// The stateless-reset token for this connection's server CID (RFC 9000
@@ -943,7 +1038,7 @@ pub const Server = struct {
             const was = std.mem.readInt(u64, state[base + i * 8 ..][0..8], .big);
             if (cur < was) return false;
         }
-        return guard.checkAndRecord(binder);
+        return guard.checkAndRecord(binder, now_s, EarlyDataReplayGuard.retentionSeconds(self.config.early_data_age_skew_ms));
     }
 
     /// RFC 8446 §8.3: the client's reported ticket age (un-obfuscated with the
@@ -3773,7 +3868,7 @@ test "quic resumption composes with HRR: the ClientHello2 binder covers message_
     try testing.expect(server.isResumed());
 }
 
-fn earlyConfig(fs: *const FeatServer, guard: *tls_resumption.ReplayGuard) Config {
+fn earlyConfig(fs: *const FeatServer, guard: *EarlyDataReplayGuard) Config {
     var cfg = fs.config();
     cfg.enable_early_data = true;
     cfg.replay_guard = guard;
@@ -3800,7 +3895,7 @@ test "quic 0-RTT: accepted once with matching early keys; a replayed ClientHello
     const alloc = testing.allocator;
     var fs: FeatServer = undefined;
     try fs.init();
-    var guard: tls_resumption.ReplayGuard = .{};
+    var guard: EarlyDataReplayGuard = .{};
     const cfg = earlyConfig(&fs, &guard);
     const owned = try featIssueSession(alloc, cfg);
     // RFC 9001 §4.6.1: the ticket advertises 0xffffffff.
@@ -3830,11 +3925,115 @@ test "quic 0-RTT: accepted once with matching early keys; a replayed ClientHello
     try testing.expect(s2.earlyDataReadKeys() == null);
 }
 
+test "quic EarlyDataReplayGuard: a flood of capacity+1 fresh binders cannot evict a live binder" {
+    const G = EarlyDataReplayGuardType(8);
+    var g: G = .{};
+    const retention = G.retentionSeconds(10_000);
+    try testing.expectEqual(@as(i64, 22), retention);
+    const t0: i64 = 1_000_000;
+    const victim: [32]u8 = @splat(0x5a);
+    try testing.expect(g.checkAndRecord(&victim, t0, retention));
+    // The attacker fills every remaining slot, then keeps going.
+    var i: u8 = 0;
+    while (i < G.capacity) : (i += 1) {
+        var b: [32]u8 = @splat(0);
+        b[0] = i;
+        b[1] = 1;
+        const fresh = g.checkAndRecord(&b, t0 + 1, retention);
+        try testing.expectEqual(i < G.capacity - 1, fresh); // full => reject
+    }
+    // The victim's binder is still remembered: its replay is rejected for the
+    // whole window in which the ticket-age check could still pass.
+    try testing.expect(!g.checkAndRecord(&victim, t0 + 1, retention));
+    try testing.expect(!g.checkAndRecord(&victim, t0 + retention, retention));
+    // A legitimate fresh binder is rejected (1-RTT fallback) while full.
+    const other: [48]u8 = @splat(0x77);
+    try testing.expect(!g.checkAndRecord(&other, t0 + retention, retention));
+    // Once the oldest entry is past retention it is recycled; by then a
+    // replay of it fails the ticket-age check anyway.
+    try testing.expect(g.checkAndRecord(&other, t0 + retention + 1, retention));
+    try testing.expect(!g.checkAndRecord(&other, t0 + retention + 1, retention));
+    // Malformed binders never pass.
+    try testing.expect(!g.checkAndRecord("", t0 + 100, retention));
+    const long: [49]u8 = @splat(1);
+    try testing.expect(!g.checkAndRecord(&long, t0 + 100, retention));
+}
+
+test "quic EarlyDataReplayGuard: refuseUntil rejects all early data for the quiet window and never shortens" {
+    var g: EarlyDataReplayGuard = .{};
+    const retention = EarlyDataReplayGuard.retentionSeconds(10_000);
+    const b: [32]u8 = @splat(3);
+    g.refuseUntil(500 + retention);
+    g.refuseUntil(400); // an earlier deadline does not shorten the window
+    try testing.expect(!g.checkAndRecord(&b, 500, retention));
+    try testing.expect(!g.checkAndRecord(&b, 500 + retention - 1, retention));
+    // Nothing was recorded during the quiet window.
+    try testing.expect(g.checkAndRecord(&b, 500 + retention, retention));
+    try testing.expect(!g.checkAndRecord(&b, 500 + retention, retention));
+}
+
+test "quic 0-RTT: flooding the replay guard with valid hellos cannot re-admit a captured ClientHello" {
+    const alloc = testing.allocator;
+    var fs: FeatServer = undefined;
+    try fs.init();
+    var guard: EarlyDataReplayGuard = .{};
+    const cfg = earlyConfig(&fs, &guard);
+    const now = cfg.now_unix_seconds.?;
+    const owned = try featIssueSession(alloc, cfg);
+
+    var client = try featClient(alloc, .{ .session = owned.get(), .ticket_age_ms = 5, .offer_early_data = true });
+    defer client.deinit();
+    try client.startHandshake();
+    const ch = try client.takeFlight(.initial);
+    defer alloc.free(ch);
+    var s1 = try Server.init(alloc, cfg);
+    defer s1.deinit();
+    try s1.feedCrypto(.initial, ch);
+    try testing.expect(s1.earlyDataAccepted());
+
+    // The attacker's flood: capacity distinct accepted binders in the window
+    // (equivalent to that many valid early-data hellos on its own ticket).
+    const retention = EarlyDataReplayGuard.retentionSeconds(cfg.early_data_age_skew_ms);
+    var n: usize = 0;
+    var flooded: usize = 0;
+    while (n < EarlyDataReplayGuard.capacity) : (n += 1) {
+        var b: [32]u8 = @splat(0xee);
+        std.mem.writeInt(u64, b[0..8], n, .little);
+        if (guard.checkAndRecord(&b, now, retention)) flooded += 1;
+    }
+    try testing.expectEqual(EarlyDataReplayGuard.capacity - 1, flooded);
+
+    // The captured hello is replayed: 0-RTT rejected, handshake still resumes.
+    var s2 = try Server.init(alloc, cfg);
+    defer s2.deinit();
+    try s2.feedCrypto(.initial, ch);
+    try testing.expect(s2.isResumed());
+    try testing.expect(!s2.earlyDataAccepted());
+    try testing.expect(s2.earlyDataReadKeys() == null);
+
+    // A fresh legitimate 0-RTT attempt is also rejected (not failed) while
+    // the guard is full of unexpired entries.
+    const fresh = try featOffer0Rtt(alloc, cfg, owned.get(), 7);
+    try testing.expect(!fresh.accepted and fresh.resumed);
+}
+
+test "quic 0-RTT is rejected (handshake resumes) during the guard's post-restart quiet window" {
+    const alloc = testing.allocator;
+    var fs: FeatServer = undefined;
+    try fs.init();
+    var guard: EarlyDataReplayGuard = .{};
+    const cfg = earlyConfig(&fs, &guard);
+    const owned = try featIssueSession(alloc, cfg);
+    guard.refuseUntil(cfg.now_unix_seconds.? + 1);
+    const r = try featOffer0Rtt(alloc, cfg, owned.get(), 0);
+    try testing.expect(!r.accepted and r.resumed);
+}
+
 test "quic 0-RTT is off by default, needs a replay guard, and checks ticket age" {
     const alloc = testing.allocator;
     var fs: FeatServer = undefined;
     try fs.init();
-    var guard: tls_resumption.ReplayGuard = .{};
+    var guard: EarlyDataReplayGuard = .{};
     const owned = try featIssueSession(alloc, earlyConfig(&fs, &guard));
     // Default config (enable_early_data = false) rejects.
     const off = try featOffer0Rtt(alloc, fs.config(), owned.get(), 0);
@@ -3861,7 +4060,7 @@ test "quic 0-RTT is rejected when remembered transport parameters would shrink o
     const alloc = testing.allocator;
     var fs: FeatServer = undefined;
     try fs.init();
-    var guard: tls_resumption.ReplayGuard = .{};
+    var guard: EarlyDataReplayGuard = .{};
     const cfg = earlyConfig(&fs, &guard);
     const owned = try featIssueSession(alloc, cfg);
 
@@ -3890,7 +4089,7 @@ test "quic 0-RTT: early_data in ClientHello2 after an HRR aborts (RFC 8446 §4.1
     const alloc = testing.allocator;
     var fs: FeatServer = undefined;
     try fs.init();
-    var guard: tls_resumption.ReplayGuard = .{};
+    var guard: EarlyDataReplayGuard = .{};
     const cfg = earlyConfig(&fs, &guard);
     const owned = try featIssueSession(alloc, cfg);
     var server = try Server.init(alloc, cfg);
