@@ -342,6 +342,7 @@ const thread_snapshot = @import("helix/thread_snapshot.zig");
 const schedule_snapshot = @import("helix/schedule_snapshot.zig");
 const cron = @import("../substrate/cron.zig");
 const mesh_redial = @import("helix/mesh_redial.zig");
+const mesh_presence_hot_checkpoint = @import("helix/mesh_presence_hot_checkpoint.zig");
 const mesh_clock_snapshot = @import("helix/mesh_clock_snapshot.zig");
 const tls_server = @import("../crypto/tls_server.zig");
 const tls12_server = @import("../crypto/tls12_server.zig");
@@ -5572,6 +5573,9 @@ pub const LinuxServer = struct {
     test_session_retry_ping: if (builtin.is_test) u8 else void = if (builtin.is_test) 0 else {},
     test_issuer_finish_owner: if (builtin.is_test) ?client_model.ClientId else void = if (builtin.is_test) null else {},
     linux_inherited_guest_lease_fd: ?linux.fd_t = null,
+    /// Inherited exclusive WAL lease of the durable mesh presence authority,
+    /// bound only after its HXMP checkpoint decoded (Linux Helix successor).
+    linux_inherited_presence_lease_fd: ?linux.fd_t = null,
     inherited_disposal_receipt: ?*InheritedDisposalReceipt = null,
     local_guest_directory: ?std.Io.Dir = null,
     local_guest_io: ?std.Io = null,
@@ -5634,6 +5638,10 @@ pub const LinuxServer = struct {
     /// this owner is the persistence source for guest identities and lifecycle
     /// transitions; it holds the WAL lease for the server lifetime.
     durable_guest_presence: ?mesh_presence_authority.Authority = null,
+    /// Linux Helix successor: the configured presence store must be adopted
+    /// from the carried HXMP checkpoint and lease, never cold-opened (which
+    /// would advance the issuer epoch). Cleared only at the adopt commit edge.
+    mesh_presence_hot_pending: bool = false,
     /// Next runtime guest counter. The on-wire epoch stays 1 for this process.
     guest_serial: u64 = 0,
     /// Immutable sorted event-time membership used by RVL2: this node plus the
@@ -6852,11 +6860,20 @@ pub const LinuxServer = struct {
                 return error.MissingMeshPresenceStorePath;
         }
         var durable_guest_presence: ?mesh_presence_authority.Authority = null;
+        var mesh_presence_hot_pending = false;
         if (config.mesh_presence_store_path.len != 0) {
             const identity = config.node_identity orelse return error.MeshPresenceIdentityRequired;
-            if (config.resume_arena_fd != null or config.native_arena_bytes != null or config.inherited_state_fd_manifest_present)
-                return error.MeshPresenceHotCheckpointRequired;
-            durable_guest_presence = try openDurableGuestPresence(allocator, config, identity);
+            const hot = config.resume_arena_fd != null or config.native_arena_bytes != null or config.inherited_state_fd_manifest_present;
+            if (hot) {
+                // Only the Linux same-PID successor carries the HXMP checkpoint
+                // and lease; it stages the authority inside adoption.
+                if (builtin.os.tag != .linux or config.resume_arena_fd == null or config.native_arena_bytes != null)
+                    return error.MeshPresenceHotCheckpointRequired;
+                mesh_presence_hot_pending = true;
+            } else {
+                durable_guest_presence = try openDurableGuestPresence(allocator, config, identity);
+                srvLog("onyx-server: mesh presence authority opened cold (issuer epoch {d})\n", .{durable_guest_presence.?.metadata.epoch});
+            }
         }
         errdefer if (durable_guest_presence) |*authority| authority.deinit();
         const durable_plan = try validateDurableDeviceBoot(config);
@@ -7213,6 +7230,7 @@ pub const LinuxServer = struct {
             .mesh_dials = mesh_dials,
             .mesh_trusted_node_keys = mesh_trusted_node_keys,
             .durable_guest_presence = durable_guest_presence,
+            .mesh_presence_hot_pending = mesh_presence_hot_pending,
             .relay_v2_required_nodes = relay_v2_required_nodes,
             .relay_v2_pressure = relay_v2_pressure,
             .session_group_roster_keys = session_group_roster_keys,
@@ -7843,6 +7861,38 @@ pub const LinuxServer = struct {
             }
         }
     };
+
+    /// Stage the durable mesh presence authority from the carried HXMP
+    /// checkpoint. Consumes only a verified CLOEXEC duplicate of the inherited
+    /// lease; the original is retired at the adopt commit edge. Performs no
+    /// WAL creation, repair, epoch advance or mutation.
+    fn stageMeshPresenceAuthority(self: *LinuxServer, carried: ?mesh_presence_hot_checkpoint.Carried) !?mesh_presence_authority.HotAuthorityStage {
+        const image = carried orelse {
+            if (self.mesh_presence_hot_pending or self.config.mesh_presence_store_path.len != 0) return error.InvalidInheritedHandoff;
+            return null;
+        };
+        if (comptime builtin.os.tag != .linux) return error.Unsupported;
+        if (!self.mesh_presence_hot_pending or self.durable_guest_presence != null) return error.InvalidInheritedHandoff;
+        const io = self.config.crypto_io orelse return error.InvalidRuntime;
+        const identity = self.config.node_identity orelse return error.MeshPresenceIdentityRequired;
+        if (image.lease_fd_index >= self.config.inherited_state_fds.len) return error.InvalidInheritedHandoff;
+        const lease_fd = self.config.inherited_state_fds[image.lease_fd_index];
+        if (self.linux_inherited_presence_lease_fd != lease_fd) return error.InvalidInheritedHandoff;
+        const context: mesh_presence_retained.LocalContext = .{ .origin = identity.sign_kp.public_key, .realm = identity.realm };
+        const duplicate: std.Io.File = .{ .handle = try os_runtime.duplicate(lease_fd), .flags = .{ .nonblocking = false } };
+        // prepare() owns `duplicate` from entry, including on every error.
+        return try mesh_presence_authority.HotAuthorityStage.prepare(
+            self.allocator,
+            io,
+            std.Io.Dir.cwd(),
+            self.config.mesh_presence_store_path,
+            context,
+            duplicate,
+            image.checkpoint,
+            &identity.sign_kp,
+            .{},
+        );
+    }
 
     fn stageLocalGuestIssuer(self: *LinuxServer, active: ?local_guest_issuer_capsule.Active, remaps: []const attachment_delivery_spool.AttachmentRemap) !StagedLocalGuestIssuer {
         var staged: StagedLocalGuestIssuer = .{ .server = self };
@@ -40893,12 +40943,19 @@ pub const LinuxServer = struct {
             if (scan.note(.pending_fabric_output)) return;
             break;
         };
-        // The durable mesh presence authority has no Helix carry yet: a successor
-        // refuses to boot with an inherited arena while it is configured
-        // (`MeshPresenceHotCheckpointRequired`). Refuse here, before exec, so
-        // the predecessor keeps serving instead of every client dropping.
-        if (self.durable_guest_presence != null or self.config.mesh_presence_store_path.len != 0)
+        // Linux carries the durable mesh presence authority as an HXMP
+        // checkpoint plus its WAL lease. Native (OpenBSD/Windows) successors
+        // still refuse it (`MeshPresenceHotCheckpointRequired`), so refuse
+        // there before exec. A Linux authority must also be hot-capturable
+        // now; a pending successor adoption is never resealed.
+        if (builtin.os.tag != .linux) {
+            if (self.durable_guest_presence != null or self.config.mesh_presence_store_path.len != 0)
+                if (scan.note(.mesh_presence_store)) return;
+        } else if (self.mesh_presence_hot_pending or
+            (self.config.mesh_presence_store_path.len != 0 and self.durable_guest_presence == null))
+        {
             if (scan.note(.mesh_presence_store)) return;
+        }
         // DROP reservations are RAM-only two-owner latches. Refuse rather than
         // serializing a half-committed identity transfer into the successor.
         if (self.session_drop_journal.activeCount() != 0) if (scan.note(.session_drop_transaction)) return;
@@ -40967,7 +41024,7 @@ pub const LinuxServer = struct {
         return switch (blocker) {
             .session_drop_transaction => "SESSION DROP transaction",
             .local_guest_issuer => "local guest issuer and unpublished physical bindings",
-            .mesh_presence_store => "durable mesh presence store (no Helix carry yet)",
+            .mesh_presence_store => "durable mesh presence store (not hot-capturable on this platform or state)",
             .remote_visible_identity => "remote visible identity and physical notification frontiers",
             .pending_remote_membership => "pending authenticated membership proposal",
             .pending_fabric_output => "accepted fabric delivery awaiting physical custody",
@@ -41966,10 +42023,32 @@ pub const LinuxServer = struct {
             self.deferredUpgradeNotice(request, "UPGRADE refused: a Windows accepted socket has not reached its owner slab");
             return error.UpgradeSocketOwnerNotQuiesced;
         }
+        // Durable mesh presence authority: exact hot checkpoint at this parked
+        // cut plus one duplicate of its exclusive WAL lease. The duplicate is
+        // closed on every refusal (exec never returns on success); the
+        // original stays with the serving authority. Declared before the
+        // carried-fd hygiene defer so that defer runs first.
+        var presence_lease_dup: ?linux.fd_t = null;
+        defer if (presence_lease_dup) |fd| closeFd(fd);
+        var presence_checkpoint: ?mesh_presence_authority.HotCheckpoint = null;
+        if (comptime builtin.os.tag == .linux) {
+            if (self.durable_guest_presence) |*authority| {
+                presence_checkpoint = authority.captureHotCheckpoint() catch |err| {
+                    srvLog("onyx-server: UPGRADE refused — mesh presence store hot checkpoint failed ({s})\n", .{@errorName(err)});
+                    self.deferredUpgradeNotice(request, "UPGRADE refused: mesh presence store is not at a hot checkpoint boundary");
+                    return err;
+                };
+                presence_lease_dup = os_runtime.duplicate(authority.lease.handle) catch |err| {
+                    self.deferredUpgradeNotice(request, "UPGRADE refused: mesh presence lease could not be duplicated");
+                    return err;
+                };
+            } else if (self.config.mesh_presence_store_path.len != 0) return error.UpgradeSocketOwnerNotQuiesced;
+        }
         var total_slots: usize = 0;
         for (self.reactors) |*r| total_slots += r.clients.slots.items.len;
         if (linux_webtransport_body) |body| total_slots += 1 + body.bridges.len;
         if (frozen_guest.lease != null) total_slots = try std.math.add(usize, total_slots, 1);
+        if (presence_lease_dup != null) total_slots = try std.math.add(usize, total_slots, 1);
         const carried_fds = try self.allocator.alloc(linux.fd_t, total_slots);
         defer self.allocator.free(carried_fds);
         var carried_fd_count: usize = 0;
@@ -41985,6 +42064,13 @@ pub const LinuxServer = struct {
                 carried_fd_count += 1;
             }
         } else if (frozen_guest.lease != null) return error.Unsupported;
+        var presence_lease_index: ?u32 = null;
+        if (presence_lease_dup) |fd| {
+            presence_lease_index = @intCast(carried_fd_count);
+            if (!setCloexec(fd, false)) return error.UpgradeSocketOwnerNotQuiesced;
+            carried_fds[carried_fd_count] = fd;
+            carried_fd_count += 1;
+        }
         if (linux_webtransport_body) |body| {
             if (!setCloexec(body.udp_fd, false)) return error.UpgradeSocketOwnerNotQuiesced;
             carried_fds[carried_fd_count] = body.udp_fd;
@@ -42013,6 +42099,11 @@ pub const LinuxServer = struct {
         }
         try self.sealPhysicalConnectionRelation(&pieces, &blobs, carried_fds[0..carried_fd_count]);
         try self.sealFrozenGuestIssuer(&frozen_guest, &pieces, &blobs, guest_lease_index);
+        var presence_wire: [mesh_presence_hot_checkpoint.encoded_len]u8 = undefined;
+        if (presence_checkpoint) |checkpoint| {
+            presence_wire = try mesh_presence_hot_checkpoint.encode(.{ .lease_fd_index = presence_lease_index.?, .checkpoint = checkpoint });
+            try pieces.append(self.allocator, .{ .kind = .mesh_checkpoint, .bytes = &presence_wire, .min_supported = 2 });
+        }
         try self.validateSealedAttachedPhysicalRelations(pieces.items, carried_fds[0..carried_fd_count]);
         const tls_carried = seal_counts.tls;
         const ws_carried = seal_counts.ws;
@@ -42288,6 +42379,7 @@ pub const LinuxServer = struct {
         self.config.inherited_state_fd_manifest_valid = false;
         self.linux_inherited_webtransport_udp_fd = null;
         self.linux_inherited_guest_lease_fd = null;
+        self.linux_inherited_presence_lease_fd = null;
     }
 
     const InheritedStateFdClaims = struct {
@@ -42546,8 +42638,10 @@ pub const LinuxServer = struct {
                 (structural_only or self.linux_inherited_webtransport_udp_fd == fd);
             const guest_lease_allowed = builtin.os.tag == .linux and self.config.guest_issuer_path.len != 0 and
                 (structural_only or self.linux_inherited_guest_lease_fd == fd) and self.inheritedStateFdIsRegular(fd);
+            const presence_lease_allowed = builtin.os.tag == .linux and self.config.mesh_presence_store_path.len != 0 and
+                (structural_only or self.linux_inherited_presence_lease_fd == fd) and self.inheritedStateFdIsRegular(fd);
             if (fd == arena_fd or (!inheritedStateFdIsConnectedStreamSocket(fd) and
-                !(datagram_allowed and inheritedStateFdIsBoundDatagram(fd)) and !guest_lease_allowed)) return false;
+                !(datagram_allowed and inheritedStateFdIsBoundDatagram(fd)) and !guest_lease_allowed and !presence_lease_allowed)) return false;
             if (self.config.inherited_listener_fd) |listener_fd| {
                 if (fd == listener_fd) return false;
             }
@@ -42953,6 +43047,42 @@ pub const LinuxServer = struct {
             self.linux_inherited_guest_lease_fd = self.config.inherited_state_fds[active.lease_fd_index];
         } else if (self.config.guest_issuer_path.len != 0 or self.local_guest_bindings != null) {
             self.abandonInheritedSessionState(caps, arena_fd, "configured guest issuer state is absent");
+            return error.InvalidInheritedHandoff;
+        }
+        // Durable mesh presence authority (HXMP). Exactly one checkpoint iff the
+        // store is configured; it binds one exact inherited regular lease fd.
+        var presence_carried: ?mesh_presence_hot_checkpoint.Carried = null;
+        for (caps) |cap| {
+            if (cap.header.kind != .mesh_checkpoint or cap.fields.len != 1 or cap.fields[0].ordinal != 1 or
+                !mesh_presence_hot_checkpoint.isCheckpoint(cap.fields[0].bytes)) continue;
+            const descriptor = helix_capsule.descriptor(.mesh_checkpoint);
+            if (presence_carried != null or cap.header.schema_id != descriptor.schema_id or
+                cap.header.version != descriptor.current_version or cap.header.min_supported != 2 or
+                cap.header.max_supported != descriptor.max_supported)
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid, noncanonical, or duplicate mesh presence checkpoint");
+                return error.InvalidInheritedHandoff;
+            }
+            presence_carried = mesh_presence_hot_checkpoint.decode(cap.fields[0].bytes) catch {
+                self.abandonInheritedSessionState(caps, arena_fd, "malformed mesh presence checkpoint");
+                return error.InvalidInheritedHandoff;
+            };
+        }
+        if (presence_carried) |carried| {
+            if (builtin.os.tag != .linux or self.config.mesh_presence_store_path.len == 0 or !self.mesh_presence_hot_pending or
+                self.durable_guest_presence != null or carried.lease_fd_index >= self.config.inherited_state_fds.len)
+            {
+                self.abandonInheritedSessionState(caps, arena_fd, "unexpected mesh presence owner");
+                return error.InvalidInheritedHandoff;
+            }
+            const fd = self.config.inherited_state_fds[carried.lease_fd_index];
+            if (self.linux_inherited_guest_lease_fd == fd) {
+                self.abandonInheritedSessionState(caps, arena_fd, "mesh presence lease aliases the guest issuer lease");
+                return error.InvalidInheritedHandoff;
+            }
+            self.linux_inherited_presence_lease_fd = fd;
+        } else if (self.config.mesh_presence_store_path.len != 0 or self.mesh_presence_hot_pending) {
+            self.abandonInheritedSessionState(caps, arena_fd, "configured mesh presence store state is absent");
             return error.InvalidInheritedHandoff;
         }
         var host_wire: ?[]const u8 = null;
@@ -43686,6 +43816,10 @@ pub const LinuxServer = struct {
                 self.abandonInheritedSessionState(caps, arena_fd, "invalid or duplicate guest issuer lease descriptor claim");
                 return error.InvalidInheritedHandoff;
             }
+            if (self.linux_inherited_presence_lease_fd) |fd| if (!state_fd_claims.?.claim(fd)) {
+                self.abandonInheritedSessionState(caps, arena_fd, "invalid or duplicate mesh presence lease descriptor claim");
+                return error.InvalidInheritedHandoff;
+            };
             if (linux_webtransport_body) |body| {
                 if (!state_fd_claims.?.claim(body.udp_fd)) {
                     self.abandonInheritedSessionState(caps, arena_fd, "invalid WebTransport UDP descriptor claim");
@@ -45549,6 +45683,12 @@ pub const LinuxServer = struct {
             return error.InvalidInheritedHandoff;
         };
         defer guest_replacement.deinit();
+        var presence_stage = self.stageMeshPresenceAuthority(presence_carried) catch |err| {
+            world_replacement.swapWorldInto(&self.world);
+            srvLog("onyx-server: UPGRADE resume fatal — mesh presence authority staging failed ({s})\n", .{@errorName(err)});
+            return error.InvalidInheritedHandoff;
+        };
+        defer if (presence_stage) |*stage| stage.deinit();
         if (comptime builtin.os.tag == .openbsd or builtin.os.tag == .windows) {
             native_bot_stage = self.stageNativeBotGrants(bot_grant_checkpoint) catch |err| {
                 world_replacement.swapWorldInto(&self.world);
@@ -45620,6 +45760,15 @@ pub const LinuxServer = struct {
         }
 
         guest_replacement.commit();
+        // Same-PID execve already retired every predecessor reference to this
+        // lease (the original was CLOEXEC); this is the authenticated commit.
+        if (presence_stage) |*stage| {
+            self.durable_guest_presence = stage.activateAfterAuthenticatedCommitAndPredecessorExit();
+            presence_stage = null;
+            const hot_presence = &self.durable_guest_presence.?;
+            srvLog("onyx-server: UPGRADE resume — mesh presence authority adopted hot (issuer epoch {d}, commit generation {d}; no cold epoch advance)\n", .{ hot_presence.metadata.epoch, hot_presence.head.commit_generation });
+        }
+        self.mesh_presence_hot_pending = false;
         if (guest_image.active) |active| for (active.latches) |latch| {
             const mapped = lookupPhysicalClientRemap(physical_remaps, latch.physical).?;
             const conn = self.connFor(clientIdFromMonitor(mapped)).?;
@@ -46021,11 +46170,13 @@ pub const LinuxServer = struct {
         // duplicates. Consume disposal custody before retiring any original
         // reference at this no-fail edge; all client endpoints are reactor-owned.
         const retired_guest_lease_fd = self.linux_inherited_guest_lease_fd;
+        const retired_presence_lease_fd = self.linux_inherited_presence_lease_fd;
         self.clearInheritedStateFdManifest();
         if (linux_webtransport_body) |body| {
             retireLinuxWebTransportReferences(body.udp_fd, body.bridges);
         }
         if (retired_guest_lease_fd) |fd| closeFd(fd);
+        if (retired_presence_lease_fd) |fd| closeFd(fd);
         if (linux_webtransport_tls != null) self.linux_webtransport.commitTls(&linux_webtransport_tls);
         self.linux_webtransport.releaseWorker();
 

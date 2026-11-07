@@ -4363,6 +4363,9 @@ pub fn main(init: std.process.Init) !void {
         };
     } else if (comptime builtin.os.tag == .linux) {
         try srv.adoptInheritedSessions();
+        // A configured presence store on a hot successor must have been adopted
+        // from its carried checkpoint; never serve without its authority.
+        if (srv.mesh_presence_hot_pending) return error.MeshPresenceHotCheckpointRequired;
         try srv.prepareConfiguredGuestIssuer(srv.config.crypto_io orelse init.io);
     }
     if (comptime builtin.os.tag == .windows) {

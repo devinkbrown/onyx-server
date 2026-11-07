@@ -114,16 +114,18 @@ before opening the listeners.
 
 ## Hot Upgrade
 
-> **Current fleet (2026-11-06):** Helix reload is blocked on both production
-> nodes by the durable mesh presence store (`mesh.presence_store_path`), which
-> has no Helix carry yet. Since 0.10.2 reload refuses before exec with
-> `durable mesh presence store (no Helix carry yet)` and the daemon keeps
-> serving; earlier builds exec'd and dropped every client. WebTransport, media
-> and kTLS no longer block Helix (NEWS 0.10.2).
-> Production upgrades there are cold restarts, one node at a time:
+> **Current fleet (2026-11-06):** since 0.10.3 Helix carries the durable mesh
+> presence store (`mesh.presence_store_path`), so mesh nodes use `reload`.
+> Expect `mesh presence authority adopted hot (issuer epoch N, …; no cold
+> epoch advance)` in the successor log. The epoch must equal the one before
+> the reload. Moving from 0.10.2 or earlier still needs one cold restart,
+> because the old binary refuses before exec. Cold restarts, one node at a time:
 > `sudo rc-service onyx-server restart` (eshmaki.me, OpenRC) and
-> `sudo systemctl restart onyx-server.service` (ircx.us). The Helix procedure
-> below applies to nodes without that blocker. Both fleet nodes run
+> `sudo systemctl restart onyx-server.service` (ircx.us). OpenBSD and Windows
+> native upgrades still refuse with a presence store. Turning on
+> `presence_store_path` (or `guest_issuer_path`) for the first time needs a
+> cold restart. A reload would exec a successor that expects carried state the
+> old process never sealed, and that successor exits. Both fleet nodes run
 > `[tls] ktls = "txrx"`; expect the boot line
 > `kTLS TX+RX offload ACTIVE (txrx)` after restart.
 

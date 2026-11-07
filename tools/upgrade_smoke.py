@@ -337,6 +337,10 @@ def _run_smoke():
             "[[oper_groups]]\nname = \"netadmin\"\n"
             "privileges = [\"server_restart\", \"server_rehash\", \"server_admin\", \"mesh_admin\"]\n"
             f"[[opers]]\naccount = \"{ACCT}\"\nclass = \"netadmin\"\n"
+            # ONYX_SMOKE_PRESENCE=1: production-shaped durable mesh presence
+            # authority, carried across UPGRADE as HXMP checkpoint + WAL lease.
+            + (f"[mesh]\npresence_store_path = \"{RUN.directory / 'mesh-presence.wal'}\"\n"
+               if os.environ.get("ONYX_SMOKE_PRESENCE") == "1" else "")
         ),
     )
     def raise_stack_limit():

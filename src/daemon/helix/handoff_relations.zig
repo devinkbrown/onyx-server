@@ -25,6 +25,7 @@ const relay_v2_replay_guard = @import("../relay_v2_replay_guard.zig");
 const relay_v2_outbox = @import("../relay_v2_outbox.zig");
 const mesh_clock_snapshot = @import("mesh_clock_snapshot.zig");
 const mesh_redial = @import("mesh_redial.zig");
+const mesh_presence_hot_checkpoint = @import("mesh_presence_hot_checkpoint.zig");
 const oper_grant_snapshot = @import("oper_grant_snapshot.zig");
 const bot_grant_snapshot = @import("bot_grant_snapshot.zig");
 const thread_snapshot = @import("thread_snapshot.zig");
@@ -249,6 +250,8 @@ pub const Error = error{
     UnknownMeshCheckpoint,
     InvalidWebTransport,
     DuplicateWebTransport,
+    InvalidMeshPresence,
+    DuplicateMeshPresence,
 };
 
 pub const Summary = struct {
@@ -319,6 +322,7 @@ pub const Summary = struct {
     content_filter: usize = 0,
     reputation: usize = 0,
     spamtrap: usize = 0,
+    mesh_presence: usize = 0,
 };
 
 /// Validate decoded capsules after `live.verifyHandoffManifest` and before any
@@ -415,6 +419,17 @@ fn validateCurrentBody(capsules: []const capsule.Capsule, state_fds: []const i32
         summary.local_guest_issuer = 1;
     };
     if (summary.local_guest_issuer != 1) return error.MissingLocalGuestIssuer;
+    // The durable mesh presence authority owns at most one regular lease fd.
+    var presence_lease_index: ?u32 = null;
+    for (capsules) |item| {
+        if (item.header.kind != .mesh_checkpoint or item.fields.len != 1 or
+            item.fields[0].ordinal != 1 or !mesh_presence_hot_checkpoint.isCheckpoint(item.fields[0].bytes)) continue;
+        if (presence_lease_index != null) return error.DuplicateMeshPresence;
+        const carried = mesh_presence_hot_checkpoint.decode(item.fields[0].bytes) catch return error.InvalidMeshPresence;
+        if (carried.lease_fd_index >= state_fds.len) return error.MissingStateFd;
+        if (guest_lease_index) |index| if (index == carried.lease_fd_index) return error.DuplicateOwnerFd;
+        presence_lease_index = carried.lease_fd_index;
+    }
 
     for (state_fds, 0..) |fd, i| {
         if (fd < 0) return error.InvalidStateFd;
@@ -494,6 +509,9 @@ fn validateCurrentBody(capsules: []const capsule.Capsule, state_fds: []const i32
             else => {},
         };
         if (guest_lease_index) |index| if (state_fds[index] == fd) {
+            owners += 1;
+        };
+        if (presence_lease_index) |index| if (state_fds[index] == fd) {
             owners += 1;
         };
         if (webtransport) |view| {
@@ -600,6 +618,12 @@ fn validateCurrentBody(capsules: []const capsule.Capsule, state_fds: []const i32
         if (linux_webtransport.isCurrent(bytes)) {
             if (item.header.min_supported != 2 or webtransport == null) return error.InvalidWebTransport;
             summary.webtransport = 1;
+            continue;
+        }
+        if (mesh_presence_hot_checkpoint.isCheckpoint(bytes)) {
+            if (item.header.min_supported != 2 or presence_lease_index == null) return error.InvalidMeshPresence;
+            if (summary.mesh_presence != 0) return error.DuplicateMeshPresence;
+            summary.mesh_presence = 1;
             continue;
         }
         if (remote_presentation_snapshot.isCheckpoint(bytes)) {
@@ -2723,4 +2747,76 @@ test "current handoff relations require exact moderation authority on every plat
         corrupt_caps[index].fields = &corrupt_field;
         try std.testing.expectError(invalid_errors[i], validateCurrent(&corrupt_caps, &.{}));
     }
+}
+
+test "current handoff relations bind the HXMP mesh presence lease as one exact fd owner" {
+    const allocator = std.testing.allocator;
+    const event_replay = try testEventSpineReplayCheckpoint(allocator);
+    defer allocator.free(event_replay);
+    var event_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = event_replay }};
+    var event_cap = capsule.make(.mesh_checkpoint, &event_field);
+    event_cap.header.min_supported = 2;
+    const relay_replay = try testRelayV2ReplayCheckpoint(allocator);
+    defer allocator.free(relay_replay);
+    var relay_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = relay_replay }};
+    var relay_cap = capsule.make(.mesh_checkpoint, &relay_field);
+    relay_cap.header.min_supported = 2;
+    const relay_outbox = try testRelayV2OutboxCheckpoint(allocator);
+    defer allocator.free(relay_outbox);
+    var outbox_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = relay_outbox }};
+    var outbox_cap = capsule.make(.mesh_checkpoint, &outbox_field);
+    outbox_cap.header.min_supported = 2;
+    const relay_event_log = try testRelayV2EventLogCheckpoint(allocator);
+    defer allocator.free(relay_event_log);
+    var event_log_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = relay_event_log }};
+    var event_log_cap = capsule.make(.mesh_checkpoint, &event_log_field);
+    event_log_cap.header.min_supported = 2;
+    const attachment = try testAttachmentDeliveryCheckpoint(allocator);
+    defer allocator.free(attachment);
+    var attachment_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = attachment }};
+    var attachment_cap = capsule.make(.mesh_checkpoint, &attachment_field);
+    attachment_cap.header.min_supported = 2;
+    const e2ee_group = try testE2eeGroupMeshAuthorityCheckpoint(allocator);
+    defer allocator.free(e2ee_group);
+    var e2ee_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = e2ee_group }};
+    var e2ee_cap = capsule.make(.mesh_checkpoint, &e2ee_field);
+    e2ee_cap.header.min_supported = 2;
+    const clock = try mesh_clock_snapshot.encode(.{}, 0, .{});
+    var clock_field: [1]capsule.Field = undefined;
+    const clock_cap = testMeshClockCap(&clock, &clock_field);
+
+    const carried: mesh_presence_hot_checkpoint.Carried = .{ .lease_fd_index = 0, .checkpoint = .{
+        .lease_identity = .{ .device = 1, .inode = 2 },
+        .context = .{ .origin = @splat(3), .realm = @splat(4) },
+        .store_id = @splat(5),
+        .head_digest = @splat(6),
+        .commit_generation = 2,
+        .image_generation = 2,
+    } };
+    const wire = try mesh_presence_hot_checkpoint.encode(carried);
+    var presence_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = &wire }};
+    var presence_cap = capsule.make(.mesh_checkpoint, &presence_field);
+    presence_cap.header.min_supported = 2;
+    const base = [_]capsule.Capsule{ event_cap, relay_cap, outbox_cap, event_log_cap, attachment_cap, e2ee_cap, clock_cap };
+
+    // Present once, owning its exact state fd: accepted and counted.
+    const with = try validateWithEmptyPolicyStoresForTest(&(base ++ .{presence_cap}), &.{40});
+    try std.testing.expectEqual(@as(usize, 1), with.mesh_presence);
+    // Absent: the relation itself does not require it (Core enforces config).
+    try std.testing.expectEqual(@as(usize, 0), (try validateWithEmptyPolicyStoresForTest(&base, &.{})).mesh_presence);
+    // Lease fd without its checkpoint is an orphan; index past the manifest is missing.
+    try std.testing.expectError(error.OrphanStateFd, validateWithEmptyPolicyStoresForTest(&base, &.{40}));
+    try std.testing.expectError(error.MissingStateFd, validateWithEmptyPolicyStoresForTest(&(base ++ .{presence_cap}), &.{}));
+    // Duplicate authority and a downgraded header fail closed.
+    try std.testing.expectError(error.DuplicateMeshPresence, validateWithEmptyPolicyStoresForTest(&(base ++ .{ presence_cap, presence_cap }), &.{40}));
+    var weak = presence_cap;
+    weak.header.min_supported = 1;
+    try std.testing.expectError(error.InvalidMeshPresence, validateWithEmptyPolicyStoresForTest(&(base ++ .{weak}), &.{40}));
+    // Right magic, wrong body.
+    var corrupt = wire;
+    corrupt[mesh_presence_hot_checkpoint.magic.len] = 9;
+    var corrupt_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = &corrupt }};
+    var corrupt_cap = capsule.make(.mesh_checkpoint, &corrupt_field);
+    corrupt_cap.header.min_supported = 2;
+    try std.testing.expectError(error.InvalidMeshPresence, validateWithEmptyPolicyStoresForTest(&(base ++ .{corrupt_cap}), &.{40}));
 }

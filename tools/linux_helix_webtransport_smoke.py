@@ -109,6 +109,9 @@ def run(binary_source: Path, successor: Path | None, browser: str, evidence: Pat
                 'cert_path = "leaf.pem"\nkey_path = "server.key"\n'
                 '[sasl]\nenabled = true\naccount_db = "accounts.wal"\n'
                 '[accounts]\npbkdf2_rounds = 10000\n'
+                # ONYX_SMOKE_PRESENCE=1 carries a durable mesh presence store.
+                + ('[mesh]\npresence_store_path = "mesh-presence.wal"\n'
+                   if os.environ.get("ONYX_SMOKE_PRESENCE") == "1" else '')
             )
             os.chmod(config, 0o600)
         finally:

@@ -11,6 +11,41 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
+## 0.10.3 — Helix carries the mesh presence store (2026-11-06)
+
+Mesh nodes can now take Helix live upgrades. The durable mesh presence store
+(`mesh.presence_store_path`, required on every active mesh node) was the last
+blocker on Linux.
+
+- **The predecessor** takes an exact hot checkpoint of the presence authority
+  at the parked seal cut. It carries the checkpoint, with one duplicate of the
+  store's exclusive WAL lease, in the authoritative state-fd manifest. The
+  checkpoint rides as a new inner family (`HXMP`) of the existing mesh
+  checkpoint capsule, so the handoff manifest format is unchanged.
+- **The successor** never cold-opens the store. A cold open would advance the
+  issuer epoch. Instead it validates the inherited lease, WAL, head digest and
+  generations against the checkpoint, and activates the authority at the
+  adoption commit edge.
+- **Failure behaviour:** a missing, duplicate, malformed or aliased checkpoint
+  aborts adoption. So does a lease that does not match the checkpoint. A
+  successor that would serve without its presence authority refuses to start.
+- **New log lines:** boot logs `mesh presence authority opened cold (issuer
+  epoch N)`. Each live upgrade logs `mesh presence authority adopted hot
+  (issuer epoch N, …; no cold epoch advance)`.
+
+OpenBSD and Windows native upgrades still refuse before exec when a presence
+store is configured. Nodes on 0.10.2 refuse Helix with a presence store, so
+moving to 0.10.3 needs one cold restart; later upgrades can use `reload`.
+
+Verified with `tools/upgrade_smoke.py` and
+`tools/linux_helix_webtransport_smoke.py` with `ONYX_SMOKE_PRESENCE=1`:
+
+- a real browser WebTransport stream through two consecutive execs;
+- TCP, TLS and mid-frame WSS clients;
+- an issuer epoch that stays constant.
+
+Upgrades from 0.10.1 to 0.10.3 without a presence store still pass.
+
 ## 0.10.2 — Linux Helix restored (2026-11-06)
 
 Helix live upgrades had not worked on Linux since 0.9.0. Two bugs combined:

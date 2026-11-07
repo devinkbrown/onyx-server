@@ -91,6 +91,7 @@ pub const ticket_key_capsule = @import("ticket_key_capsule.zig");
 pub const s2s_snapshot = @import("s2s_snapshot.zig");
 pub const mesh_redial = @import("mesh_redial.zig");
 pub const mesh_clock_snapshot = @import("mesh_clock_snapshot.zig");
+pub const mesh_presence_hot_checkpoint = @import("mesh_presence_hot_checkpoint.zig");
 pub const oper_grant_snapshot = @import("oper_grant_snapshot.zig");
 pub const thread_snapshot = @import("thread_snapshot.zig");
 pub const schedule_snapshot = @import("schedule_snapshot.zig");

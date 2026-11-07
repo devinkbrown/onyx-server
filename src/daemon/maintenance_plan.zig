@@ -156,7 +156,7 @@ pub fn blockerName(b: Blocker) []const u8 {
         .pending_remote_membership => "pending authenticated membership proposal",
         .pending_fabric_output => "accepted fabric delivery awaiting physical custody",
         .unmappable_attachment_delivery => "pending physical delivery without a mandatory HSSN mapping",
-        .mesh_presence_store => "durable mesh presence store (no Helix carry yet)",
+        .mesh_presence_store => "durable mesh presence store (not hot-capturable on this platform or state)",
         .listener_change => "on-disk listener set changed",
         .retired_fence_change => "retired session fence policy changed",
         .prospective_authority => "target identity or cohort cannot preserve carried session authority",
