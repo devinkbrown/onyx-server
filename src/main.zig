@@ -2620,6 +2620,9 @@ pub fn main(init: std.process.Init) !void {
             srv_cfg.native_listener_manifest = incoming.listeners;
             srv_cfg.native_arena_bytes = incoming.plaintext;
             srv_cfg.native_adopt_barrier = incoming.barrier();
+            // Durable mesh presence lease (typed row): Server's hot stage
+            // takes close custody; the bootstrap keeps its validation copy.
+            if (incoming.presence_lease_fd != null) srv_cfg.native_presence_lease_fd = try incoming.takePresenceLease();
             srv_cfg.inherited_state_fds = incoming.state_fds;
             srv_cfg.inherited_state_fd_manifest_present = true;
             srv_cfg.inherited_state_fd_manifest_valid = true;
@@ -4361,6 +4364,7 @@ pub fn main(init: std.process.Init) !void {
             if (native_incoming != null) std.posix.system._exit(125);
             return err;
         };
+        if (srv.mesh_presence_hot_pending) return error.MeshPresenceHotCheckpointRequired;
     } else if (comptime builtin.os.tag == .linux) {
         try srv.adoptInheritedSessions();
         // A configured presence store on a hot successor must have been adopted
@@ -4374,6 +4378,7 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("onyx-server: Windows Helix adoption failed ({s})\n", .{@errorName(err)});
                 windows_driver.candidateAbortNow();
             };
+            if (srv.mesh_presence_hot_pending) return error.MeshPresenceHotCheckpointRequired;
             std.debug.print("onyx-server: Windows Helix adoption committed; starting reactors\n", .{});
             windows_commit_confirmed = true;
             // A committed candidate becomes the next predecessor. Keep hooks

@@ -11,6 +11,40 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
+## 0.10.4 — Presence store carried on every Helix platform (source, 2026-11-07)
+
+- **OpenBSD** native Helix now carries the durable mesh presence store. The
+  predecessor sends a duplicate of the store's WAL lease as the existing typed
+  `presence_lease` descriptor row, alongside the HXMP checkpoint. The candidate
+  stages `HotAuthorityStage` from that descriptor. It activates after COMMIT,
+  once it has seen the predecessor exit. The lease stays locked throughout,
+  with no epoch advance.
+- **Windows** cannot hold a file lock across processes, so its successor hands
+  the lease over instead:
+  - After COMMIT and predecessor exit it calls the new
+    `Authority.openHandover`. That reacquires the existing lease, retrying for
+    up to about 3 s while Windows releases the exited process's lock.
+  - It accepts only the exact checkpointed state: store id, head digest,
+    generations and lease identity. It restores that state without an epoch
+    advance and logs `mesh presence authority handed over`.
+  - A refused handover falls back to an ordinary cold open, which advances the
+    epoch once. If that also fails, the successor refuses to serve.
+- **Other platforms:** reload still refuses before exec when a presence store
+  is configured.
+- **Refusal logging:** a refused Helix seal now names each client that blocked
+  it, with fd, nick, transport and reason, for example `client not sealable
+  fd=7 nick="half" transport=tcp reason=not registered yet`.
+
+**Verification:**
+- **Linux:** the two-exec WebTransport smoke passed with a presence store.
+- **Leaf tests:** `openHandover` was tested on Linux. It refuses while the
+  predecessor holds the lease and keeps the exact epoch after the predecessor
+  exits. A stale cut, the wrong key, context or lease identity are each refused
+  without writing the WAL, and the cold fallback still opens afterwards. The
+  relation validator covers native lease custody.
+- **OpenBSD and Windows:** both compile, but have not yet been tested on live
+  OpenBSD or Windows hosts.
+
 ## 0.10.3 — Helix carries the mesh presence store (2026-11-06)
 
 Mesh nodes can now take Helix live upgrades. The durable mesh presence store

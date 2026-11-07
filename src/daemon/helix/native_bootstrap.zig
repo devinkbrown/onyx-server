@@ -159,7 +159,8 @@ pub const Driver = struct {
         var arena = try arena_file.Arena.create(self.allocator, &sealer, plaintext.items);
         defer arena.deinit();
         const identity: exchange.Identity = .{ .generation = candidate.identity.generation, .upgrade_id = sealer.upgrade_id };
-        const rows = try self.allocator.alloc(manifest.Row, snapshot.state_fds.len + snapshot.listeners.len);
+        const presence_rows: usize = if (snapshot.presence_lease_fd != null) 1 else 0;
+        const rows = try self.allocator.alloc(manifest.Row, snapshot.state_fds.len + snapshot.listeners.len + presence_rows);
         defer self.allocator.free(rows);
         for (snapshot.state_fds, 0..) |fd, index| {
             var role: ?manifest.Role = null;
@@ -188,6 +189,7 @@ pub const Driver = struct {
                 .s2s => .s2s_listener,
             },
         };
+        if (snapshot.presence_lease_fd) |fd| rows[rows.len - 1] = .{ .canonical = fd, .fd = fd, .role = .presence_lease, .shard = 0, .family = 0 };
         try manifest.validate(rows);
         var body: [arena_body_len]u8 = undefined;
         defer std.crypto.secureZero(u8, &body);

@@ -121,8 +121,11 @@ before opening the listeners.
 > the reload. Moving from 0.10.2 or earlier still needs one cold restart,
 > because the old binary refuses before exec. Cold restarts, one node at a time:
 > `sudo rc-service onyx-server restart` (eshmaki.me, OpenRC) and
-> `sudo systemctl restart onyx-server.service` (ircx.us). OpenBSD and Windows
-> native upgrades still refuse with a presence store. Turning on
+> `sudo systemctl restart onyx-server.service` (ircx.us). Since 0.10.4 OpenBSD
+> carries the lease over SCM_RIGHTS. Windows hands the lease over after the
+> predecessor exits and logs `handed over`, or `opened cold after refused
+> handover` when it falls back. A reload that refuses now names each blocking
+> client: look for `client not sealable … reason=` in the log. Turning on
 > `presence_store_path` (or `guest_issuer_path`) for the first time needs a
 > cold restart. A reload would exec a successor that expects carried state the
 > old process never sealed, and that successor exits. Both fleet nodes run

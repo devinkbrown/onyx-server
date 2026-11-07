@@ -101,6 +101,9 @@ pub const NativeUpgradeSnapshot = struct {
     listeners: []const ListenerDescriptor,
     epoch: u64,
     now_ms: i64,
+    /// OpenBSD: duplicate of the durable mesh presence WAL lease, sent as one
+    /// typed `presence_lease` descriptor row beside the HXMP checkpoint.
+    presence_lease_fd: ?linux.fd_t = null,
     /// Windows-only live source authority. Absent after any partial REHASH.
     windows_source_digest: ?[32]u8 = null,
     /// Borrowed exact private WAL owner; the native leaf duplicates its held

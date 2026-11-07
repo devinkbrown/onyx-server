@@ -421,11 +421,18 @@ fn validateCurrentBody(capsules: []const capsule.Capsule, state_fds: []const i32
     if (summary.local_guest_issuer != 1) return error.MissingLocalGuestIssuer;
     // The durable mesh presence authority owns at most one regular lease fd.
     var presence_lease_index: ?u32 = null;
+    var presence_native = false;
     for (capsules) |item| {
         if (item.header.kind != .mesh_checkpoint or item.fields.len != 1 or
             item.fields[0].ordinal != 1 or !mesh_presence_hot_checkpoint.isCheckpoint(item.fields[0].bytes)) continue;
-        if (presence_lease_index != null) return error.DuplicateMeshPresence;
+        if (presence_lease_index != null or presence_native) return error.DuplicateMeshPresence;
         const carried = mesh_presence_hot_checkpoint.decode(item.fields[0].bytes) catch return error.InvalidMeshPresence;
+        if (carried.lease_fd_index == mesh_presence_hot_checkpoint.native_lease_index) {
+            // Native lease custody is outside the state-fd manifest.
+            if (presence_native) return error.DuplicateMeshPresence;
+            presence_native = true;
+            continue;
+        }
         if (carried.lease_fd_index >= state_fds.len) return error.MissingStateFd;
         if (guest_lease_index) |index| if (index == carried.lease_fd_index) return error.DuplicateOwnerFd;
         presence_lease_index = carried.lease_fd_index;
@@ -621,7 +628,7 @@ fn validateCurrentBody(capsules: []const capsule.Capsule, state_fds: []const i32
             continue;
         }
         if (mesh_presence_hot_checkpoint.isCheckpoint(bytes)) {
-            if (item.header.min_supported != 2 or presence_lease_index == null) return error.InvalidMeshPresence;
+            if (item.header.min_supported != 2 or (presence_lease_index == null and !presence_native)) return error.InvalidMeshPresence;
             if (summary.mesh_presence != 0) return error.DuplicateMeshPresence;
             summary.mesh_presence = 1;
             continue;
@@ -2819,4 +2826,14 @@ test "current handoff relations bind the HXMP mesh presence lease as one exact f
     var corrupt_cap = capsule.make(.mesh_checkpoint, &corrupt_field);
     corrupt_cap.header.min_supported = 2;
     try std.testing.expectError(error.InvalidMeshPresence, validateWithEmptyPolicyStoresForTest(&(base ++ .{corrupt_cap}), &.{40}));
+    // Native custody: no state fd is owned; a stray fd stays an orphan.
+    var native = carried;
+    native.lease_fd_index = mesh_presence_hot_checkpoint.native_lease_index;
+    const native_wire = try mesh_presence_hot_checkpoint.encode(native);
+    var native_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = &native_wire }};
+    var native_cap = capsule.make(.mesh_checkpoint, &native_field);
+    native_cap.header.min_supported = 2;
+    try std.testing.expectEqual(@as(usize, 1), (try validateWithEmptyPolicyStoresForTest(&(base ++ .{native_cap}), &.{})).mesh_presence);
+    try std.testing.expectError(error.OrphanStateFd, validateWithEmptyPolicyStoresForTest(&(base ++ .{native_cap}), &.{40}));
+    try std.testing.expectError(error.DuplicateMeshPresence, validateWithEmptyPolicyStoresForTest(&(base ++ .{ native_cap, presence_cap }), &.{40}));
 }

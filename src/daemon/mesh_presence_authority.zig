@@ -138,9 +138,6 @@ pub const Authority = struct {
     /// This binds real current authority, not reconstructed maximum counters or
     /// an independently guessed inode. Physical inventory is a separate gate.
     pub fn captureHotCheckpoint(self: *const Authority) !HotCheckpoint {
-        // Lease-identity custody needs POSIX fds; unreachable in Windows
-        // production, so tests skip via this one gate.
-        if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
         if (self.durable.preparedWritesPoisoned() or self.durable.isReadOnly() or self.active_generation != null or self.durable.active_batch != null or self.durable.active_prepared != null or self.published_generation != self.retained_store.generation) return error.InvalidState;
         const envelope = try retained.readCommittedEnvelope(&self.durable, self.context);
         const metadata = try issuer.validateRows(envelope.rows.metadata, envelope.rows.frontier, self.context.origin);
@@ -149,8 +146,42 @@ pub const Authority = struct {
         defer canonical.deinit();
         if (canonical.entries != envelope.head.entries or canonical.frontiers != envelope.head.frontiers or canonical.retained_bytes != envelope.head.retained_bytes or !std.mem.eql(u8, canonical.bytes, envelope.image)) return error.InvalidState;
         const identity = try lease_custody.statRegular(self.lease.handle);
-        try validateAuthorityLease(self.allocator, self.io, self.durable.dir, self.durable.wal_path, self.lease, identity);
+        // Windows cannot carry the lease across processes; its successor
+        // reacquires the configured lease by `openHandover`, which binds this
+        // identity. POSIX validates the held lease against the path here.
+        if (comptime builtin.os.tag != .windows)
+            try validateAuthorityLease(self.allocator, self.io, self.durable.dir, self.durable.wal_path, self.lease, identity);
         return .{ .lease_identity = identity, .context = self.context, .store_id = self.head.store_id, .head_digest = retained.digest(self.durable.get(.props, retained.head_key).?), .commit_generation = self.head.commit_generation, .image_generation = self.head.image_generation };
+    }
+
+    /// Handover successor for platforms whose lease cannot cross processes
+    /// (Windows LockFileEx is process-owned). CALL ONLY after authenticated
+    /// COMMIT and observed predecessor exit. Reacquires the EXISTING configured
+    /// lease, requires the exact checkpointed committed cut (store id, head
+    /// digest, commit/image generations, lease identity) and restores it
+    /// WITHOUT advancing the issuer epoch. Any mismatch fails with no WAL
+    /// write, so the caller may fall back to `openCold`.
+    pub fn openHandover(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, context: retained.LocalContext, checkpoint: HotCheckpoint, key: *const sign.KeyPair, config: Config) !Authority {
+        try requireKey(context, key);
+        if (!std.meta.eql(checkpoint.context, context)) return error.ContextMismatch;
+        const cold_dir: ?std.Io.Dir = if (comptime builtin.os.tag == .windows) try coldRuntimeDirectory(io, dir, path) else null;
+        errdefer if (cold_dir) |owned| owned.close(io);
+        const held_dir = if (cold_dir) |owned| owned else dir;
+        const held_path = if (comptime builtin.os.tag == .windows) std.fs.path.basename(path) else path;
+        const lease = try acquireExistingColdLease(allocator, io, held_dir, held_path);
+        errdefer lease.close(io);
+        if (!std.meta.eql(checkpoint.lease_identity, try lease_custody.statRegular(lease.handle))) return error.IdentityMismatch;
+        var durable = try persistence.OroStore.openReadOnlyWithConfig(allocator, io, held_dir, held_path, config.storage);
+        errdefer durable.deinit();
+        const envelope = try retained.readCommittedEnvelope(&durable, context);
+        if (!std.mem.eql(u8, &checkpoint.store_id, &envelope.head.store_id) or !std.mem.eql(u8, &checkpoint.head_digest, &retained.digest(durable.get(.props, retained.head_key).?)) or checkpoint.commit_generation != envelope.head.commit_generation or checkpoint.image_generation != envelope.head.image_generation) return error.InvalidState;
+        var restored = try image.stageRestore(allocator, &durable, context, config.retained);
+        errdefer restored.deinit();
+        const metadata = try issuer.validateRows(envelope.rows.metadata, envelope.rows.frontier, context.origin);
+        try durable.preparePromotion();
+        try durable.releaseReadHandleForPreparedPromotion();
+        durable.promotePrepared();
+        return .{ .allocator = allocator, .io = io, .lease = lease, .owned_cold_dir = cold_dir, .durable = durable, .retained_store = restored.store, .context = context, .metadata = metadata, .head = restored.head, .local_authoring_disabled = restored.local_authoring_disabled, .published_generation = restored.store.generation };
     }
 
     pub fn deinit(self: *Authority) void {
@@ -3296,4 +3327,75 @@ test "mesh presence retained v2 actual live compaction every successor batch pre
     const packet_len = try liveCompactionBoundaryScenario(.successor, 0);
     for (1..packet_len + 1) |prefix| _ = try liveCompactionBoundaryScenario(.successor, prefix);
     std.debug.print("live compaction actual successor SIGKILL prefixes: {d} (0..{d})\n", .{ packet_len + 1, packet_len });
+}
+
+test "mesh presence handover reacquires the lease and preserves the exact epoch after predecessor exit" {
+    if (comptime !hotSupported()) return error.SkipZigTest;
+    var tmp = try testTmpDir();
+    defer tmp.cleanup();
+    var local = try sign.KeyPair.fromSeed(@splat(190));
+    defer local.deinit();
+    var remote = try sign.KeyPair.fromSeed(@splat(191));
+    defer remote.deinit();
+    const context = contextFor(&local);
+    var parent = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "handover.wal", context, @splat(21), &local, 1000, .{});
+    var parent_owned = true;
+    defer if (parent_owned) parent.deinit();
+    const burned = try parent.reserveSubject(&local);
+    var cut = try parent.prepareLocalFrontier(burned.counter, &.{}, 1000, &local);
+    defer cut.abort();
+    try cut.commit();
+    var value = try recordFor(remote.public_key, .{ .epoch = 1, .counter = 1 });
+    value.expires_ms = 5000;
+    try publish(&parent, value, &remote, &local, 1000);
+    const checkpoint = try parent.captureHotCheckpoint();
+    const epoch = parent.metadata.epoch;
+    // While the predecessor holds the lease the handover must not proceed.
+    try std.testing.expectError(error.WouldBlock, Authority.openHandover(std.testing.allocator, std.testing.io, tmp.dir, "handover.wal", context, checkpoint, &local, .{}));
+    parent.deinit();
+    parent_owned = false;
+    var successor = try Authority.openHandover(std.testing.allocator, std.testing.io, tmp.dir, "handover.wal", context, checkpoint, &local, .{});
+    defer successor.deinit();
+    try std.testing.expectEqual(epoch, successor.metadata.epoch);
+    try std.testing.expectEqualDeep(checkpoint, try successor.captureHotCheckpoint());
+    try std.testing.expect(successor.winner("Guest", 1500, &.{remote.public_key}) != null);
+    try std.testing.expectEqualDeep(wire.Subject{ .epoch = epoch, .counter = 2 }, try successor.reserveSubject(&local));
+}
+
+test "mesh presence handover rejects a changed cut, foreign key and wrong context without writing" {
+    if (comptime !hotSupported()) return error.SkipZigTest;
+    var tmp = try testTmpDir();
+    defer tmp.cleanup();
+    var key = try sign.KeyPair.fromSeed(@splat(192));
+    defer key.deinit();
+    var foreign = try sign.KeyPair.fromSeed(@splat(193));
+    defer foreign.deinit();
+    const context = contextFor(&key);
+    var stale: HotCheckpoint = undefined;
+    {
+        var parent = try Authority.initialize(std.testing.allocator, std.testing.io, tmp.dir, "handover-bad.wal", context, @splat(22), &key, 1000, .{});
+        defer parent.deinit();
+        stale = try parent.captureHotCheckpoint();
+        // A mutation after the checkpoint makes the carried cut stale.
+        const burned = try parent.reserveSubject(&key);
+        var cut = try parent.prepareLocalFrontier(burned.counter, &.{}, 1000, &key);
+        defer cut.abort();
+        try cut.commit();
+    }
+    const before = try tmp.dir.readFileAlloc(std.testing.io, "handover-bad.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(before);
+    try std.testing.expectError(error.InvalidState, Authority.openHandover(std.testing.allocator, std.testing.io, tmp.dir, "handover-bad.wal", context, stale, &key, .{}));
+    try std.testing.expectError(error.ContextMismatch, Authority.openHandover(std.testing.allocator, std.testing.io, tmp.dir, "handover-bad.wal", context, stale, &foreign, .{}));
+    var wrong = stale;
+    wrong.context.realm = @splat(99);
+    try std.testing.expectError(error.ContextMismatch, Authority.openHandover(std.testing.allocator, std.testing.io, tmp.dir, "handover-bad.wal", context, wrong, &key, .{}));
+    wrong = stale;
+    wrong.lease_identity.inode +%= 1;
+    try std.testing.expectError(error.IdentityMismatch, Authority.openHandover(std.testing.allocator, std.testing.io, tmp.dir, "handover-bad.wal", context, wrong, &key, .{}));
+    const after = try tmp.dir.readFileAlloc(std.testing.io, "handover-bad.wal", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    // The fallback cold open still works after every refused handover.
+    var cold = try Authority.openCold(std.testing.allocator, std.testing.io, tmp.dir, "handover-bad.wal", context, &key, 2000, .{});
+    cold.deinit();
 }

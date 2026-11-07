@@ -27,6 +27,12 @@ pub const magic = [_]u8{ 'H', 'X', 'M', 'P' };
 pub const version: u8 = 1;
 pub const encoded_len: usize = magic.len + 1 + 4 + 8 * 3 + 32 + 32 + 16 + 32 + 8 * 2;
 
+/// The lease does not ride in the authoritative state-fd manifest: OpenBSD
+/// sends it as a typed `presence_lease` descriptor row, and Windows (whose
+/// LockFileEx custody is process-owned) reacquires it by handover after the
+/// predecessor exits. Linux always carries a concrete state-fd index.
+pub const native_lease_index: u32 = std.math.maxInt(u32);
+
 pub const Carried = struct {
     lease_fd_index: u32,
     checkpoint: authority.HotCheckpoint,
