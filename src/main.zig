@@ -3862,6 +3862,7 @@ pub fn main(init: std.process.Init) !void {
             if (comptime builtin.os.tag == .windows) {
                 if (srv.acme_worker == s) srv.acme_worker = null;
             }
+            if (srv.acme_tls_alpn01_store == s.tlsAlpn01Store()) srv.acme_tls_alpn01_store = null;
             allocator.destroy(s);
         }
     };
@@ -3960,6 +3961,10 @@ pub fn main(init: std.process.Init) !void {
                 const svc = try allocator.create(AcmeRenewalService);
                 svc.* = AcmeRenewalService.init(allocator, init.io, srv, h.parsed.acme, &h.parsed.tls);
                 acme_renewal = svc;
+                // RFC 8737 §3: the implicit-TLS listener must answer
+                // acme-tls/1 validation hellos from this Service's store on
+                // every platform, not only where `acme_worker` is set.
+                if (h.parsed.acme.challenge == .tls_alpn_01) srv.acme_tls_alpn01_store = svc.tlsAlpn01Store();
                 if (comptime builtin.os.tag == .windows) {
                     // Pause and parked-restore both require the bound clock.
                     try svc.prepareColdResources(init.io);

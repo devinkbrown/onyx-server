@@ -6543,6 +6543,12 @@ pub const LinuxServer = struct {
     acme_reload_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     acme_reload_retry_after_ms: i64 = 0,
     acme_worker: ?*@import("acme_renewal.zig").Service = null,
+    /// RFC 8737 tls-alpn-01 challenge store owned by the ACME renewal Service.
+    /// Kept separate from `acme_worker` so it is wired on every platform
+    /// without entering Windows Helix runtime-relation accounting. main.zig
+    /// sets it only for `challenge = "tls-alpn-01"` and clears it before the
+    /// Service is destroyed (after the reactors have stopped).
+    acme_tls_alpn01_store: ?*acme_runner.TlsAlpn01Store = null,
     /// Boot-time `[tls]` view used for ACME-triggered reloads. Changing `[tls]`
     /// paths through live REHASH while ACME is enabled is intentionally unsupported;
     /// REHASH still uses `reload_parsed` for its own operator-requested reload.
@@ -15407,9 +15413,7 @@ pub const LinuxServer = struct {
     /// null unless ACME renewal runs with `challenge = "tls-alpn-01"`. The
     /// Service (and with it the store) outlives every client connection.
     fn tlsAlpn01Store(self: *LinuxServer) ?*acme_runner.TlsAlpn01Store {
-        const owner = self.acme_worker orelse return null;
-        if (owner.acme.challenge != .tls_alpn_01) return null;
-        return owner.tlsAlpn01Store();
+        return self.acme_tls_alpn01_store;
     }
 
     fn startAcceptedTls(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, arm_recv: bool) !bool {
@@ -73591,12 +73595,14 @@ pub const LinuxServer = struct {
                 error.DigitalSignatureKeyUsageMissing,
                 error.LeafKeyMismatch,
                 error.UnsupportedLeafKey,
-                error.CertificateNotYetValid,
                 error.OutlivesCertificate,
                 => {
                     self.dc_refused_digest = digest;
                     srvLog("onyx-server: [tls] delegated_credentials disabled for the current certificate ({s}); serving without a delegated credential\n", .{@errorName(err)});
                 },
+                // CertificateNotYetValid is transient: a clock still behind
+                // the leaf's notBefore at boot must not disable rotation for
+                // the leaf's whole lifetime, so it retries like any other.
                 else => {
                     self.dc_retry_after_unix = now_unix + 60;
                     srvLog("onyx-server: [tls] delegated credential mint failed ({s}); retrying in 60s\n", .{@errorName(err)});
@@ -185651,6 +185657,140 @@ test "armor3: delegated credentials rotate from the serving leaf, retire safely 
     try std.testing.expect(server.dc_refused_digest != null);
     try std.testing.expect(server.tls13Config(false).delegated_credential == null);
     try std.testing.expect(server.delegatedCredentialSecondsLeft(now) == null);
+    server.pruneRetiredDelegatedCredentials();
+}
+
+test "armor3: RFC 8737 tls-alpn-01 store reaches the implicit-TLS listener through startAcceptedTls and driveTls" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const allocator = std.testing.allocator;
+    const tls_client = @import("../crypto/tls_client.zig");
+    const acme_challenge = @import("../proto/acme_challenge.zig");
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try mintRehashTlsLeaf(&leaf_buf, 0xa6, "irc.example.test");
+    const chain = [_][]const u8{leaf.der};
+    const server = initTlsPolicyTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = leaf.kp,
+        .max_clones_per_ip = 8,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+
+    // The renewal Service's store, filled with a live challenge certificate.
+    var store: acme_runner.TlsAlpn01Store = .{};
+    var challenge_buf: [acme_challenge.max_tls_alpn01_cert_len]u8 = undefined;
+    var minted = try acme_runner.mintTlsAlpn01(std.testing.io, &challenge_buf, "irc.example.test", "token.thumbprint", 1_735_689_600);
+    defer ecdsa_p256.wipeKeyPair(&minted.key_pair);
+    try store.put("irc.example.test", minted.der, minted.key_pair);
+
+    const Admit = struct {
+        fn one(srv: *Server, addr_byte: u8) !struct { id: client_model.ClientId, conn: *ConnState } {
+            const id = try srv.rx().clients.alloc(ConnState.init(-1));
+            const conn = srv.rx().clients.get(id).?;
+            conn.token = try tokenFromId(id);
+            conn.overflow_allocator = std.testing.allocator;
+            conn.peer_addr = .{ .ipv4 = .{ 198, 51, 100, addr_byte } };
+            if (!try srv.startAcceptedTls(id, conn, false)) return error.TestUnexpectedResult;
+            return .{ .id = id, .conn = conn };
+        }
+        fn drop(srv: *Server, id: client_model.ClientId, conn: *ConnState) void {
+            if (conn.send_overflow.capacity > 0) conn.send_overflow.deinit(conn.overflow_allocator);
+            conn.send_overflow = .empty;
+            srv.rollbackAcceptedTransport(id, conn);
+        }
+    };
+
+    // Not wired (no tls-alpn-01 renewal): the listener has no store.
+    {
+        const admitted = try Admit.one(server, 60);
+        defer Admit.drop(server, admitted.id, admitted.conn);
+        try std.testing.expect(admitted.conn.tls.?.acme_store == null);
+    }
+
+    // Wired the way main.zig does on every platform.
+    server.acme_tls_alpn01_store = &store;
+    defer server.acme_tls_alpn01_store = null;
+    {
+        const admitted = try Admit.one(server, 61);
+        defer Admit.drop(server, admitted.id, admitted.conn);
+        const conn = admitted.conn;
+        try std.testing.expect(conn.tls.?.acme_store == &store);
+        var client = try tls_client.Client.init(allocator, .{ .server_name = "irc.example.test", .trust_anchors = &.{}, .alpn_protocols = &.{acme_challenge.acme_tls_alpn_protocol} });
+        defer client.deinit();
+        client.disableServerCertVerification();
+        const ch = try client.start();
+        defer allocator.free(ch);
+        const backlog_before = sendq.wireBacklog(conn);
+        try server.driveTls(admitted.id, conn, ch);
+        // The validation flight carries the challenge certificate, selects
+        // acme-tls/1 and never reaches IRC registration.
+        try std.testing.expect(conn.tls.?.isAcmeTlsAlpn01());
+        try std.testing.expectEqualStrings(acme_challenge.acme_tls_alpn_protocol, conn.tls.?.selectedAlpn().?);
+        try std.testing.expectEqualSlices(u8, minted.der, conn.tls.?.engine.tls13.config.cert_chain[0]);
+        try std.testing.expect(sendq.wireBacklog(conn) > backlog_before);
+    }
+
+    // An ordinary IRC hello to the same listener is untouched.
+    {
+        const admitted = try Admit.one(server, 62);
+        defer Admit.drop(server, admitted.id, admitted.conn);
+        const conn = admitted.conn;
+        var client = try tls_client.Client.init(allocator, .{ .server_name = "irc.example.test", .trust_anchors = &chain, .alpn_protocols = &.{"irc"} });
+        defer client.deinit();
+        client.disableServerCertVerification();
+        const ch = try client.start();
+        defer allocator.free(ch);
+        try server.driveTls(admitted.id, conn, ch);
+        try std.testing.expect(!conn.tls.?.isAcmeTlsAlpn01());
+        try std.testing.expectEqualSlices(u8, leaf.der, conn.tls.?.engine.tls13.config.cert_chain[0]);
+        try std.testing.expect(!conn.closing);
+    }
+}
+
+test "armor3: a clock behind the leaf notBefore retries delegated-credential rotation instead of refusing the leaf" {
+    if (comptime !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try armor3DelegationLeaf(&leaf_buf, 0xa5, true);
+    const chain = [_][]const u8{leaf.der};
+    const server = initTlsPolicyTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = leaf.kp,
+        .crypto_io = std.testing.io,
+        .tls_delegated_credentials = .{ .valid_seconds = 7200, .renew_before_seconds = 3600 },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    // The leaf's notBefore is 1_704_067_200 (armor3DelegationLeaf).
+    const behind: i64 = 1_704_067_200 - 1000;
+    server.maybeRotateDelegatedCredential(behind);
+    try std.testing.expect(server.dc_active == null);
+    try std.testing.expect(server.dc_refused_digest == null);
+    try std.testing.expectEqual(behind + 60, server.dc_retry_after_unix);
+    // Inside the back-off window nothing is attempted.
+    server.maybeRotateDelegatedCredential(behind + 30);
+    try std.testing.expect(server.dc_active == null);
+    // Once the clock is corrected the same leaf gets a credential.
+    const now = @divFloor(platform.realtimeMillis(), 1000);
+    server.maybeRotateDelegatedCredential(now);
+    try std.testing.expect(server.dc_active != null);
+    try std.testing.expect(server.tls13Config(false).delegated_credential != null);
     server.pruneRetiredDelegatedCredentials();
 }
 

@@ -62,14 +62,14 @@ pub const Resolver = struct {
     }
 };
 
-/// Default maximum bytes accepted for a single HTTP response (ACME payloads are
-/// small). Operationally tunable via `[acme].max_response_bytes`.
 /// RFC 8701 GREASE stays on for this outbound TLS 1.3 client so peers that
 /// mishandle unknown values are found early; GREASE ECH stays off because the
 /// daemon holds no ECHConfig for these hosts (draft-ietf-tls-esni §6.2).
 pub const outbound_grease = true;
 pub const outbound_ech_grease = false;
 
+/// Default maximum bytes accepted for a single HTTP response (ACME payloads are
+/// small). Operationally tunable via `[acme].max_response_bytes`.
 pub const default_max_response_bytes: usize = 256 * 1024;
 /// Default max ACME state-machine steps before aborting.
 pub const default_max_steps: usize = 64;
