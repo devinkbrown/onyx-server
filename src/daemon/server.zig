@@ -5610,6 +5610,8 @@ pub const LinuxServer = struct {
     /// config, so `resumeFrom` fails every carried TLS 1.2 row and the whole
     /// adopt aborts (InvalidInheritedHandoff). The seal refuses before exec.
     helix_target_tls12_disabled: bool = false,
+    /// Mixer for post-welcome registration nick fallbacks (renameRegistrationNick).
+    registration_nick_fallback_seq: u16 = 0,
     /// Reactor-0 monotonic retry guard for automatic Windows descriptor-ID
     /// rollover. The successor starts fresh after Helix imports only live IDs.
     windows_descriptor_rollover_retry_after_ms: i64 = 0,
@@ -24473,30 +24475,62 @@ pub const LinuxServer = struct {
         return true;
     }
 
+    const RegistrationNickBlock = struct { numeric: Numeric, reason: []const u8 };
+
+    /// Why `nick` cannot be claimed by this registering connection, or null.
+    fn registrationNickBlock(self: *LinuxServer, conn: *ConnState, nick: []const u8) ?RegistrationNickBlock {
+        if (self.registeredNickRequiresAuthentication(conn, nick))
+            return .{ .numeric = .ERR_ERRONEUSNICKNAME, .reason = "Nickname is registered; authenticate as this account before using it" };
+        if (self.saccess.matchNick(nick)) |entry|
+            return .{ .numeric = .ERR_ERRONEUSNICKNAME, .reason = serverAccessReason(entry, "Nickname blocked by SACCESS") };
+        if (self.nickReservationBlocks(conn, nick)) |entry|
+            return .{ .numeric = .ERR_ERRONEUSNICKNAME, .reason = serverAccessReason(entry, "Nickname is reserved") };
+        if (self.nickDelayBlocks(conn, nick))
+            return .{ .numeric = .ERR_UNAVAILRESOURCE, .reason = "Nick is held (nick delay); try again shortly" };
+        return null;
+    }
+
+    /// The welcome burst (001) is already queued when registerConnNick finds
+    /// the nick unusable on deferred registration paths (local guest issuer,
+    /// challenge). Closing the socket there turned an ordinary nick clash into
+    /// a reconnect loop for clients that always offer the same nick (the Onyx
+    /// web client registers as "guest"). Tell the client why, then move it to
+    /// a free fallback nick with a NICK change so the session continues.
+    /// Returns false when no fallback could be formed (caller closes).
+    fn renameRegistrationNick(self: *LinuxServer, conn: *ConnState, block: RegistrationNickBlock) !bool {
+        const old = conn.session.displayName();
+        try queueNumeric(conn, block.numeric, &.{old}, block.reason);
+        const limit = @max(@as(usize, 6), @min(@as(usize, self.config.nicklen), 64));
+        const stem_len = @min(old.len, limit - 5);
+        var candidate_buf: [64]u8 = undefined;
+        var attempt: u32 = 0;
+        while (attempt < 32) : (attempt += 1) {
+            self.registration_nick_fallback_seq +%= 1;
+            const tag: u16 = @truncate((@as(u64, @bitCast(self.nowMs())) *% 0x9E3779B97F4A7C15) >> 48 ^ self.registration_nick_fallback_seq);
+            const candidate = std.fmt.bufPrint(&candidate_buf, "{s}-{x:0>4}", .{ old[0..stem_len], tag }) catch return false;
+            if (self.world.findNick(candidate) != null) continue;
+            if (self.registrationNickBlock(conn, candidate) != null) continue;
+            var prefix_buf: ClientPrefixBuffer = undefined;
+            var msg_buf: [default_reply_bytes]u8 = undefined;
+            const old_prefix = clientPrefix(conn, &prefix_buf);
+            const msg = formatMessage(&msg_buf, old_prefix, "NICK", &.{}, candidate) catch return false;
+            conn.session.setNick(candidate) catch return false;
+            try appendToConn(conn, msg);
+            return true;
+        }
+        return false;
+    }
+
     fn registerConnNick(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState) !void {
-        const nick = conn.session.displayName();
-        if (std.mem.eql(u8, nick, "*")) return;
-        if (self.registeredNickRequiresAuthentication(conn, nick)) {
-            try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{nick}, "Nickname is registered; authenticate as this account before using it");
-            conn.close_reason = "Registered nickname requires authentication";
-            conn.closing = true;
-            return;
+        if (std.mem.eql(u8, conn.session.displayName(), "*")) return;
+        if (self.registrationNickBlock(conn, conn.session.displayName())) |block| {
+            if (!try self.renameRegistrationNick(conn, block)) {
+                conn.close_reason = "Registration nickname unavailable";
+                conn.closing = true;
+                return;
+            }
         }
-        if (self.saccess.matchNick(nick)) |entry| {
-            try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{nick}, serverAccessReason(entry, "Nickname blocked by SACCESS"));
-            conn.closing = true;
-            return;
-        }
-        if (self.nickReservationBlocks(conn, nick)) |entry| {
-            try queueNumeric(conn, .ERR_ERRONEUSNICKNAME, &.{nick}, serverAccessReason(entry, "Nickname is reserved"));
-            conn.closing = true;
-            return;
-        }
-        if (self.nickDelayBlocks(conn, nick)) {
-            try queueNumeric(conn, .ERR_UNAVAILRESOURCE, &.{nick}, "Nick is held (nick delay); try again shortly");
-            conn.closing = true;
-            return;
-        }
+        var nick = conn.session.displayName();
         // Fund the physical ticket before publishing World nickname ownership.
         // Account-null is only a candidate filter; capture uses the full real
         // World/Store witness after registration and before this tail's output.
@@ -24509,33 +24543,42 @@ pub const LinuxServer = struct {
                 }
             }
         }
-        const already_owned = conn.local_guest_registration_pending and blk: {
-            const holder = self.world.findNick(nick) orelse break :blk false;
-            break :blk holder.eql(worldIdFromClient(id));
-        };
-        if (!already_owned) self.world.registerNick(nick, worldIdFromClient(id)) catch |err| switch (err) {
-            error.NickInUse => {
-                // Account-aware same-nick multi-session: if THIS connection is
-                // SASL-authenticated and the existing holder of `nick` is a local
-                // connection logged in to the SAME account, this is the same
-                // identity attaching from another client/device — do NOT 433/close.
-                // Let registration complete sharing the nick: the primary keeps
-                // world ownership; this conn keeps displayName == nick and is added
-                // to the account session group (trackSession) so DM/notice fan-out
-                // reaches it. (NAMES dedup + mesh-wide same-nick are out of scope;
-                // a second client may JOIN channels itself.)
-                if (conn.session.account()) |acct| {
-                    if (self.nickHeldBySameAccount(nick, acct, worldIdFromClient(id))) {
-                        // Shared nick; the holder already notified MONITOR online.
+        var claim_attempts: u8 = 0;
+        claim: while (true) {
+            const already_owned = conn.local_guest_registration_pending and blk: {
+                const holder = self.world.findNick(nick) orelse break :blk false;
+                break :blk holder.eql(worldIdFromClient(id));
+            };
+            if (!already_owned) self.world.registerNick(nick, worldIdFromClient(id)) catch |err| switch (err) {
+                error.NickInUse => {
+                    // Account-aware same-nick multi-session: if THIS connection is
+                    // SASL-authenticated and the existing holder of `nick` is a local
+                    // connection logged in to the SAME account, this is the same
+                    // identity attaching from another client/device — do NOT 433/close.
+                    // Let registration complete sharing the nick: the primary keeps
+                    // world ownership; this conn keeps displayName == nick and is added
+                    // to the account session group (trackSession) so DM/notice fan-out
+                    // reaches it. (NAMES dedup + mesh-wide same-nick are out of scope;
+                    // a second client may JOIN channels itself.)
+                    if (conn.session.account()) |acct| {
+                        if (self.nickHeldBySameAccount(nick, acct, worldIdFromClient(id))) {
+                            // Shared nick; the holder already notified MONITOR online.
+                            return;
+                        }
+                    }
+                    claim_attempts += 1;
+                    if (claim_attempts > 4 or !try self.renameRegistrationNick(conn, .{ .numeric = .ERR_NICKNAMEINUSE, .reason = "Nickname is already in use" })) {
+                        conn.close_reason = "Registration nickname unavailable";
+                        conn.closing = true;
                         return;
                     }
-                }
-                try queueNumeric(conn, .ERR_NICKNAMEINUSE, &.{nick}, "Nickname is already in use");
-                conn.closing = true;
-                return;
-            },
-            else => return err,
-        };
+                    nick = conn.session.displayName();
+                    continue :claim;
+                },
+                else => return err,
+            };
+            break :claim;
+        }
         if (conn.local_guest_ticket) |ticket| {
             if (conn.local_guest_capture_pending) {
                 const capture: LocalGuestBindingCapture = .{ .owner = self.local_guest_bindings.?, .ticket = ticket };
@@ -126755,6 +126798,57 @@ test "threaded server: pre-registration REGISTER fails and CAP LS 302 advertises
     try writeAllFd(fd, "REGISTER newacct * pw\r\n");
     try recvUntil(&client, "FAIL REGISTER COMPLETE_CONNECTION_REQUIRED", 200);
     try std.testing.expect(std.mem.indexOf(u8, client.written(), " 421 ") == null);
+}
+
+test "registration: a nick refused after the welcome is renamed to a free fallback instead of closing the connection" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer current_reactor = null;
+    const a = std.testing.allocator;
+    const server = try createTestServer(a, .{ .host = "127.0.0.1", .port = 0, .max_clients = 8, .nick_delay_ms = 60_000 });
+    defer {
+        server.deinit();
+        a.destroy(server);
+    }
+    current_reactor = &server.reactors[0];
+    try server.nick_delay.hold("guest", server.nowMs() + 60_000, null);
+
+    var pairs: [2][2]linux.fd_t = undefined;
+    var ids: [2]client_model.ClientId = undefined;
+    for (&pairs, &ids, [_][]const u8{ "guest", "taken" }) |*pair, *id, nick| {
+        if (linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, pair)) != .SUCCESS) return error.SkipZigTest;
+        id.* = try server.rx().clients.alloc(ConnState.init(pair[0]));
+        const conn = server.connFor(id.*).?;
+        conn.token = try tokenFromId(id.*);
+        conn.overflow_allocator = a;
+        server.applyAcceptedAddress(conn, .{ .ipv4 = .{ 127, 0, 0, 1 } });
+        try conn.session.setNick(nick);
+    }
+    defer for (pairs) |pair| closeFd(pair[1]);
+
+    // Deferred registration path: 001 already queued, nick under nick delay.
+    const held = server.connFor(ids[0]).?;
+    server.world.lockWrite();
+    try server.registerConnNick(ids[0], held);
+    server.world.unlockWrite();
+    try std.testing.expect(!held.closing);
+    try std.testing.expect(std.mem.startsWith(u8, held.session.displayName(), "guest-"));
+    try std.testing.expect(server.world.findNick(held.session.displayName()).?.eql(worldIdFromClient(ids[0])));
+    const out0 = try copyTestSendQ(a, held);
+    defer a.free(out0);
+    try std.testing.expect(std.mem.indexOf(u8, out0, " 437 guest ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out0, ":guest!") != null and std.mem.indexOf(u8, out0, " NICK ") != null);
+
+    // Nick already held in the World by another client: renamed, not closed.
+    const other = server.connFor(ids[1]).?;
+    try server.world.registerNick("taken", worldIdFromClient(ids[0]));
+    server.world.lockWrite();
+    try server.registerConnNick(ids[1], other);
+    server.world.unlockWrite();
+    try std.testing.expect(!other.closing);
+    try std.testing.expect(std.mem.startsWith(u8, other.session.displayName(), "taken-"));
+    const out1 = try copyTestSendQ(a, other);
+    defer a.free(out1);
+    try std.testing.expect(std.mem.indexOf(u8, out1, " 433 taken ") != null);
 }
 
 test "threaded server: a nick under nick delay answers 437 before 001 and keeps the connection for a retry" {

@@ -11,6 +11,17 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
+## 0.11.3 — Deferred registration renames instead of disconnecting (2026-11-07)
+
+- On deferred registration paths (local guest issuer, challenge) the welcome
+  burst is already queued when the nick is claimed, so the 0.11.1/0.11.2
+  pre-welcome check cannot run. A nick that turns out to be in use, under nick
+  delay, reserved, SACCESS-blocked or registered is now answered with its
+  numeric and the client is moved to a free fallback nick (`<nick>-xxxx`) with
+  a `NICK` change, instead of the connection being closed. Production uses the
+  local guest issuer, so the Onyx web client reconnecting as `guest` still hit
+  the disconnect on 0.11.2.
+
 ## 0.11.2 — Registration keeps the connection on nick delay and reservation (2026-11-07)
 
 - A nick under nick delay (`437`) or reserved (`432`) is now answered before
