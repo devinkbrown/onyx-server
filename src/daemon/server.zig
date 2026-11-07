@@ -131167,10 +131167,10 @@ const DaemonOutputTestPair = struct {
         errdefer std.testing.allocator.free(plain);
         switch (self.client) {
             .tls13 => |*client| {
-                try std.testing.expectError(error.TlsAlert, client.decrypt(bytes[at..]));
+                try std.testing.expectError(error.EndOfStream, client.decrypt(bytes[at..]));
                 try std.testing.expectEqual(@import("../proto/tls_alert.zig").AlertDescription.close_notify, client.last_alert.?.description);
             },
-            .tls12 => |*client| try std.testing.expectError(error.TlsAlert, client.decrypt(bytes[at..])),
+            .tls12 => |*client| try std.testing.expectError(error.EndOfStream, client.decrypt(bytes[at..])),
         }
         return plain;
     }
@@ -131785,7 +131785,8 @@ fn tls3ServerKernelPrefix(suite: u16, kernel_rx: bool, armed: bool, overflow: bo
             // (RFC 8446 §6.1); nothing may follow it.
             try std.testing.expect(!close_notify_seen);
             const read = fixture.pair.client.tls13.decryptApp(cipher.items[0..len]) catch |err| {
-                if (err != error.TlsAlert or !clean_close) return err;
+                // RFC 8446 §6.1: the client engine reports close_notify as EndOfStream.
+                if (err != error.EndOfStream or !clean_close) return err;
                 try std.testing.expectEqual(@import("../proto/tls_alert.zig").AlertDescription.close_notify, fixture.pair.client.tls13.last_alert.?.description);
                 close_notify_seen = true;
                 std.mem.copyForwards(u8, cipher.items[0 .. cipher.items.len - len], cipher.items[len..]);

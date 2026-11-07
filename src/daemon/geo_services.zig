@@ -1868,6 +1868,11 @@ const NewsTlsFixture = struct {
                 "<rss><channel><item><title>Loopback headline</title></item></channel></rss>");
             defer std.heap.page_allocator.free(response);
             try native_io.writeAll(fd, response);
+            // The body has no length framing, so it ends at close_notify
+            // (RFC 8446 §6.1); a bare TCP close would be truncation.
+            const bye = try engine.closeNotify();
+            defer std.heap.page_allocator.free(bye);
+            try native_io.writeAll(fd, bye);
         }
     };
 };

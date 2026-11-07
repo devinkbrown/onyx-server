@@ -2220,7 +2220,8 @@ fn expectClientSeesCloseNotify(alloc: Allocator, client: *tls_client.Client, fd:
     defer alloc.free(record);
     // TLS 1.3 protects the alert inside an application_data outer record.
     try std.testing.expectEqual(@as(u8, 23), record[0]);
-    try std.testing.expectError(error.TlsAlert, client.decrypt(record));
+    // RFC 8446 §6.1: the client engine reports close_notify as a clean EOF.
+    try std.testing.expectError(error.EndOfStream, client.decrypt(record));
     try std.testing.expectEqual(tls_alert_mod.AlertDescription.close_notify, client.last_alert.?.description);
 }
 
