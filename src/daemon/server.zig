@@ -533,6 +533,9 @@ const og_mod = @import("operator_groups.zig");
 const config_format = @import("config_format.zig");
 const delivery_authority = @import("delivery_authority.zig");
 const tls_certs = @import("tls_certs.zig");
+const tls_sni_load = @import("tls_sni_load.zig");
+const tls_ech_load = @import("tls_ech_load.zig");
+const crypto_x509 = @import("../crypto/x509.zig");
 const x509_verify = @import("../crypto/x509_verify.zig");
 const services_mod = @import("services.zig");
 const ocg2_runtime_mod = @import("ocg2_runtime.zig");
@@ -2729,6 +2732,25 @@ pub const Config = struct {
     /// Server-side Encrypted Client Hello keys loaded by main.zig. Empty ⇒ ECH is
     /// not accepted, preserving the existing outer-ClientHello behavior.
     tls_ech_keys: []const tls_server.EchKey = &.{},
+    /// Merged ECHConfigList of `tls_ech_keys`, sent as `retry_configs` to a
+    /// client whose ECH this server could not decrypt. Same generation and
+    /// lifetime as `tls_ech_keys`. Empty ⇒ no retry_configs.
+    tls_ech_retry_config_list: []const u8 = &.{},
+    /// ALPN ids the implicit-TLS IRC listener may select (`[tls] alpn`).
+    /// Empty disables ALPN. A client offering none of these, or no ALPN at
+    /// all, still completes the handshake without an ALPN selection. The
+    /// browser WebSocket listener selects only `http/1.1` while this is set.
+    /// Borrowed for the server's lifetime.
+    tls_alpn_protocols: []const []const u8 = &.{},
+    /// `[tls] cert_compression`: RFC 8879 zlib Certificate compression for
+    /// clients that offer it. Default false keeps the wire byte-identical.
+    tls_cert_compression: bool = false,
+    /// `[tls] enforce_cert_signature_algorithms`: refuse a chain whose
+    /// certificate signatures the client did not advertise. Default false.
+    tls_enforce_cert_signature_algorithms: bool = false,
+    /// `[tls] ticket_lifetime`: NewSessionTicket lifetime for both legs.
+    /// Null keeps each engine's default.
+    tls_ticket_lifetime_seconds: ?u32 = null,
     /// RFC 7250 server raw public keys. Default false preserves X.509 Certificate
     /// messages; when true, clients that explicitly offer RawPublicKey may receive
     /// the leaf SPKI instead of the certificate chain.
@@ -3369,6 +3391,11 @@ pub const ConnState = struct {
     /// Explicit abort disposition; a healthy close-after delivery still drains
     /// its admitted control and application FIFO before ordinary final teardown.
     tls_terminal_failure: bool = false,
+    /// The TLS handshake on this connection completed (or it was adopted
+    /// already connected). Later record faults are not handshake failures.
+    tls_handshake_finished: bool = false,
+    /// This connection owns one unit of `tls_ktls_active`.
+    stats_ktls_counted: bool = false,
     /// Turn-local guards: no nested protocol progress or hot capture while a
     /// borrowed Outcome is being dispatched. They never survive a safe point.
     tls_ingress_active: bool = false,
@@ -5163,13 +5190,78 @@ const webpush_overflow_delivery_slots: usize = 8;
 
 const RuntimePhase = enum(u8) { idle, resources, workers, published, joined };
 
+/// ALPN id the browser WebSocket listener selects when ALPN is enabled.
+const ws_alpn_protocols = [_][]const u8{"http/1.1"};
+
+/// `[[tls.sni]]` and `[[tls.ech_keys]]` reload with the default certificate on
+/// REHASH (ACME renewal reloads only the default certificate). Native Windows
+/// binds them into its static Helix proof instead, so there they change only
+/// with a restart.
+const tls_sni_ech_hot_reload = builtin.os.tag != .windows;
+
 const RetiredTlsGeneration = struct {
     primary: ?tls_certs.Loaded = null,
     side: ?tls_certs.Tls12 = null,
+    sni: ?TlsSniGeneration = null,
+    ech: ?tls_ech_load.Loaded = null,
 
     fn deinit(self: *RetiredTlsGeneration, allocator: std.mem.Allocator) void {
         if (self.primary) |*loaded| loaded.deinit(allocator);
         if (self.side) |*loaded| loaded.deinit(allocator);
+        if (self.sni) |*generation| generation.deinit(allocator);
+        if (self.ech) |*loaded| loaded.deinit(allocator);
+        self.* = .{};
+    }
+};
+
+/// One server-owned `[[tls.sni]]` reload generation: the loaded certificate
+/// material, its own copy of every server name, and the selection list whose
+/// entries borrow both. Nothing here borrows the parsed config, which REHASH
+/// frees on its next commit. A TLS engine borrows `certs` until its handshake
+/// finishes.
+const TlsSniGeneration = struct {
+    loaded: std.ArrayList(tls_certs.Loaded) = .empty,
+    certs: []tls_server.SniCert = &.{},
+    /// Every entry's server names, concatenated; `names` slices into it.
+    name_bytes: []u8 = &.{},
+    /// Every entry's name list, flattened; `certs[i].server_names` slices it.
+    names: [][]const u8 = &.{},
+
+    /// Replace each `certs[i].server_names` (borrowed from the parsed config)
+    /// with copies owned by this generation.
+    fn ownServerNames(self: *TlsSniGeneration, allocator: std.mem.Allocator) !void {
+        std.debug.assert(self.names.len == 0 and self.name_bytes.len == 0);
+        var name_count: usize = 0;
+        var byte_count: usize = 0;
+        for (self.certs) |cert| {
+            name_count += cert.server_names.len;
+            for (cert.server_names) |name| byte_count += name.len;
+        }
+        const name_bytes = try allocator.alloc(u8, byte_count);
+        errdefer allocator.free(name_bytes);
+        const names = try allocator.alloc([]const u8, name_count);
+        var name_at: usize = 0;
+        var byte_at: usize = 0;
+        for (self.certs) |*cert| {
+            const first = name_at;
+            for (cert.server_names) |name| {
+                @memcpy(name_bytes[byte_at..][0..name.len], name);
+                names[name_at] = name_bytes[byte_at..][0..name.len];
+                byte_at += name.len;
+                name_at += 1;
+            }
+            cert.server_names = names[first..name_at];
+        }
+        self.name_bytes = name_bytes;
+        self.names = names;
+    }
+
+    fn deinit(self: *TlsSniGeneration, allocator: std.mem.Allocator) void {
+        if (self.certs.len != 0) allocator.free(self.certs);
+        allocator.free(self.names);
+        allocator.free(self.name_bytes);
+        for (self.loaded.items) |*entry| entry.deinit(allocator);
+        self.loaded.deinit(allocator);
         self.* = .{};
     }
 };
@@ -6408,7 +6500,20 @@ pub const LinuxServer = struct {
     /// below until no incomplete handshake borrows their chain or RSA key.
     reload_tls_prev: ?tls_certs.Loaded = null,
     reload_tls12_prev: ?tls_certs.Tls12 = null,
+    /// Server-owned `[[tls.sni]]` and `[[tls.ech_keys]]` generations loaded by
+    /// the same transactional reload, with the same current/previous/retired
+    /// custody as `reload_tls`. Null while the boot (main-owned) material, or
+    /// no material, is serving.
+    reload_sni: ?TlsSniGeneration = null,
+    reload_sni_prev: ?TlsSniGeneration = null,
+    reload_ech: ?tls_ech_load.Loaded = null,
+    reload_ech_prev: ?tls_ech_load.Loaded = null,
     reload_tls_retired: std.ArrayList(RetiredTlsGeneration) = .empty,
+    /// TLS listener counters for `/metrics` (atomic; any reactor records).
+    tls_stats: server_stats.TlsStats = .{},
+    /// Live gauge of client connections with kernel TLS offload in either
+    /// direction. Each connection owns at most one unit (`stats_ktls_counted`).
+    tls_ktls_active: std.atomic.Value(i64) = .init(0),
     /// Cross-thread ACME signal: the renewal worker sets this only after writing
     /// new cert/key files. Reactor 0 consumes it on the housekeeping tick and
     /// performs the actual live TLS reload, so ACME never mutates listener state.
@@ -8392,6 +8497,7 @@ pub const LinuxServer = struct {
             "# TYPE onyx_module_hook_handler_errors_total counter\n");
         try out.print(self.allocator, "onyx_module_hook_handler_errors_total {d}\n", .{self.module_runtime.bus.totalHandlerErrors()});
         try self.latency_stats.writePrometheus(self.allocator, &out);
+        try self.writeTlsPrometheus(self.allocator, &out, @divFloor(platform.realtimeMillis(), 1000));
         try self.writeNodeHealthPrometheus(self.allocator, &out);
         try self.writeReactorAcceptPrometheus(self.allocator, &out);
         try self.writeOutputClassPrometheus(self.allocator, &out);
@@ -8406,6 +8512,58 @@ pub const LinuxServer = struct {
         var offer_retry_metrics: [offer_retry_reuse.RetryReasonStats.max_render_len]u8 = undefined;
         try out.appendSlice(self.allocator, try self.offer_retry_reason_stats.renderPrometheus(&offer_retry_metrics));
         try self.metrics_snapshot.set(out.items);
+    }
+
+    /// TLS listener series: handshake counters, the kTLS gauge, the OCSP staple
+    /// state, and days until expiry of every serving certificate (default,
+    /// generated TLS 1.2 side leaf, and each `[[tls.sni]]` entry). The expiry
+    /// series reads the live chains directly, so it works without ACME.
+    fn writeTlsPrometheus(self: *LinuxServer, allocator: std.mem.Allocator, out: *std.ArrayList(u8), now_unix: i64) !void {
+        try self.tls_stats.writePrometheus(allocator, out);
+        try writePromGauge(allocator, out, "onyx_tls_ktls_active", "Client connections with kernel TLS offload in either direction", @max(@as(i64, 0), self.tls_ktls_active.load(.acquire)));
+
+        // OCSP: `status` is exactly one of none/good/expired. `good` means the
+        // staple is inside its validated window and is being stapled.
+        const staple = self.config.tls_ocsp_staple;
+        const status: []const u8 = if (staple == null) "none" else if (now_unix < self.ocsp_staple_valid_until_unix) "good" else "expired";
+        try out.appendSlice(allocator, "# HELP onyx_tls_ocsp_staple_status Current OCSP staple state for the default certificate\n# TYPE onyx_tls_ocsp_staple_status gauge\n");
+        for ([_][]const u8{ "none", "good", "expired" }) |name| {
+            try out.print(allocator, "onyx_tls_ocsp_staple_status{{status=\"{s}\"}} {d}\n", .{ name, @intFromBool(std.mem.eql(u8, name, status)) });
+        }
+        if (staple) |der| {
+            if (ocspStapleThisUpdate(der)) |this_update| {
+                try writePromGauge(allocator, out, "onyx_tls_ocsp_staple_age_seconds", "Seconds since the stapled OCSP response's thisUpdate", now_unix -| this_update);
+            }
+            try writePromGauge(allocator, out, "onyx_tls_ocsp_staple_expires_in_seconds", "Seconds until the stapled OCSP response stops being served", self.ocsp_staple_valid_until_unix -| now_unix);
+        }
+
+        try out.appendSlice(allocator, "# HELP onyx_tls_certificate_expiry_days Whole days until the serving leaf certificate's notAfter (negative once expired)\n# TYPE onyx_tls_certificate_expiry_days gauge\n");
+        try writeCertExpiry(allocator, out, "default", "", self.config.tls_cert_chain, now_unix);
+        if (self.config.tls12_cert_chain.len != 0 and self.config.tls_cert_chain.len != 0 and
+            self.config.tls12_cert_chain[0].ptr != self.config.tls_cert_chain[0].ptr)
+            try writeCertExpiry(allocator, out, "tls12", "", self.config.tls12_cert_chain, now_unix);
+        for (self.config.tls_sni_certs) |entry| {
+            const name = if (entry.server_names.len != 0) entry.server_names[0] else "";
+            try writeCertExpiry(allocator, out, "sni", name, entry.cert_chain, now_unix);
+        }
+    }
+
+    fn writeCertExpiry(allocator: std.mem.Allocator, out: *std.ArrayList(u8), source: []const u8, sni_name: []const u8, chain: []const []const u8, now_unix: i64) !void {
+        if (chain.len == 0) return;
+        const leaf = crypto_x509.parse(chain[0]) catch return;
+        const days = @divFloor(leaf.not_after.epoch_seconds -| now_unix, 86_400);
+        try out.print(allocator, "onyx_tls_certificate_expiry_days{{source=\"{s}\",server_name=\"", .{source});
+        try server_stats.writePromLabelValue(allocator, out, sni_name);
+        try out.print(allocator, "\"}} {d}\n", .{days});
+    }
+
+    /// thisUpdate of the stapled response. A served staple was verified for
+    /// the leaf before install, so its first SingleResponse is the leaf's.
+    fn ocspStapleThisUpdate(der: []const u8) ?i64 {
+        const ocsp = @import("../crypto/ocsp.zig");
+        const parsed = ocsp.parse(der) catch return null;
+        const single = parsed.responseAt(0) orelse return null;
+        return crypto_x509.generalizedTimeToEpoch(single.this_update) catch null;
     }
 
     fn writePromGauge(
@@ -9720,8 +9878,13 @@ pub const LinuxServer = struct {
             .request_client_cert = request_client_cert,
             .sni_certs = self.config.tls_sni_certs,
             .ech_keys = self.config.tls_ech_keys,
+            .ech_retry_config_list = if (self.config.tls_ech_keys.len != 0) self.config.tls_ech_retry_config_list else &.{},
             .enable_raw_public_key = self.config.tls_raw_public_key,
+            .alpn_protocols = self.config.tls_alpn_protocols,
+            .enable_cert_compression = self.config.tls_cert_compression,
+            .enforce_cert_signature_algorithms = self.config.tls_enforce_cert_signature_algorithms,
         };
+        if (self.config.tls_ticket_lifetime_seconds) |seconds| cfg.ticket_lifetime_seconds = seconds;
         if (self.config.tls_ocsp_staple) |staple| {
             if (@divFloor(platform.realtimeMillis(), 1000) < self.ocsp_staple_valid_until_unix)
                 cfg.ocsp_staple = staple;
@@ -9734,6 +9897,22 @@ pub const LinuxServer = struct {
             cfg.now_unix_seconds = @divTrunc(platform.realtimeMillis(), 1000);
             cfg.max_early_data_size = self.config.tls_early_data_max_size;
         }
+        return cfg;
+    }
+
+    /// TLS configs for the browser WebSocket listener: never a client-cert
+    /// request (see `startAcceptedWs`), and, while ALPN is enabled, only the
+    /// `http/1.1` id, because this listener speaks HTTP/1.1 Upgrade, never IRC.
+    /// A browser offering ["h2","http/1.1"] therefore negotiates what it gets.
+    fn wsTls13Config(self: *LinuxServer) tls_server.Config {
+        var cfg = self.tls13Config(false);
+        if (cfg.alpn_protocols.len != 0) cfg.alpn_protocols = &ws_alpn_protocols;
+        return cfg;
+    }
+
+    fn wsTls12Config(self: *LinuxServer) tls12_server.Config {
+        var cfg = self.tls12Config();
+        if (cfg.alpn_protocols.len != 0) cfg.alpn_protocols = &ws_alpn_protocols;
         return cfg;
     }
 
@@ -9750,7 +9929,9 @@ pub const LinuxServer = struct {
             .ecdsa_p256_signing_key = self.config.tls12_signing_key,
             .rsa_signing_key = self.config.tls_rsa_signing_key,
             .request_client_cert = self.config.tls_request_client_cert,
+            .alpn_protocols = self.config.tls_alpn_protocols,
         };
+        if (self.config.tls_ticket_lifetime_seconds) |seconds| cfg.ticket_lifetime_seconds = seconds;
         // Only staple on the 1.2 leg when it presents the SAME leaf as the 1.3
         // leg (shared chain object). An Ed25519 1.3 leaf forces a separately
         // minted ECDSA 1.2 leaf whose serial the staple does not cover, so it must
@@ -10412,6 +10593,10 @@ pub const LinuxServer = struct {
         if (self.reload_tls12) |*t| t.deinit(self.allocator);
         if (self.reload_tls_prev) |*t| t.deinit(self.allocator);
         if (self.reload_tls12_prev) |*t| t.deinit(self.allocator);
+        if (self.reload_sni) |*g| g.deinit(self.allocator);
+        if (self.reload_sni_prev) |*g| g.deinit(self.allocator);
+        if (self.reload_ech) |*e| e.deinit(self.allocator);
+        if (self.reload_ech_prev) |*e| e.deinit(self.allocator);
         for (self.reload_tls_retired.items) |*retired| retired.deinit(self.allocator);
         self.reload_tls_retired.deinit(self.allocator);
         // Free all server-owned OCSP generations after the connection tables.
@@ -15197,9 +15382,9 @@ pub const LinuxServer = struct {
             // initiated WebSocket and abort the handshake (close 1006), which
             // silently breaks every browser client. mTLS/CERTFP is unavailable
             // to browser JS anyway, so forcing this off loses nothing.
-            const tls_cfg = self.tls13Config(false);
+            const tls_cfg = self.wsTls13Config();
             if (self.config.tls12_cert_chain.len != 0 and (self.config.tls12_signing_key != null or self.config.tls_rsa_signing_key != null)) {
-                tls.* = tls_conn.TlsConn.initDual(self.allocator, tls_cfg, self.tls12Config());
+                tls.* = tls_conn.TlsConn.initDual(self.allocator, tls_cfg, self.wsTls12Config());
             } else {
                 tls.* = tls_conn.TlsConn.initBorrowed(self.allocator, tls_cfg) catch {
                     self.allocator.destroy(tls);
@@ -15558,6 +15743,10 @@ pub const LinuxServer = struct {
     /// pre-admission socket is a no-op and can never subtract another live slot.
     fn dropClientStats(self: *LinuxServer, conn: *ConnState) void {
         self.releaseWorkloadTicket(conn);
+        if (conn.stats_ktls_counted) {
+            conn.stats_ktls_counted = false;
+            _ = self.tls_ktls_active.fetchSub(1, .monotonic);
+        }
         if (!conn.stats_client_counted) return;
         conn.stats_client_counted = false;
         self.stats.onClose(false, false);
@@ -16617,8 +16806,48 @@ pub const LinuxServer = struct {
         sendq.cancelControlReservation(conn);
     }
 
+    /// Record one completed TLS handshake: version, suite, group, resumption
+    /// and 0-RTT outcome. Reads only the engine's settled negotiation state.
+    fn noteTlsHandshakeComplete(self: *LinuxServer, conn: *ConnState) void {
+        if (conn.tls_handshake_finished) return;
+        conn.tls_handshake_finished = true;
+        const t = conn.tls orelse return;
+        switch (t.engine) {
+            .undecided => {},
+            .tls13 => |*s| self.tls_stats.onHandshakeComplete(.{
+                .version = .tls13,
+                .suite_name = s.cipherName(),
+                // A resumed psk_dhe_ke handshake still runs a key exchange,
+                // but the group series counts full handshakes only.
+                .group = if (s.resumed) null else @backingInt(s.selected_group),
+                .resumed = s.resumed,
+                .early_data_offered = s.early_data_offered,
+                .early_data_accepted = s.early_data_accepted,
+            }),
+            .tls12 => |*s| self.tls_stats.onHandshakeComplete(.{
+                .version = .tls12,
+                .suite_name = s.cipherName(),
+                .resumed = s.resuming,
+            }),
+        }
+    }
+
+    /// Count a kernel TLS offload in `direction` and take this connection's
+    /// single unit of the active-offload gauge.
+    fn noteKtlsOffload(self: *LinuxServer, conn: *ConnState, direction: server_stats.TlsStats.KtlsDirection) void {
+        self.tls_stats.onKtlsOffload(direction);
+        self.noteKtlsActive(conn);
+    }
+
+    fn noteKtlsActive(self: *LinuxServer, conn: *ConnState) void {
+        if (conn.stats_ktls_counted) return;
+        conn.stats_ktls_counted = true;
+        _ = self.tls_ktls_active.fetchAdd(1, .monotonic);
+    }
+
     fn failTls(self: *LinuxServer, conn: *ConnState, failure: anyerror) void {
         const t = conn.tls orelse return;
+        if (!conn.tls_terminal_failure and !conn.tls_handshake_finished) self.tls_stats.onHandshakeFailure(failure);
         if (!conn.tls_terminal_failure) logConnectionDiagnostic(conn, .tls_error, 0, failure, .none);
         conn.tls_terminal_failure = true;
         conn.closing = true;
@@ -22720,6 +22949,7 @@ pub const LinuxServer = struct {
         }
         if (handshake_pending and conn.tls.?.handshakeDone()) {
             self.recordElapsedLatency(.tls_handshake, started_at_ms);
+            self.noteTlsHandshakeComplete(conn);
             logConnectionDiagnostic(conn, .tls_established, 0, null, .none);
         }
         // Once the mTLS handshake completes, bind the presented client cert's
@@ -22798,6 +23028,7 @@ pub const LinuxServer = struct {
         {
             if (conn.tls.?.enableKtlsRx(conn.fd)) |_| {
                 conn.tls_rx_offloaded = true;
+                self.noteKtlsOffload(conn, .rx);
                 self.publishWhoisProfile(conn, true);
             } else |err| {
                 // Attach failed: stay on userspace RX, but make the failure
@@ -22832,6 +23063,7 @@ pub const LinuxServer = struct {
         };
         conn.ktls_attach_pending = false;
         conn.tls_tx_offloaded = true;
+        self.noteKtlsOffload(conn, .tx);
         self.publishWhoisProfile(conn, true);
     }
 
@@ -47092,6 +47324,10 @@ pub const LinuxServer = struct {
         conn.session.password_sasl_allowed = true;
         conn.tls_tx_offloaded = ts.tx_offloaded;
         conn.tls_rx_offloaded = ts.rx_offloaded;
+        // Carried connections finished their handshake in a predecessor:
+        // never count their later record faults as handshake failures.
+        conn.tls_handshake_finished = true;
+        if (ts.tx_offloaded or ts.rx_offloaded) self.noteKtlsActive(conn);
         if (ts.certfp.len != 0) {
             @memcpy(&conn.certfp_buf, ts.certfp);
             conn.session.tls_certfp = conn.certfp_buf[0..];
@@ -73160,17 +73396,34 @@ pub const LinuxServer = struct {
     /// current certs and NOTICEs). `tls` borrows caller-owned config that must
     /// outlive the reload call; REHASH uses `self.reload_parsed`, while ACME uses
     /// main's held boot config on reactor 0.
+    ///
+    /// This path reloads only the default certificate (and its TLS 1.2 leg):
+    /// the current `[[tls.sni]]` and `[[tls.ech_keys]]` generations keep
+    /// serving unchanged. ACME holds the boot config, which a later REHASH
+    /// does not update, so reloading SNI/ECH from it would silently revert
+    /// operator changes; and one expired manually managed SNI certificate must
+    /// never block renewal of the ACME-managed default certificate.
     pub fn reloadTlsCerts(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls) !TlsReloadOutcome {
-        return self.reloadTlsCertsLocked(io, tls, false);
+        return self.reloadTlsCertsLocked(io, tls, false, .default_only);
     }
 
     /// REHASH may keep a pathless WebTransport bootstrap certificate when an
     /// active QUIC connection makes replacement impossible, but only after
     /// the caller proved the parsed TLS settings are unchanged. Explicit ACME
     /// reload requests and normal reload callers retain strict rotation.
+    ///
+    /// REHASH also reloads `[[tls.sni]]` and `[[tls.ech_keys]]` from `tls` in
+    /// the same all-or-nothing transaction as the default certificate.
     pub fn reloadTlsCertsForRehash(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls, unchanged_tls_proven: bool) !TlsReloadOutcome {
-        return self.reloadTlsCertsLocked(io, tls, unchanged_tls_proven);
+        return self.reloadTlsCertsLocked(io, tls, unchanged_tls_proven, .with_sni_ech);
     }
+
+    const TlsReloadScope = enum {
+        /// ACME renewal: the default certificate only.
+        default_only,
+        /// Operator REHASH: the default certificate plus SNI and ECH.
+        with_sni_ech,
+    };
 
     /// The caller holds the accepted-event boundary. A TLS engine keeps its
     /// certificate config until its handshake finishes, so reload cadence is
@@ -73183,6 +73436,7 @@ pub const LinuxServer = struct {
             if (generation.side) |loaded| {
                 if (history.tls_config.cert_chain.ptr == loaded.cert_chain.ptr) return true;
             }
+            if (tlsConfigBorrowsSniEch(&history.tls_config, generation)) return true;
         }
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items) |*slot| {
@@ -73197,9 +73451,51 @@ pub const LinuxServer = struct {
                     if (tls.cfg13.cert_chain.ptr == loaded.cert_chain.ptr) return true;
                     if (tls.cfg12) |cfg| if (cfg.cert_chain.ptr == loaded.cert_chain.ptr) return true;
                 }
+                if (tlsConfigBorrowsSniEch(&tls.cfg13, generation)) return true;
             }
         }
         return false;
+    }
+
+    /// True when `cfg` still points into the generation's SNI selection list or
+    /// ECH material. The selected SNI chain, its keys, the ECH configs and the
+    /// retry list all live in those same allocations.
+    fn tlsConfigBorrowsSniEch(cfg: *const tls_server.Config, generation: *const RetiredTlsGeneration) bool {
+        if (generation.sni) |sni| {
+            if (sni.certs.len != 0 and cfg.sni_certs.ptr == sni.certs.ptr) return true;
+        }
+        if (generation.ech) |ech| {
+            if (ech.keys.len != 0 and cfg.ech_keys.ptr == ech.keys.ptr) return true;
+            if (ech.retry_config_list.len != 0 and cfg.ech_retry_config_list.ptr == ech.retry_config_list.ptr) return true;
+        }
+        return false;
+    }
+
+    fn validateReloadedChainAny(chain: []const []const u8) anyerror!void {
+        return validateReloadedChain(chain);
+    }
+
+    /// Load `[[tls.sni]]` into a fresh server-owned generation. Each chain is
+    /// validated like the default leaf and each key must match its leaf. An
+    /// empty list yields an empty generation (SNI selection off).
+    fn loadTlsSniGeneration(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls) !TlsSniGeneration {
+        var generation = TlsSniGeneration{};
+        errdefer generation.deinit(self.allocator);
+        if (tls.sni.len == 0) return generation;
+        generation.certs = try tls_sni_load.buildSniCerts(
+            self.allocator,
+            io,
+            tls.sni,
+            tls.dns_name,
+            &generation.loaded,
+            validateReloadedChainAny,
+            tls_sni_load.default_loader,
+        );
+        for (generation.loaded.items) |*entry| {
+            try native_windows_tls_proof.validateIdentity(native_windows_tls_proof.fromLoaded(entry));
+        }
+        try generation.ownServerNames(self.allocator);
+        return generation;
     }
 
     fn pruneRetiredTlsGenerations(self: *LinuxServer) void {
@@ -73214,7 +73510,7 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn reloadTlsCertsLocked(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls, unchanged_tls_proven: bool) !TlsReloadOutcome {
+    fn reloadTlsCertsLocked(self: *LinuxServer, io: std.Io, tls: *const config_format.Config.Tls, unchanged_tls_proven: bool, scope: TlsReloadScope) !TlsReloadOutcome {
         // Mirror the boot gate in main.zig: only [tls] enabled nodes load certs.
         if (!tls.enabled or self.config.tls_cert_chain.len == 0) return .not_configured;
 
@@ -73279,6 +73575,41 @@ pub const LinuxServer = struct {
             }
         }
 
+        // `[[tls.sni]]` and `[[tls.ech_keys]]` reload in the same transaction as
+        // the default leaf: every entry is loaded and the complete candidate is
+        // proven by constructing a TLS engine from it before anything is
+        // published, so one bad file keeps the whole current set serving.
+        // Native Windows keeps them as static Helix-proof inputs (restart).
+        // A default-only (ACME) reload keeps the serving SNI/ECH generations
+        // and proves the new default certificate against them.
+        const swap_sni_ech = tls_sni_ech_hot_reload and scope == .with_sni_ech;
+        var new_sni: ?TlsSniGeneration = null;
+        errdefer if (new_sni) |*g| g.deinit(self.allocator);
+        var new_ech: ?tls_ech_load.Loaded = null;
+        errdefer if (new_ech) |*e| e.deinit(self.allocator);
+        if (swap_sni_ech) {
+            new_sni = self.loadTlsSniGeneration(io, tls) catch |err| {
+                srvLog("onyx-server: TLS reload: [[tls.sni]] failed to load ({s}); keeping current certificates\n", .{@errorName(err)});
+                return err;
+            };
+            new_ech = tls_ech_load.load(self.allocator, io, tls.ech_keys) catch |err| {
+                srvLog("onyx-server: TLS reload: [[tls.ech_keys]] failed to load ({s}); keeping current certificates\n", .{@errorName(err)});
+                return err;
+            };
+        }
+        if (comptime tls_sni_ech_hot_reload) {
+            var probe = try tls_server.Server.init(self.allocator, .{
+                .cert_chain = loaded.cert_chain,
+                .signing_key = loaded.signing_key,
+                .ecdsa_p256_signing_key = loaded.ecdsa_p256_signing_key,
+                .rsa_signing_key = loaded.rsa_signing_key,
+                .sni_certs = if (new_sni) |g| g.certs else self.config.tls_sni_certs,
+                .ech_keys = if (new_ech) |e| e.keys else self.config.tls_ech_keys,
+                .ech_retry_config_list = if (new_ech) |e| e.retry_config_list else self.config.tls_ech_retry_config_list,
+            });
+            probe.deinit();
+        }
+
         const still_servable_expiry: ?i64 = if (self.ocsp_staple_owned) |der|
             managed_ocsp.stapleValidUntilForChain(
                 der,
@@ -73291,7 +73622,12 @@ pub const LinuxServer = struct {
         const still_servable_staple: ?[]u8 = if (still_servable_expiry != null) self.ocsp_staple_owned else null;
 
         self.pruneRetiredTlsGenerations();
-        const retiring = RetiredTlsGeneration{ .primary = self.reload_tls_prev, .side = self.reload_tls12_prev };
+        const retiring = RetiredTlsGeneration{
+            .primary = self.reload_tls_prev,
+            .side = self.reload_tls12_prev,
+            .sni = if (swap_sni_ech) self.reload_sni_prev else null,
+            .ech = if (swap_sni_ech) self.reload_ech_prev else null,
+        };
         const retain_retiring = self.tlsGenerationBorrowed(&retiring);
         if (retain_retiring) try self.reload_tls_retired.ensureUnusedCapacity(self.allocator, 1);
 
@@ -73330,6 +73666,8 @@ pub const LinuxServer = struct {
                 if (err == error.ActiveQuicContinuityUnsupported and unchanged_tls_proven and
                     tls.cert_path == null and tls.key_path == null)
                 {
+                    if (new_ech) |*e| e.deinit(self.allocator);
+                    if (new_sni) |*g| g.deinit(self.allocator);
                     if (new_tls12) |*side| side.deinit(self.allocator);
                     loaded.deinit(self.allocator);
                     return .unchanged;
@@ -73347,6 +73685,15 @@ pub const LinuxServer = struct {
         if (want_tls12) {
             self.config.tls12_cert_chain = tls12_chain;
             self.config.tls12_signing_key = tls12_key;
+        }
+        if (swap_sni_ech) {
+            self.config.tls_sni_certs = new_sni.?.certs;
+            self.config.tls_ech_keys = new_ech.?.keys;
+            self.config.tls_ech_retry_config_list = new_ech.?.retry_config_list;
+            self.reload_sni_prev = self.reload_sni;
+            self.reload_ech_prev = self.reload_ech;
+            self.reload_sni = new_sni;
+            self.reload_ech = new_ech;
         }
 
         // Keep a generation older than `*_prev` for as long as any unfinished
@@ -159071,6 +159418,588 @@ test "REHASH cert hot-reload rejects mismatched leaf and private key before publ
         try std.testing.expectEqualSlices(u8, &a.kp.public_key.toBytes(), &server.config.tls_signing_key.?.public_key.toBytes());
         try std.testing.expect(server.reload_tls == null);
     } else return error.SkipZigTest;
+}
+
+/// Write `leaf` and the Ed25519 key for `seed_byte` as PEM files into `tmp`
+/// and return cwd-relative paths (caller frees both).
+fn writeRehashTlsPair(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, leaf_der: []const u8, seed_byte: u8, cert_name: []const u8, key_name: []const u8) !struct { cert: []u8, key: []u8 } {
+    const ed25519_pkcs8 = @import("../proto/ed25519_pkcs8.zig");
+    const pem = @import("../proto/pem.zig");
+    const seed = @as([std.crypto.sign.Ed25519.KeyPair.seed_length]u8, @splat(seed_byte));
+    var key_der_buf: [ed25519_pkcs8.der_len]u8 = undefined;
+    const key_der = try ed25519_pkcs8.encode(&key_der_buf, seed);
+    var cert_pem_buf: [4096]u8 = undefined;
+    const cert_pem = try pem.encode(&cert_pem_buf, "CERTIFICATE", leaf_der);
+    var key_pem_buf: [4096]u8 = undefined;
+    const key_pem = try pem.encode(&key_pem_buf, "PRIVATE KEY", key_der);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = cert_name, .data = cert_pem });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = key_name, .data = key_pem });
+    const cert_path = try rehashTmpPath(allocator, tmp, cert_name);
+    errdefer allocator.free(cert_path);
+    return .{ .cert = cert_path, .key = try rehashTmpPath(allocator, tmp, key_name) };
+}
+
+/// A single-entry draft-13 ECHConfigList for tests (X25519, HKDF-SHA256,
+/// ChaCha20-Poly1305), the same shape the deployment publishes.
+fn testEchConfigList(buf: []u8, config_id: u8, public_key: []const u8, public_name: []const u8) []const u8 {
+    const ech_seal = @import("../crypto/ech_seal.zig");
+    const ech_config = @import("../proto/ech_config.zig");
+    var n: usize = 6; // list length + version + entry length
+    buf[n] = config_id;
+    n += 1;
+    std.mem.writeInt(u16, buf[n..][0..2], ech_seal.kem_id, .big);
+    std.mem.writeInt(u16, buf[n + 2 ..][0..2], @intCast(public_key.len), .big);
+    n += 4;
+    @memcpy(buf[n..][0..public_key.len], public_key);
+    n += public_key.len;
+    std.mem.writeInt(u16, buf[n..][0..2], 4, .big);
+    std.mem.writeInt(u16, buf[n + 2 ..][0..2], ech_seal.kdf_id, .big);
+    std.mem.writeInt(u16, buf[n + 4 ..][0..2], ech_seal.aead_id, .big);
+    n += 6;
+    buf[n] = 64; // maximum_name_length
+    buf[n + 1] = @intCast(public_name.len);
+    n += 2;
+    @memcpy(buf[n..][0..public_name.len], public_name);
+    n += public_name.len;
+    std.mem.writeInt(u16, buf[n..][0..2], 0, .big); // no extensions
+    n += 2;
+    std.mem.writeInt(u16, buf[0..2], @intCast(n - 2), .big);
+    std.mem.writeInt(u16, buf[2..4], ech_config.version_draft13, .big);
+    std.mem.writeInt(u16, buf[4..6], @intCast(n - 6), .big);
+    return buf[0..n];
+}
+
+fn initTlsPolicyTestServer(allocator: std.mem.Allocator, cfg: Config) !*Server {
+    const server = try allocator.create(Server);
+    errdefer allocator.destroy(server);
+    server.* = try Server.init(allocator, cfg);
+    return server;
+}
+
+test "TLS listener config carries ALPN, cert compression, cert signature policy, ticket lifetime and ECH retry list" {
+    if (comptime !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try mintRehashTlsLeaf(&leaf_buf, 0x91, "policy.test");
+    const chain = [_][]const u8{leaf.der};
+    const alpn = [_][]const u8{"irc"};
+    const hpke = @import("../crypto/hpke.zig");
+    const ech_kp = try hpke.KeyPair.generateDeterministic(@splat(0x92));
+    var ech_buf: [256]u8 = undefined;
+    const ech_list = testEchConfigList(&ech_buf, 3, &ech_kp.public_key, "policy.test");
+    const ech_keys = [_]tls_server.EchKey{.{ .config = ech_list, .private_key = ech_kp.secret_key }};
+
+    // Engine defaults: an embedder that sets none of the new fields keeps the
+    // previous wire (no ALPN, no compression, default ticket lifetimes).
+    const plain = initTlsPolicyTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &chain, .tls_signing_key = leaf.kp }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        plain.deinit();
+        allocator.destroy(plain);
+    }
+    const plain13 = plain.tls13Config(false);
+    try std.testing.expectEqual(@as(usize, 0), plain13.alpn_protocols.len);
+    try std.testing.expect(!plain13.enable_cert_compression and !plain13.enforce_cert_signature_algorithms);
+    try std.testing.expectEqual(@as(u32, 86_400), plain13.ticket_lifetime_seconds);
+    try std.testing.expectEqual(@as(u32, 7200), plain.tls12Config().ticket_lifetime_seconds);
+    try std.testing.expectEqual(@as(usize, 0), plain13.ech_retry_config_list.len);
+    try std.testing.expectEqual(@as(usize, 0), plain.wsTls13Config().alpn_protocols.len);
+
+    const tuned = initTlsPolicyTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = leaf.kp,
+        .tls_alpn_protocols = &alpn,
+        .tls_cert_compression = true,
+        .tls_enforce_cert_signature_algorithms = true,
+        .tls_ticket_lifetime_seconds = 3600,
+        .tls_ech_keys = &ech_keys,
+        .tls_ech_retry_config_list = ech_list,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        tuned.deinit();
+        allocator.destroy(tuned);
+    }
+    const cfg13 = tuned.tls13Config(true);
+    try std.testing.expectEqual(@as(usize, 1), cfg13.alpn_protocols.len);
+    try std.testing.expectEqualStrings("irc", cfg13.alpn_protocols[0]);
+    try std.testing.expect(cfg13.enable_cert_compression and cfg13.enforce_cert_signature_algorithms);
+    try std.testing.expectEqual(@as(u32, 3600), cfg13.ticket_lifetime_seconds);
+    try std.testing.expectEqualSlices(u8, ech_list, cfg13.ech_retry_config_list);
+    const cfg12 = tuned.tls12Config();
+    try std.testing.expectEqualStrings("irc", cfg12.alpn_protocols[0]);
+    try std.testing.expectEqual(@as(u32, 3600), cfg12.ticket_lifetime_seconds);
+    // The browser listener never offers "irc" and never requests a client cert.
+    const ws13 = tuned.wsTls13Config();
+    try std.testing.expectEqual(@as(usize, 1), ws13.alpn_protocols.len);
+    try std.testing.expectEqualStrings("http/1.1", ws13.alpn_protocols[0]);
+    try std.testing.expect(!ws13.request_client_cert);
+    try std.testing.expectEqualStrings("http/1.1", tuned.wsTls12Config().alpn_protocols[0]);
+    // A retry list without keys is never emitted.
+    tuned.config.tls_ech_keys = &.{};
+    try std.testing.expectEqual(@as(usize, 0), tuned.tls13Config(false).ech_retry_config_list.len);
+}
+
+test "ALPN on the IRC TLS listener selects irc and never refuses a client offering none or other ids" {
+    if (comptime !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const tls_client = @import("../crypto/tls_client.zig");
+    const allocator = std.testing.allocator;
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try mintRehashTlsLeaf(&leaf_buf, 0x93, "alpn.test");
+    const chain = [_][]const u8{leaf.der};
+    const alpn = [_][]const u8{"irc"};
+    const server = initTlsPolicyTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &chain, .tls_signing_key = leaf.kp, .tls_alpn_protocols = &alpn }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    const Case = struct { offered: []const []const u8, want: ?[]const u8, ws: bool = false };
+    const cases = [_]Case{
+        .{ .offered = &.{ "h2", "irc" }, .want = "irc" },
+        .{ .offered = &.{"h2"}, .want = null },
+        .{ .offered = &.{}, .want = null },
+        .{ .offered = &.{ "h2", "http/1.1" }, .want = "http/1.1", .ws = true },
+        .{ .offered = &.{"irc"}, .want = null, .ws = true },
+    };
+    for (cases) |case| {
+        var conn = try tls_conn.TlsConn.init(allocator, if (case.ws) server.wsTls13Config() else server.tls13Config(false));
+        defer conn.deinit();
+        var client = try tls_client.Client.init(allocator, .{ .server_name = "alpn.test", .trust_anchors = &.{leaf.der}, .alpn_protocols = case.offered });
+        defer client.deinit();
+        const ch = try client.start();
+        defer allocator.free(ch);
+        const flight = try conn.onInbound(ch);
+        const fin = switch (try client.feed(flight.handshake_bytes)) {
+            .bytes_to_send => |b| b,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer allocator.free(fin);
+        _ = try conn.onInbound(fin);
+        try std.testing.expect(conn.handshakeDone());
+        if (case.want) |want| {
+            try std.testing.expectEqualStrings(want, conn.selectedAlpn().?);
+            try std.testing.expectEqualStrings(want, client.selected_alpn.?);
+        } else {
+            try std.testing.expect(conn.selectedAlpn() == null);
+            try std.testing.expect(client.selected_alpn == null);
+        }
+    }
+}
+
+test "ECH keys make the TLS listener send retry_configs to a client holding a stale config" {
+    if (comptime !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const tls_client = @import("../crypto/tls_client.zig");
+    const hpke = @import("../crypto/hpke.zig");
+    const allocator = std.testing.allocator;
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try mintRehashTlsLeaf(&leaf_buf, 0x94, "cover.example");
+    const chain = [_][]const u8{leaf.der};
+
+    const server_kp = try hpke.KeyPair.generateDeterministic(@splat(0x95));
+    var server_buf: [256]u8 = undefined;
+    const server_list = testEchConfigList(&server_buf, 9, &server_kp.public_key, "cover.example");
+    const keys = [_]tls_server.EchKey{.{ .config = server_list, .private_key = server_kp.secret_key }};
+    const retry = try tls_ech_load.buildRetryConfigList(allocator, &keys);
+    defer allocator.free(retry);
+
+    const stale_kp = try hpke.KeyPair.generateDeterministic(@splat(0x96));
+    var stale_buf: [256]u8 = undefined;
+    const stale_list = testEchConfigList(&stale_buf, 7, &stale_kp.public_key, "cover.example");
+
+    const server = initTlsPolicyTestServer(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .tls_cert_chain = &chain,
+        .tls_signing_key = leaf.kp,
+        .tls_ech_keys = &keys,
+        .tls_ech_retry_config_list = retry,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+    var conn = try tls_conn.TlsConn.init(allocator, server.tls13Config(false));
+    defer conn.deinit();
+    var client = try tls_client.Client.init(allocator, .{ .server_name = "cover.example", .trust_anchors = &.{leaf.der}, .ech_config_list = stale_list });
+    defer client.deinit();
+    const ch = try client.start();
+    defer allocator.free(ch);
+    try std.testing.expect(client.echOffered());
+    const flight = try conn.onInbound(ch);
+    if (client.feed(flight.handshake_bytes)) |result| switch (result) {
+        .bytes_to_send => |b| allocator.free(b),
+        .need_more => {},
+    } else |_| {}
+    try std.testing.expectEqual(@as(?bool, false), client.echAccepted());
+    const got = client.echRetryConfigs() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, server_list, got);
+}
+
+test "REHASH reloads SNI certificates and ECH keys transactionally with the default certificate" {
+    if (comptime !tls_sni_ech_hot_reload or !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const hpke = @import("../crypto/hpke.zig");
+    const allocator = std.testing.allocator;
+
+    var a_buf: [1024]u8 = undefined;
+    const a = try mintRehashTlsLeaf(&a_buf, 0xa1, "a.test");
+    const boot_chain = [_][]const u8{a.der};
+    const server = initTlsPolicyTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &boot_chain, .tls_signing_key = a.kp, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b_buf: [1024]u8 = undefined;
+    const b = try mintRehashTlsLeaf(&b_buf, 0xa2, "b.test");
+    const b_paths = try writeRehashTlsPair(allocator, tmp, b.der, 0xa2, "b.pem", "b.key");
+    defer allocator.free(b_paths.cert);
+    defer allocator.free(b_paths.key);
+    var s_buf: [1024]u8 = undefined;
+    const s = try mintRehashTlsLeaf(&s_buf, 0xa3, "sni.test");
+    const s_paths = try writeRehashTlsPair(allocator, tmp, s.der, 0xa3, "s.pem", "s.key");
+    defer allocator.free(s_paths.cert);
+    defer allocator.free(s_paths.key);
+    // A key that does not match `s` — an invalid SNI entry.
+    const bad_paths = try writeRehashTlsPair(allocator, tmp, s.der, 0xa4, "bad.pem", "bad.key");
+    defer allocator.free(bad_paths.cert);
+    defer allocator.free(bad_paths.key);
+
+    const ech_kp = try hpke.KeyPair.generateDeterministic(@splat(0xa5));
+    var ech_buf: [256]u8 = undefined;
+    const ech_list = testEchConfigList(&ech_buf, 5, &ech_kp.public_key, "b.test");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ech.bin", .data = ech_list });
+    const ech_path = try rehashTmpPath(allocator, tmp, "ech.bin");
+    defer allocator.free(ech_path);
+
+    const names = [_][]const u8{"sni.test"};
+    var sni_good = [_]config_format.Config.SniCertDef{.{ .server_names = &names, .cert_path = s_paths.cert, .key_path = s_paths.key }};
+    var sni_bad = [_]config_format.Config.SniCertDef{.{ .server_names = &names, .cert_path = bad_paths.cert, .key_path = bad_paths.key }};
+    var ech_good = [_]config_format.Config.EchKeyDef{.{ .config_path = ech_path, .private_key = ech_kp.secret_key }};
+    var ech_bad = [_]config_format.Config.EchKeyDef{.{ .config_path = ech_path, .private_key = @splat(0x42) }};
+
+    const tls_full = config_format.Config.Tls{ .enabled = true, .cert_path = b_paths.cert, .key_path = b_paths.key, .dns_name = "b.test", .sni = &sni_good, .ech_keys = &ech_good };
+    try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.reloaded, try server.reloadTlsCertsForRehash(std.testing.io, &tls_full, false));
+    try std.testing.expectEqual(@as(usize, 1), server.config.tls_sni_certs.len);
+    try std.testing.expectEqualSlices(u8, s.der, server.config.tls_sni_certs[0].cert_chain[0]);
+    try std.testing.expectEqualStrings("sni.test", server.config.tls_sni_certs[0].server_names[0]);
+    try std.testing.expectEqual(@as(usize, 1), server.config.tls_ech_keys.len);
+    try std.testing.expectEqualSlices(u8, ech_list, server.config.tls_ech_retry_config_list);
+    try std.testing.expectEqualSlices(u8, ech_list, server.tls13Config(false).ech_retry_config_list);
+
+    // A handshake left incomplete borrows this SNI/ECH generation.
+    const pending_tls = try allocator.create(tls_conn.TlsConn);
+    pending_tls.* = try tls_conn.TlsConn.init(allocator, server.tls13Config(false));
+    const pending_id = try server.rx().clients.alloc(ConnState.init(-1));
+    server.rx().clients.get(pending_id).?.tls = pending_tls;
+    var pending_live = true;
+    defer if (pending_live) {
+        server.rx().clients.get(pending_id).?.tls = null;
+        pending_tls.deinit();
+        allocator.destroy(pending_tls);
+        _ = server.rx().clients.free(pending_id);
+    };
+
+    // A bad SNI entry or a mismatched ECH key fails the whole reload and keeps
+    // every live pointer exactly where it was, default certificate included.
+    const live_chain = server.config.tls_cert_chain.ptr;
+    const live_sni = server.config.tls_sni_certs.ptr;
+    const live_ech = server.config.tls_ech_keys.ptr;
+    const live_retry = server.config.tls_ech_retry_config_list.ptr;
+    const tls_bad_sni = config_format.Config.Tls{ .enabled = true, .cert_path = b_paths.cert, .key_path = b_paths.key, .dns_name = "b.test", .sni = &sni_bad, .ech_keys = &ech_good };
+    try std.testing.expectError(error.TlsKeyMismatch, server.reloadTlsCertsForRehash(std.testing.io, &tls_bad_sni, false));
+    const tls_bad_ech = config_format.Config.Tls{ .enabled = true, .cert_path = b_paths.cert, .key_path = b_paths.key, .dns_name = "b.test", .sni = &sni_good, .ech_keys = &ech_bad };
+    try std.testing.expectError(error.BadEchConfig, server.reloadTlsCertsForRehash(std.testing.io, &tls_bad_ech, false));
+    try std.testing.expectEqual(live_chain, server.config.tls_cert_chain.ptr);
+    try std.testing.expectEqual(live_sni, server.config.tls_sni_certs.ptr);
+    try std.testing.expectEqual(live_ech, server.config.tls_ech_keys.ptr);
+    try std.testing.expectEqual(live_retry, server.config.tls_ech_retry_config_list.ptr);
+
+    // Removing both lists takes effect on the next good reload; the borrowed
+    // generation stays alive until its handshake ends, then is released.
+    const tls_none = config_format.Config.Tls{ .enabled = true, .cert_path = b_paths.cert, .key_path = b_paths.key, .dns_name = "b.test" };
+    _ = try server.reloadTlsCertsForRehash(std.testing.io, &tls_none, false);
+    try std.testing.expectEqual(@as(usize, 0), server.config.tls_sni_certs.len);
+    try std.testing.expectEqual(@as(usize, 0), server.config.tls_ech_keys.len);
+    try std.testing.expectEqual(@as(usize, 0), server.tls13Config(false).ech_retry_config_list.len);
+    try std.testing.expectEqual(live_sni, server.reload_sni_prev.?.certs.ptr);
+    _ = try server.reloadTlsCertsForRehash(std.testing.io, &tls_none, false);
+    try std.testing.expectEqual(@as(usize, 1), server.reload_tls_retired.items.len);
+    try std.testing.expectEqual(live_sni, server.reload_tls_retired.items[0].sni.?.certs.ptr);
+    try std.testing.expectEqual(live_ech, server.reload_tls_retired.items[0].ech.?.keys.ptr);
+    server.rx().clients.get(pending_id).?.tls = null;
+    pending_tls.deinit();
+    allocator.destroy(pending_tls);
+    _ = server.rx().clients.free(pending_id);
+    pending_live = false;
+    server.pruneRetiredTlsGenerations();
+    try std.testing.expectEqual(@as(usize, 0), server.reload_tls_retired.items.len);
+}
+
+test "REHASH SNI generation owns its server names after the parsed config is freed" {
+    if (comptime !tls_sni_ech_hot_reload or !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const tls_client = @import("../crypto/tls_client.zig");
+    const allocator = std.testing.allocator;
+
+    var a_buf: [1024]u8 = undefined;
+    const a = try mintRehashTlsLeaf(&a_buf, 0xc1, "a.test");
+    const boot_chain = [_][]const u8{a.der};
+    const server = initTlsPolicyTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &boot_chain, .tls_signing_key = a.kp, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b_buf: [1024]u8 = undefined;
+    const b = try mintRehashTlsLeaf(&b_buf, 0xc2, "b.test");
+    const b_paths = try writeRehashTlsPair(allocator, tmp, b.der, 0xc2, "b.pem", "b.key");
+    defer allocator.free(b_paths.cert);
+    defer allocator.free(b_paths.key);
+    var s_buf: [1024]u8 = undefined;
+    const s = try mintRehashTlsLeaf(&s_buf, 0xc3, "sni.test");
+    const s_paths = try writeRehashTlsPair(allocator, tmp, s.der, 0xc3, "s.pem", "s.key");
+    defer allocator.free(s_paths.cert);
+    defer allocator.free(s_paths.key);
+    const missing = try rehashTmpPath(allocator, tmp, "missing.pem");
+    defer allocator.free(missing);
+
+    // REHASH #1 loads from a heap config, as oper_cmd loads from
+    // `reload_parsed`, which the next REHASH commit frees.
+    {
+        const name = try allocator.dupe(u8, "sni.test");
+        defer {
+            @memset(name, 'X');
+            allocator.free(name);
+        }
+        const names = [_][]const u8{name};
+        var sni = [_]config_format.Config.SniCertDef{.{ .server_names = &names, .cert_path = s_paths.cert, .key_path = s_paths.key }};
+        const tls = config_format.Config.Tls{ .enabled = true, .cert_path = b_paths.cert, .key_path = b_paths.key, .dns_name = "b.test", .sni = &sni };
+        try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.reloaded, try server.reloadTlsCertsForRehash(std.testing.io, &tls, false));
+    }
+
+    // REHASH #2 freed that config and its TLS reload fails; the first
+    // generation keeps serving and must not read the freed names.
+    const tls_bad = config_format.Config.Tls{ .enabled = true, .cert_path = missing, .key_path = b_paths.key, .dns_name = "b.test" };
+    try std.testing.expectError(error.FileNotFound, server.reloadTlsCertsForRehash(std.testing.io, &tls_bad, false));
+    try std.testing.expectEqual(@as(usize, 1), server.config.tls_sni_certs.len);
+    try std.testing.expectEqualStrings("sni.test", server.config.tls_sni_certs[0].server_names[0]);
+
+    // An SNI handshake still selects the SNI certificate.
+    var conn = try tls_conn.TlsConn.init(allocator, server.tls13Config(false));
+    defer conn.deinit();
+    {
+        var client = try tls_client.Client.init(allocator, .{ .server_name = "sni.test", .trust_anchors = &.{s.der} });
+        defer client.deinit();
+        const ch = try client.start();
+        defer allocator.free(ch);
+        const flight = try conn.onInbound(ch);
+        const fin = switch (try client.feed(flight.handshake_bytes)) {
+            .bytes_to_send => |bytes| bytes,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer allocator.free(fin);
+        _ = try conn.onInbound(fin);
+    }
+    try std.testing.expect(conn.handshakeDone());
+
+    // The metrics render labels the SNI certificate by its owned name.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try server.writeTlsPrometheus(allocator, &out, 1_800_000_000);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "source=\"sni\",server_name=\"sni.test\"") != null);
+}
+
+test "ACME TLS reload renews only the default certificate and keeps REHASH SNI and ECH generations" {
+    if (comptime !tls_sni_ech_hot_reload or !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const hpke = @import("../crypto/hpke.zig");
+    const allocator = std.testing.allocator;
+
+    var a_buf: [1024]u8 = undefined;
+    const a = try mintRehashTlsLeaf(&a_buf, 0xd1, "a.test");
+    const boot_chain = [_][]const u8{a.der};
+    const server = initTlsPolicyTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &boot_chain, .tls_signing_key = a.kp, .crypto_io = std.testing.io }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b_buf: [1024]u8 = undefined;
+    const b = try mintRehashTlsLeaf(&b_buf, 0xd2, "b.test");
+    const b_paths = try writeRehashTlsPair(allocator, tmp, b.der, 0xd2, "b.pem", "b.key");
+    defer allocator.free(b_paths.cert);
+    defer allocator.free(b_paths.key);
+    var c_buf: [1024]u8 = undefined;
+    const c = try mintRehashTlsLeaf(&c_buf, 0xd3, "b.test");
+    const c_paths = try writeRehashTlsPair(allocator, tmp, c.der, 0xd3, "c.pem", "c.key");
+    defer allocator.free(c_paths.cert);
+    defer allocator.free(c_paths.key);
+    var s_buf: [1024]u8 = undefined;
+    const s = try mintRehashTlsLeaf(&s_buf, 0xd4, "sni.test");
+    const s_paths = try writeRehashTlsPair(allocator, tmp, s.der, 0xd4, "s.pem", "s.key");
+    defer allocator.free(s_paths.cert);
+    defer allocator.free(s_paths.key);
+    const missing = try rehashTmpPath(allocator, tmp, "gone.pem");
+    defer allocator.free(missing);
+
+    const ech_kp = try hpke.KeyPair.generateDeterministic(@splat(0xd5));
+    var ech_buf: [256]u8 = undefined;
+    const ech_list = testEchConfigList(&ech_buf, 6, &ech_kp.public_key, "b.test");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ech.bin", .data = ech_list });
+    const ech_path = try rehashTmpPath(allocator, tmp, "ech.bin");
+    defer allocator.free(ech_path);
+
+    const names = [_][]const u8{"sni.test"};
+    var sni_rehash = [_]config_format.Config.SniCertDef{.{ .server_names = &names, .cert_path = s_paths.cert, .key_path = s_paths.key }};
+    var ech_rehash = [_]config_format.Config.EchKeyDef{.{ .config_path = ech_path, .private_key = ech_kp.secret_key }};
+    const tls_rehash = config_format.Config.Tls{ .enabled = true, .cert_path = b_paths.cert, .key_path = b_paths.key, .dns_name = "b.test", .sni = &sni_rehash, .ech_keys = &ech_rehash };
+    _ = try server.reloadTlsCertsForRehash(std.testing.io, &tls_rehash, false);
+    const live_sni = server.config.tls_sni_certs.ptr;
+    const live_ech = server.config.tls_ech_keys.ptr;
+    const live_retry = server.config.tls_ech_retry_config_list.ptr;
+
+    // ACME reloads from the boot config, which still names an SNI file that
+    // has since been deleted. The default certificate renews regardless and
+    // the REHASH SNI/ECH generations keep serving untouched.
+    const boot_names = [_][]const u8{"old.test"};
+    var sni_boot = [_]config_format.Config.SniCertDef{.{ .server_names = &boot_names, .cert_path = missing, .key_path = s_paths.key }};
+    const tls_acme = config_format.Config.Tls{ .enabled = true, .cert_path = c_paths.cert, .key_path = c_paths.key, .dns_name = "b.test", .sni = &sni_boot };
+    try std.testing.expectEqual(LinuxServer.TlsReloadOutcome.reloaded, try server.reloadTlsCerts(std.testing.io, &tls_acme));
+    try std.testing.expectEqualSlices(u8, c.der, server.config.tls_cert_chain[0]);
+    try std.testing.expectEqual(live_sni, server.config.tls_sni_certs.ptr);
+    try std.testing.expectEqual(live_ech, server.config.tls_ech_keys.ptr);
+    try std.testing.expectEqual(live_retry, server.config.tls_ech_retry_config_list.ptr);
+    try std.testing.expectEqualStrings("sni.test", server.config.tls_sni_certs[0].server_names[0]);
+    try std.testing.expectEqualSlices(u8, ech_list, server.tls13Config(false).ech_retry_config_list);
+    try std.testing.expectEqual(live_sni, server.reload_sni.?.certs.ptr);
+}
+
+test "TLS metrics count handshakes, failures and kTLS, and report OCSP state and certificate expiry without ACME" {
+    if (comptime !(builtin.os.tag == .linux or builtin.os.tag == .openbsd)) return error.SkipZigTest;
+    const tls_client = @import("../crypto/tls_client.zig");
+    const allocator = std.testing.allocator;
+    var leaf_buf: [1024]u8 = undefined;
+    const leaf = try mintRehashTlsLeaf(&leaf_buf, 0xb1, "metrics.test");
+    const chain = [_][]const u8{leaf.der};
+    var sni_buf: [1024]u8 = undefined;
+    const sni_leaf = try mintRehashTlsLeaf(&sni_buf, 0xb2, "sni.metrics.test");
+    const sni_chain = [_][]const u8{sni_leaf.der};
+    const sni_names = [_][]const u8{"sni.metrics.test"};
+    const sni = [_]tls_server.SniCert{.{ .server_names = &sni_names, .cert_chain = &sni_chain, .signing_key = sni_leaf.kp }};
+    const server = initTlsPolicyTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .tls_cert_chain = &chain, .tls_signing_key = leaf.kp, .tls_sni_certs = &sni }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer {
+        server.deinit();
+        allocator.destroy(server);
+    }
+
+    // One completed handshake, recorded once even if noted twice.
+    const done_tls = try allocator.create(tls_conn.TlsConn);
+    done_tls.* = try tls_conn.TlsConn.init(allocator, server.tls13Config(false));
+    const done_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const done = server.rx().clients.get(done_id).?;
+    done.tls = done_tls;
+    defer {
+        done.tls = null;
+        done_tls.deinit();
+        allocator.destroy(done_tls);
+        _ = server.rx().clients.free(done_id);
+    }
+    {
+        var client = try tls_client.Client.init(allocator, .{ .server_name = "metrics.test", .trust_anchors = &.{leaf.der} });
+        defer client.deinit();
+        const ch = try client.start();
+        defer allocator.free(ch);
+        const flight = try done_tls.onInbound(ch);
+        const fin = switch (try client.feed(flight.handshake_bytes)) {
+            .bytes_to_send => |bytes| bytes,
+            .need_more => return error.TestUnexpectedResult,
+        };
+        defer allocator.free(fin);
+        _ = try done_tls.onInbound(fin);
+    }
+    try std.testing.expect(done_tls.handshakeDone());
+    server.noteTlsHandshakeComplete(done);
+    server.noteTlsHandshakeComplete(done);
+    // A record fault after the handshake is not a handshake failure.
+    server.failTls(done, error.RecordAuthenticationFailed);
+
+    // A connection that fails during the handshake is counted by reason.
+    const pending_tls = try allocator.create(tls_conn.TlsConn);
+    pending_tls.* = try tls_conn.TlsConn.init(allocator, server.tls13Config(false));
+    const pending_id = try server.rx().clients.alloc(ConnState.init(-1));
+    const pending = server.rx().clients.get(pending_id).?;
+    pending.tls = pending_tls;
+    defer {
+        pending.tls = null;
+        pending_tls.deinit();
+        allocator.destroy(pending_tls);
+        _ = server.rx().clients.free(pending_id);
+    }
+    server.failTls(pending, error.UnsupportedGroup);
+    server.failTls(pending, error.UnsupportedGroup); // terminal: counted once
+
+    // kTLS gauge: one unit per connection, released with the connection stats.
+    server.noteKtlsOffload(done, .tx);
+    server.noteKtlsOffload(done, .rx);
+    try std.testing.expectEqual(@as(i64, 1), server.tls_ktls_active.load(.acquire));
+
+    const not_after: i64 = 4_102_444_800;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try server.writeTlsPrometheus(allocator, &out, not_after - 10 * 86_400 - 5);
+    for ([_][]const u8{
+        "onyx_tls_handshakes_total{version=\"tls13\"} 1\n",
+        "onyx_tls_handshake_failures_total{reason=\"no_shared_group\"} 1\n",
+        "onyx_tls_handshake_failures_total{reason=\"bad_record\"} 0\n",
+        "onyx_tls_ktls_offloads_total{direction=\"tx\"} 1\n",
+        "onyx_tls_ktls_offloads_total{direction=\"rx\"} 1\n",
+        "onyx_tls_ktls_active 1\n",
+        "onyx_tls_ocsp_staple_status{status=\"none\"} 1\n",
+        "onyx_tls_ocsp_staple_status{status=\"good\"} 0\n",
+        "onyx_tls_certificate_expiry_days{source=\"default\",server_name=\"\"} 10\n",
+        "onyx_tls_certificate_expiry_days{source=\"sni\",server_name=\"sni.metrics.test\"} 10\n",
+    }) |needle| {
+        if (std.mem.indexOf(u8, out.items, needle) == null) {
+            std.debug.print("missing: {s}\n--- got ---\n{s}\n", .{ needle, out.items });
+            return error.TestExpectedEqual;
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "onyx_tls_ocsp_staple_age_seconds") == null);
+    out.clearRetainingCapacity();
+    try server.writeTlsPrometheus(allocator, &out, not_after + 1);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "onyx_tls_certificate_expiry_days{source=\"default\",server_name=\"\"} -1\n") != null);
+
+    done.stats_client_counted = false;
+    server.dropClientStats(done);
+    try std.testing.expectEqual(@as(i64, 0), server.tls_ktls_active.load(.acquire));
 }
 
 test "Windows OCSP publication reaches TLS config with exact DER and exclusive expiry" {

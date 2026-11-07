@@ -22,7 +22,6 @@ const random = @import("random.zig");
 const ratchet = @import("ratchet.zig");
 const hpke = @import("hpke.zig");
 const treekem = @import("treekem.zig");
-const toml = @import("../proto/toml.zig");
 
 const X25519 = std.crypto.dh.X25519;
 
@@ -33,17 +32,10 @@ pub const PublicKey = [X25519.public_length]u8;
 /// Historic default for the double-ratchet's max cached skipped message keys.
 pub const default_max_skip_default: usize = 256;
 
-/// Operationally tunable max skipped message keys cached by the double ratchet.
-/// Overridable via `[tls].ratchet_max_skip`; defaults preserve prior behavior.
+/// Max skipped message keys cached by the double ratchet. This module is not
+/// part of the daemon, so there is no config key for it (the former
+/// `[tls].ratchet_max_skip` is refused at config load); embedders set it.
 pub var default_max_skip: usize = default_max_skip_default;
-
-/// Overlay `[tls].ratchet_max_skip` onto the module-level ratchet skip cap.
-/// Absent or zero values leave the current cap unchanged (behavior preserved).
-pub fn applyToml(doc: *const toml.Document) void {
-    if (doc.getUint("tls.ratchet_max_skip")) |v| {
-        if (v != 0) default_max_skip = @intCast(v);
-    }
-}
 
 /// The ratchet `max_skip` (a `u32` in the ratchet API), clamped from the
 /// module-level `usize` default so an over-large config never overflows.
@@ -251,21 +243,12 @@ test "group: all members share a key; rekey on remove evicts the removed member"
     try testing.expect(!std.mem.eql(u8, &k1, &k2));
 }
 
-test "applyToml overrides ratchet_max_skip and restores cleanly" {
+test "default_max_skip feeds the ratchet cap and clamps to u32" {
     const saved = default_max_skip;
     defer default_max_skip = saved; // never leak the override into other tests
-    const allocator = testing.allocator;
 
-    var doc = try toml.parse(allocator, "[tls]\nratchet_max_skip = 64\n");
-    defer doc.deinit(allocator);
-    applyToml(&doc);
-    try testing.expectEqual(@as(usize, 64), default_max_skip);
+    default_max_skip = 64;
     try testing.expectEqual(@as(u32, 64), ratchetMaxSkip());
-
-    // Absent / zero leaves the current value unchanged.
-    default_max_skip = default_max_skip_default;
-    var zero = try toml.parse(allocator, "[tls]\nratchet_max_skip = 0\n");
-    defer zero.deinit(allocator);
-    applyToml(&zero);
-    try testing.expectEqual(default_max_skip_default, default_max_skip);
+    default_max_skip = std.math.maxInt(usize);
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), ratchetMaxSkip());
 }

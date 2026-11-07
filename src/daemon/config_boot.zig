@@ -13,6 +13,8 @@ const builtin = @import("builtin");
 const dlog = @import("dlog.zig");
 
 const config_format = @import("config_format.zig");
+const mooring_handshake = @import("../crypto/mooring_handshake.zig");
+const tls_client = @import("../crypto/tls_client.zig");
 const server = @import("server.zig");
 const oper_mod = @import("oper.zig");
 const conn_class = @import("conn_class.zig");
@@ -617,12 +619,36 @@ pub const TlsBootConfig = struct {
     /// key bytes borrow `parsed`; `main.zig` loads the ECHConfigList bytes and the
     /// TLS engine validates the public/private match before wiring the listener.
     ech_keys: []const config_format.Config.EchKeyDef = &.{},
+    /// Effective ALPN ids (`[tls] alpn`, default `["irc"]`). Borrows `parsed`.
+    alpn: []const []const u8 = config_format.Config.default_tls_alpn,
+    cert_compression: bool = false,
+    enforce_cert_signature_algorithms: bool = false,
+    ticket_lifetime_seconds: ?u32 = null,
+    /// Process-wide knobs applied once by `applyTlsProcessKnobs`.
+    mooring_max_meshpass_len: ?u16 = null,
+    debug_log: bool = false,
 };
+
+/// Apply the `[tls]` keys that tune process-wide module state rather than the
+/// listener: the Mooring mesh-password cap and outbound TLS client tracing.
+/// `main` calls this once at boot, before any mesh link or outbound TLS client
+/// exists; a Helix successor applies its own copy at its boot. Absent keys
+/// restore the module defaults, so the effective value always matches config.
+pub fn applyTlsProcessKnobs(tls: TlsBootConfig) void {
+    mooring_handshake.max_meshpass_len = tls.mooring_max_meshpass_len orelse mooring_handshake.default_max_meshpass_len;
+    tls_client.debug_log = tls.debug_log;
+}
 
 /// Project the parsed `[tls]` section onto the neutral boot struct. Borrows
 /// `cfg`'s string fields; keep `cfg` alive as long as the result is used.
 pub fn mapTlsBootConfig(cfg: config_format.Config) TlsBootConfig {
     return .{
+        .alpn = cfg.tlsAlpnProtocols(),
+        .cert_compression = cfg.tls.cert_compression,
+        .enforce_cert_signature_algorithms = cfg.tls.enforce_cert_signature_algorithms,
+        .ticket_lifetime_seconds = cfg.tls.ticket_lifetime_seconds,
+        .mooring_max_meshpass_len = cfg.tls.mooring_max_meshpass_len,
+        .debug_log = cfg.tls.debug_log,
         .enabled = cfg.tls.enabled,
         .port = cfg.tls.port,
         .cert_path = cfg.tls.cert_path,
@@ -2601,6 +2627,54 @@ test "tls section projects onto the boot tls config" {
     try testing.expectEqualStrings("leaf.pem", loaded.tls.cert_path.?);
     try testing.expectEqualStrings("leaf.key", loaded.tls.key_path.?);
     try testing.expectEqualStrings("irc.example.test", loaded.tls.dns_name);
+}
+
+test "tls policy keys surface on the boot tls projection with safe defaults" {
+    const allocator = testing.allocator;
+    var plain = try loadFromText(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n[tls]\nenabled = true\n", .{ .port = 6680 }, .{});
+    defer plain.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), plain.tls.alpn.len);
+    try testing.expectEqualStrings("irc", plain.tls.alpn[0]);
+    try testing.expect(!plain.tls.cert_compression and !plain.tls.enforce_cert_signature_algorithms and !plain.tls.debug_log);
+    try testing.expect(plain.tls.ticket_lifetime_seconds == null and plain.tls.mooring_max_meshpass_len == null);
+
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[tls]
+        \\enabled = true
+        \\alpn = []
+        \\cert_compression = true
+        \\enforce_cert_signature_algorithms = true
+        \\ticket_lifetime = 3600
+        \\mooring_max_meshpass_len = 128
+        \\debug_log = true
+        \\
+    ;
+    var loaded = try loadFromText(allocator, text, .{ .port = 6680 }, .{});
+    defer loaded.deinit(allocator);
+    try testing.expectEqual(@as(usize, 0), loaded.tls.alpn.len);
+    try testing.expect(loaded.tls.cert_compression and loaded.tls.enforce_cert_signature_algorithms and loaded.tls.debug_log);
+    try testing.expectEqual(@as(?u32, 3600), loaded.tls.ticket_lifetime_seconds);
+    try testing.expectEqual(@as(?u16, 128), loaded.tls.mooring_max_meshpass_len);
+}
+
+test "applyTlsProcessKnobs sets and restores the Mooring cap and TLS client tracing" {
+    const saved_cap = mooring_handshake.max_meshpass_len;
+    const saved_debug = tls_client.debug_log;
+    defer {
+        mooring_handshake.max_meshpass_len = saved_cap;
+        tls_client.debug_log = saved_debug;
+    }
+    applyTlsProcessKnobs(.{ .mooring_max_meshpass_len = 77, .debug_log = true });
+    try testing.expectEqual(@as(usize, 77), mooring_handshake.max_meshpass_len);
+    try testing.expect(tls_client.debug_log);
+    // Absent keys put the module defaults back rather than keeping a stale value.
+    applyTlsProcessKnobs(.{});
+    try testing.expectEqual(mooring_handshake.default_max_meshpass_len, mooring_handshake.max_meshpass_len);
+    try testing.expect(!tls_client.debug_log);
 }
 
 test "tls sni entries surface on the boot tls projection" {

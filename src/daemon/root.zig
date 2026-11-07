@@ -225,6 +225,7 @@ pub const tiered_keys = @import("tiered_keys.zig");
 pub const tls_certs = @import("tls_certs.zig");
 pub const tls_client_failure = @import("tls_client_failure.zig");
 pub const tls_conn = @import("tls_conn.zig");
+pub const tls_ech_load = @import("tls_ech_load.zig");
 pub const tls_sni_load = @import("tls_sni_load.zig");
 pub const totp_auth = @import("totp_auth.zig");
 pub const transcript = @import("transcript.zig");
@@ -714,6 +715,7 @@ test {
     _ = tls_certs;
     _ = tls_client_failure;
     _ = tls_conn;
+    _ = tls_ech_load;
     _ = tls_sni_load;
     _ = totp_auth;
     _ = transcript;

@@ -12,6 +12,7 @@
 //! A field is overridden only when the document supplies it; otherwise the
 //! defaults stand. Required: `[node].id` and `[listen].irc`.
 const std = @import("std");
+const builtin = @import("builtin");
 const toml = @import("../proto/toml.zig");
 const acme_cli = @import("acme_cli.zig");
 const acme_http01_listener = @import("acme_http01_listener.zig");
@@ -830,8 +831,48 @@ pub const Config = struct {
         sni: []SniCertDef = &.{},
         /// Server-side Encrypted Client Hello keys (`[[tls.ech_keys]]`, owned).
         /// Empty ⇒ ECH acceptance is off and the TLS wire stays byte-identical.
+        /// When keys are present the listener also sends their ECHConfigList as
+        /// `retry_configs` to a client whose ECH it could not decrypt.
         ech_keys: []EchKeyDef = &.{},
+        /// ALPN protocol ids the IRC TLS listener may select, in preference
+        /// order (`[tls] alpn`, owned). Null means the default `["irc"]`; an
+        /// explicit empty list turns ALPN off. A client that sends no ALPN, or
+        /// only ids not listed here, still completes the handshake: the server
+        /// then omits ALPN from EncryptedExtensions and never sends an alert.
+        alpn: ?[]const []const u8 = null,
+        /// RFC 8879 certificate compression (zlib) for clients that offer it.
+        /// The compressed form is sent only when it is smaller. Default off.
+        cert_compression: bool = false,
+        /// Refuse to present a chain whose non-self-signed certificate
+        /// signatures use an algorithm the client did not list in
+        /// `signature_algorithms_cert` (or `signature_algorithms`). Default off.
+        enforce_cert_signature_algorithms: bool = false,
+        /// Lifetime in seconds advertised in issued session tickets, for both
+        /// the TLS 1.3 and TLS 1.2 legs. Null keeps each engine's default
+        /// (1.3: 86400, 1.2: 7200). Bounded to 1..604800 (RFC 8446 §4.6.1).
+        ticket_lifetime_seconds: ?u32 = null,
+        /// Maximum Mooring mesh-password length accepted in either direction of
+        /// the mesh handshake. Null keeps `mooring_handshake.default_max_meshpass_len`.
+        /// Applied once at process start. Must cover `[mesh] mesh_pass`.
+        mooring_max_meshpass_len: ?u16 = null,
+        /// Trace outbound TLS client handshakes (ACME, OCSP, Web Push, feeds)
+        /// to stderr: states, message types, lengths and error names only,
+        /// never key material. Applied once at process start. Default off.
+        debug_log: bool = false,
     };
+
+    /// ALPN id list used when `[tls] alpn` is absent.
+    pub const default_tls_alpn: []const []const u8 = &.{"irc"};
+    /// Upper bounds for `[tls] alpn`: RFC 7301 ids are 1..255 bytes; a short
+    /// list keeps the EncryptedExtensions entry small.
+    pub const max_tls_alpn_protocols: usize = 8;
+    /// RFC 8446 §4.6.1: servers MUST NOT use a ticket lifetime above 7 days.
+    pub const max_tls_ticket_lifetime_seconds: u32 = 604_800;
+
+    /// The effective ALPN list for the IRC TLS listener.
+    pub fn tlsAlpnProtocols(self: *const Config) []const []const u8 {
+        return self.tls.alpn orelse default_tls_alpn;
+    }
 
     /// One `[[tls.sni]]` entry. `main.zig` loads `cert_path` + `key_path` with the
     /// SAME loader as the default cert (`tls_certs.loadOrBootstrap`) and hands the
@@ -1120,6 +1161,7 @@ pub const Config = struct {
             std.crypto.secureZero(u8, &key.private_key);
         }
         allocator.free(self.tls.ech_keys);
+        if (self.tls.alpn) |list| freeStringList(allocator, list);
         allocator.free(self.acme.directory_url);
         allocator.free(self.acme.ca_bundle_path);
         allocator.free(self.webpush.subject);
@@ -1168,6 +1210,16 @@ pub const TomlError = toml.ParseError || error{
     Ocg2ProjectionRequiresEnabled,
     Ocg2MintingRequiresEnabled,
     Ocg2MintingRequiresProjection,
+    /// `[tls]` policy keys: wrong type or out of range.
+    @"tls.alpn",
+    @"tls.cert_compression",
+    @"tls.enforce_cert_signature_algorithms",
+    @"tls.debug_log",
+    @"tls.ticket_lifetime",
+    @"tls.mooring_max_meshpass_len",
+    /// Keys that only ever tuned modules outside the daemon; refused.
+    @"tls.ratchet_max_skip was removed: it never applied to the daemon",
+    @"tls.treekem_max_members was removed: it never applied to the daemon",
 } || std.mem.Allocator.Error;
 
 /// Conservative fail-closed hint for normal boot: if a supplied config appears
@@ -1697,6 +1749,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     cfg.tls.early_data_max_size = @intCast(try uintField(doc, "tls.early_data_max_size", cfg.tls.early_data_max_size, 0, std.math.maxInt(u32)));
     if (doc.getBool("tls.raw_public_key")) |b| cfg.tls.raw_public_key = b;
     if (doc.getString("tls.ktls")) |s| cfg.tls.ktls = parseKtlsMode(s) orelse return error.ParseError;
+    try parseTlsPolicy(allocator, resolver, doc, &cfg);
 
     // [[tls.sni]] — additional SNI-selectable certificates. Each entry pairs one
     // or more host names with an on-disk cert+key; main.zig loads the material
@@ -2201,6 +2254,94 @@ fn parseKtlsMode(s: []const u8) ?Config.KtlsMode {
     return null;
 }
 
+/// `[tls]` handshake policy keys. Each key is type-checked: a present key of
+/// the wrong type, or a value outside its range, is a named config error rather
+/// than a silent fallback to the default.
+fn parseTlsPolicy(allocator: std.mem.Allocator, resolver: Resolver, doc: toml.Document, cfg: *Config) TomlError!void {
+    // These two keys were only ever applied by unit tests: the double ratchet
+    // and TreeKEM modules they tuned are not part of the daemon. Refuse them so
+    // an operator does not believe they have an effect.
+    if (doc.get("tls.ratchet_max_skip") != null) return error.@"tls.ratchet_max_skip was removed: it never applied to the daemon";
+    if (doc.get("tls.treekem_max_members") != null) return error.@"tls.treekem_max_members was removed: it never applied to the daemon";
+
+    if (doc.get("tls.alpn")) |value| {
+        const items = switch (value.*) {
+            .array => |arr| arr,
+            else => return error.@"tls.alpn",
+        };
+        if (items.len > Config.max_tls_alpn_protocols) return error.@"tls.alpn";
+        const list = ownStringArray(allocator, resolver, items) catch |err| switch (err) {
+            error.ParseError => return error.@"tls.alpn",
+            else => return err,
+        };
+        errdefer freeStringList(allocator, list);
+        for (list, 0..) |id, index| {
+            if (id.len == 0 or id.len > 255) return error.@"tls.alpn";
+            for (list[0..index]) |prior| if (std.mem.eql(u8, prior, id)) return error.@"tls.alpn";
+        }
+        if (cfg.tls.alpn) |old| freeStringList(allocator, old);
+        cfg.tls.alpn = list;
+    }
+    if (doc.get("tls.cert_compression")) |value| switch (value.*) {
+        .boolean => |b| cfg.tls.cert_compression = b,
+        else => return error.@"tls.cert_compression",
+    };
+    if (doc.get("tls.enforce_cert_signature_algorithms")) |value| switch (value.*) {
+        .boolean => |b| cfg.tls.enforce_cert_signature_algorithms = b,
+        else => return error.@"tls.enforce_cert_signature_algorithms",
+    };
+    if (doc.get("tls.debug_log")) |value| switch (value.*) {
+        .boolean => |b| cfg.tls.debug_log = b,
+        else => return error.@"tls.debug_log",
+    };
+    if (doc.get("tls.ticket_lifetime")) |value| {
+        const seconds: u64 = switch (value.*) {
+            .integer => |n| if (n < 0) return error.@"tls.ticket_lifetime" else @intCast(n),
+            .string => |s| (durationMs(s) catch return error.@"tls.ticket_lifetime") / 1000,
+            else => return error.@"tls.ticket_lifetime",
+        };
+        if (seconds == 0 or seconds > Config.max_tls_ticket_lifetime_seconds) return error.@"tls.ticket_lifetime";
+        cfg.tls.ticket_lifetime_seconds = @intCast(seconds);
+    }
+    if (doc.get("tls.mooring_max_meshpass_len")) |value| {
+        const n = switch (value.*) {
+            .integer => |n| n,
+            else => return error.@"tls.mooring_max_meshpass_len",
+        };
+        if (n < 1 or n > std.math.maxInt(u16)) return error.@"tls.mooring_max_meshpass_len";
+        cfg.tls.mooring_max_meshpass_len = @intCast(n);
+    }
+    // The cap applies to our own outbound M1 too: a node whose own mesh
+    // password exceeds it could never complete a Mooring handshake.
+    // With `[mesh] admission_token` set, outbound M1 carries the decoded
+    // token instead of the password, so the cap must admit it too.
+    if (cfg.tls.mooring_max_meshpass_len) |cap| {
+        if (cfg.mesh.mesh_pass) |pass| if (pass.len > cap) return error.@"tls.mooring_max_meshpass_len";
+        if (cfg.mesh.admission_token) |token| {
+            if (admissionTokenDecodedLenBound(token) > cap) return error.@"tls.mooring_max_meshpass_len";
+        }
+    }
+}
+
+/// Largest admission token M1 can carry.
+const max_admission_token_len: usize = @import("../proto/meshpass.zig").max_token_len;
+
+/// Decoded byte length of `[mesh] admission_token`, following the daemon's
+/// decoder (hex first, then standard base64). Text that decodes as neither
+/// returns the largest token length, so the bound never under-counts.
+fn admissionTokenDecodedLenBound(text: []const u8) usize {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len != 0 and trimmed.len % 2 == 0 and trimmed.len / 2 <= max_admission_token_len) {
+        const all_hex = for (trimmed) |c| {
+            if (!std.ascii.isHex(c)) break false;
+        } else true;
+        if (all_hex) return trimmed.len / 2;
+    }
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(trimmed) catch return max_admission_token_len;
+    if (decoded_len == 0 or decoded_len > max_admission_token_len) return max_admission_token_len;
+    return decoded_len;
+}
+
 fn parseRelayV2Authoring(s: []const u8) ?relay_v2_activation.Mode {
     if (std.mem.eql(u8, s, "compat")) return .compat;
     if (std.mem.eql(u8, s, "active")) return .active;
@@ -2654,7 +2795,13 @@ const reloadable_config_fields = [_][]const u8{
     "tls.cert_path",
     "tls.key_path",
     "tls.dns_name",
-};
+} ++ tls_sni_ech_reloadable_fields;
+
+/// SNI certificates and ECH keys are re-read and swapped transactionally with
+/// the default certificate on REHASH and ACME reload. Native Windows keeps them
+/// as static Helix-proof inputs, so there they still need a restart.
+const tls_sni_ech_reloadable_fields: [if (builtin.os.tag == .windows) 0 else 2][]const u8 =
+    if (builtin.os.tag == .windows) .{} else .{ "tls.sni", "tls.ech_keys" };
 
 const restart_required_config_fields = [_][]const u8{
     // Every `ListenerSet` member: `listenerChangeError` above.
@@ -4815,6 +4962,101 @@ test "parseToml: [[tls.ech_keys]] rejects malformed private key" {
     ;
 
     try testing.expectError(error.ParseError, parseToml(allocator, text, .{}));
+}
+
+test "parseToml: [tls] policy keys default to the safe values" {
+    const allocator = testing.allocator;
+    var cfg = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n[tls]\nenabled = true\n", .{});
+    defer cfg.deinit(allocator);
+    try testing.expect(cfg.tls.alpn == null);
+    try testing.expectEqual(@as(usize, 1), cfg.tlsAlpnProtocols().len);
+    try testing.expectEqualStrings("irc", cfg.tlsAlpnProtocols()[0]);
+    try testing.expect(!cfg.tls.cert_compression);
+    try testing.expect(!cfg.tls.enforce_cert_signature_algorithms);
+    try testing.expect(cfg.tls.ticket_lifetime_seconds == null);
+    try testing.expect(cfg.tls.mooring_max_meshpass_len == null);
+    try testing.expect(!cfg.tls.debug_log);
+}
+
+test "parseToml: [tls] policy keys project onto Config" {
+    const allocator = testing.allocator;
+    const text =
+        \\[node]
+        \\id = 1
+        \\[listen]
+        \\irc = 6680
+        \\[mesh]
+        \\mesh_pass = "0123456789"
+        \\[tls]
+        \\enabled = true
+        \\alpn = ["irc", "ircv3"]
+        \\cert_compression = true
+        \\enforce_cert_signature_algorithms = true
+        \\ticket_lifetime = "12h"
+        \\mooring_max_meshpass_len = 512
+        \\debug_log = true
+        \\
+    ;
+    var cfg = try parseToml(allocator, text, .{});
+    defer cfg.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), cfg.tlsAlpnProtocols().len);
+    try testing.expectEqualStrings("irc", cfg.tlsAlpnProtocols()[0]);
+    try testing.expectEqualStrings("ircv3", cfg.tlsAlpnProtocols()[1]);
+    try testing.expect(cfg.tls.cert_compression);
+    try testing.expect(cfg.tls.enforce_cert_signature_algorithms);
+    try testing.expectEqual(@as(?u32, 43_200), cfg.tls.ticket_lifetime_seconds);
+    try testing.expectEqual(@as(?u16, 512), cfg.tls.mooring_max_meshpass_len);
+    try testing.expect(cfg.tls.debug_log);
+
+    var off = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n[tls]\nalpn = []\nticket_lifetime = 604800\n", .{});
+    defer off.deinit(allocator);
+    try testing.expectEqual(@as(usize, 0), off.tlsAlpnProtocols().len);
+    try testing.expectEqual(@as(?u32, 604_800), off.tls.ticket_lifetime_seconds);
+
+    // A cap that admits the decoded admission token (10 bytes) is accepted.
+    var token_fits = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n[mesh]\nadmission_token = \"AAECAwQFBgcICQ==\"\n[tls]\nmooring_max_meshpass_len = 10\n", .{});
+    defer token_fits.deinit(allocator);
+    try testing.expectEqual(@as(?u16, 10), token_fits.tls.mooring_max_meshpass_len);
+}
+
+test "parseToml: [tls] policy keys fail closed on bad values" {
+    const allocator = testing.allocator;
+    const Case = struct { text: []const u8, err: TomlError };
+    const cases = [_]Case{
+        .{ .text = "[tls]\nalpn = \"irc\"\n", .err = error.@"tls.alpn" },
+        .{ .text = "[tls]\nalpn = [\"\"]\n", .err = error.@"tls.alpn" },
+        .{ .text = "[tls]\nalpn = [\"irc\", \"irc\"]\n", .err = error.@"tls.alpn" },
+        .{ .text = "[tls]\nalpn = [1]\n", .err = error.@"tls.alpn" },
+        .{ .text = "[tls]\nalpn = [\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\"]\n", .err = error.@"tls.alpn" },
+        .{ .text = "[tls]\ncert_compression = \"yes\"\n", .err = error.@"tls.cert_compression" },
+        .{ .text = "[tls]\nenforce_cert_signature_algorithms = 1\n", .err = error.@"tls.enforce_cert_signature_algorithms" },
+        .{ .text = "[tls]\ndebug_log = \"on\"\n", .err = error.@"tls.debug_log" },
+        .{ .text = "[tls]\nticket_lifetime = 0\n", .err = error.@"tls.ticket_lifetime" },
+        .{ .text = "[tls]\nticket_lifetime = 604801\n", .err = error.@"tls.ticket_lifetime" },
+        .{ .text = "[tls]\nticket_lifetime = \"169h\"\n", .err = error.@"tls.ticket_lifetime" },
+        .{ .text = "[tls]\nticket_lifetime = -5\n", .err = error.@"tls.ticket_lifetime" },
+        .{ .text = "[tls]\nmooring_max_meshpass_len = 0\n", .err = error.@"tls.mooring_max_meshpass_len" },
+        .{ .text = "[tls]\nmooring_max_meshpass_len = 65536\n", .err = error.@"tls.mooring_max_meshpass_len" },
+        .{ .text = "[mesh]\nmesh_pass = \"0123456789\"\n[tls]\nmooring_max_meshpass_len = 9\n", .err = error.@"tls.mooring_max_meshpass_len" },
+        // M1 carries the decoded admission token instead: 10 bytes as hex, as
+        // base64, and an undecodable token bounded at the 448-byte maximum.
+        .{ .text = "[mesh]\nadmission_token = \"00112233445566778899\"\n[tls]\nmooring_max_meshpass_len = 9\n", .err = error.@"tls.mooring_max_meshpass_len" },
+        .{ .text = "[mesh]\nadmission_token = \"AAECAwQFBgcICQ==\"\n[tls]\nmooring_max_meshpass_len = 9\n", .err = error.@"tls.mooring_max_meshpass_len" },
+        .{ .text = "[mesh]\nadmission_token = \"!!\"\n[tls]\nmooring_max_meshpass_len = 447\n", .err = error.@"tls.mooring_max_meshpass_len" },
+        .{ .text = "[tls]\nratchet_max_skip = 64\n", .err = error.@"tls.ratchet_max_skip was removed: it never applied to the daemon" },
+        .{ .text = "[tls]\ntreekem_max_members = 2\n", .err = error.@"tls.treekem_max_members was removed: it never applied to the daemon" },
+    };
+    for (cases) |case| {
+        const text = try std.fmt.allocPrint(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n{s}", .{case.text});
+        defer allocator.free(text);
+        try testing.expectError(case.err, parseToml(allocator, text, .{}));
+    }
+}
+
+test "configFieldClass: SNI and ECH material reload with the certificate on REHASH" {
+    const expected: ConfigFieldClass = if (builtin.os.tag == .windows) .startup_only else .reloadable;
+    try testing.expectEqual(expected, configFieldClass("tls.sni"));
+    try testing.expectEqual(expected, configFieldClass("tls.ech_keys"));
 }
 
 test "GAP-K6 parseToml: [[tls.sni]] is the operator certificate list" {
