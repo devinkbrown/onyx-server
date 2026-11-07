@@ -422,6 +422,8 @@ const ServerSetup = struct {
             .ecdsa_p256_signing_key = self.loaded.ecdsa_p256_signing_key,
             .rsa_signing_key = self.loaded.rsa_signing_key,
             .alpn_protocols = alpn,
+            // BoGo expects the strict RFC 7301 §3.2 refusal.
+            .alpn_mismatch_fatal = true,
             .ocsp_staple = flags.ocspResponse(),
             .enable_session_tickets = tickets,
             .ticket_key = if (tickets) ticket_key else null,
@@ -433,6 +435,8 @@ const ServerSetup = struct {
             .ecdsa_p256_signing_key = self.loaded.ecdsa_p256_signing_key,
             .rsa_signing_key = self.loaded.rsa_signing_key,
             .alpn_protocols = alpn,
+            // BoGo expects the strict RFC 7301 §3.2 refusal.
+            .alpn_mismatch_fatal = true,
             .ocsp_staple = flags.ocspResponse(),
             .enable_session_tickets = tickets,
             .ticket_key = if (tickets) ticket_key else null,

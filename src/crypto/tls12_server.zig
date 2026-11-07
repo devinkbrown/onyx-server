@@ -112,8 +112,9 @@ pub const Config = struct {
     /// RFC 7301 §3.2: refuse (fatal `no_application_protocol`) a client that
     /// offers ALPN sharing no protocol with a non-empty `alpn_protocols`.
     /// A client offering no ALPN always proceeds. See the TLS 1.3
-    /// `tls_server.Config.alpn_mismatch_fatal`.
-    alpn_mismatch_fatal: bool = true,
+    /// `tls_server.Config.alpn_mismatch_fatal`; defaults to `false` (lenient)
+    /// to preserve the daemon's never-refuse ALPN listener policy.
+    alpn_mismatch_fatal: bool = false,
     /// Mutual TLS: when true the server sends a CertificateRequest and, if the
     /// client presents a cert, verifies its CertificateVerify possession proof
     /// and exposes the leaf via `clientCertDer()` (for certfp / SASL EXTERNAL).
@@ -236,6 +237,9 @@ pub const Server = struct {
     peer_alert: ?tls_alert.Alert = null,
     /// Set once `closeNotify` emitted our close_notify (RFC 5246 §7.2.1).
     close_notify_sent: bool = false,
+    /// See `tls_server.Server.tx_offloaded`: set by `markTxOffloaded` once TX
+    /// is in the kernel; userspace seals then fail closed.
+    tx_offloaded: bool = false,
     /// The client offered status_request (wants an OCSP staple).
     client_requested_ocsp: bool = false,
     /// The client offered the RFC 7627 extended_master_secret extension.
@@ -699,7 +703,7 @@ pub const Server = struct {
     pub fn prepareAppWrite(self: *Server, chunks: []const []const u8) Error!PreparedAppWrite {
         if (self.read_failed) return error.BadState;
         // RFC 8446 §6.1: nothing may be written after our close_notify.
-        if (self.close_notify_sent) return error.BadState;
+        if (self.close_notify_sent or self.tx_offloaded) return error.BadState;
         if (self.state != .connected or self.app_write_active != null) return error.BadState;
         if (self.app_write_generation == std.math.maxInt(u64)) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
@@ -755,8 +759,13 @@ pub const Server = struct {
     /// Valid only once connected; sealed under the server write key at the next
     /// application sequence number. No application data may follow it. Caller
     /// owns the bytes.
+    ///
+    /// Userspace-TX connections only: after kTLS TX install the kernel owns
+    /// the write sequence and this would reuse a (key, nonce) pair. Send the
+    /// alert as a kernel control record (cmsg, record type 21) instead, and
+    /// call `markTxOffloaded` at install so this returns BadState.
     pub fn closeNotify(self: *Server) Error![]u8 {
-        if (self.state != .connected or self.app_write_active != null or self.close_notify_sent) return error.BadState;
+        if (self.state != .connected or self.app_write_active != null or self.close_notify_sent or self.tx_offloaded) return error.BadState;
         const suite = self.selected_suite orelse return error.BadState;
         const seq = try tls12.reserveAppSeq(self.app_write_seq);
         const body = [_]u8{ @backingInt(tls_server.AlertLevel.warning), @backingInt(tls_server.AlertDescription.close_notify) };
@@ -801,6 +810,13 @@ pub const Server = struct {
     /// engines to kernel `TLS_CIPHER_*` code points with one switch; crypto never
     /// depends on the daemon's `ktls` module.
     pub const KtlsCipher = tls_server.Server.KtlsCipher;
+
+    /// Record that TX has been installed into the kernel (kTLS `TLS_TX`).
+    /// Afterwards `closeNotify`, `prepareAppWrite` and `encrypt` return
+    /// BadState rather than sealing under a stale userspace sequence.
+    pub fn markTxOffloaded(self: *Server) void {
+        self.tx_offloaded = true;
+    }
 
     /// One direction's TLS 1.2 AEAD material for `setsockopt(TLS_TX|TLS_RX)`
     /// with `version = TLS_1_2_VERSION`:
@@ -4875,4 +4891,41 @@ test "tls12 conformance (RFC 5246 §7.2.1): closeNotify seals one close_notify a
     try std.testing.expectEqualSlices(u8, &.{ 1, 0 }, opened.plaintext);
     try std.testing.expectError(error.BadState, server.closeNotify());
     try std.testing.expectError(error.BadState, server.encrypt("after close"));
+}
+
+test "tls12 conformance: ALPN mismatch is lenient by default so the daemon IRC listener never refuses" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const cfg: Config = .{ .cert_chain = &chain };
+    try std.testing.expect(!cfg.alpn_mismatch_fatal);
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key, .alpn_protocols = &.{"irc"} });
+    defer server.deinit();
+    const alpn_h2 = synth_ok_exts ++ [_]u8{ 0x00, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02, 'h', '2' };
+    const ch = try conformanceHello12(allocator, 0x0303, 0x0301, &conformance_ecdsa_suites, &.{0}, &alpn_h2);
+    defer allocator.free(ch);
+    const flight = switch (try server.feed(ch)) {
+        .bytes_to_send => |b| b,
+        .need_more => return error.TestUnexpectedResult,
+    };
+    allocator.free(flight);
+}
+
+test "tls12 conformance: after markTxOffloaded no userspace seal reuses a kernel-owned nonce" {
+    const allocator = std.testing.allocator;
+    const fixture = try makeFixture(allocator);
+    defer fixture.deinit(allocator);
+    const chain = [_][]const u8{fixture.cert};
+    const anchors = [_][]const u8{fixture.cert};
+    var server = try Server.init(allocator, .{ .cert_chain = &chain, .ecdsa_p256_signing_key = fixture.key });
+    defer server.deinit();
+    var client = try tls12_client.Client.init(allocator, .{ .server_name = "localhost", .trust_anchors = &anchors, .now_unix_seconds = 1_735_689_600 });
+    defer client.deinit();
+    try driveFullHandshake(allocator, &server, &client);
+    const seq = server.app_write_seq;
+    server.markTxOffloaded();
+    try std.testing.expectError(error.BadState, server.closeNotify());
+    try std.testing.expectError(error.BadState, server.encrypt("x"));
+    try std.testing.expectEqual(seq, server.app_write_seq);
 }
