@@ -14239,13 +14239,22 @@ pub const LinuxServer = struct {
         // The IO barrier above now rules out further publications, so every
         // owner must admit its final queue before advertising a parked slab.
         _ = try self.drainWindowsAccepted();
-        if (self.fabric == null) return;
         self.world.lockWrite();
-        self.abortPoisonedDeliveries();
-        self.drainSessionDropControls();
-        self.drainFabric();
-        self.abortPoisonedDeliveries();
-        self.world.unlockWrite();
+        defer self.world.unlockWrite();
+        if (self.fabric != null) {
+            self.abortPoisonedDeliveries();
+            self.drainSessionDropControls();
+            self.drainFabric();
+            self.abortPoisonedDeliveries();
+        }
+        // Move this owner's already-accepted diverted output (ADS heads,
+        // departure images, local QUIT captures) into its SendQ, which Helix
+        // carries byte-exactly. Without this, output accepted moments before
+        // the quiesce (or just copied out of the fabric above) is still in
+        // the uncheckpointed lane at the continuity check, and a transient
+        // diversion refuses the UPGRADE. Socket I/O is quiesced, so this
+        // only appends; nothing is armed, dropped or reordered.
+        self.drainAttachmentSpoolForCurrentReactorDeep();
     }
 
     /// With every socket owner quiesced and every sibling parked, rebind this
@@ -187045,4 +187054,44 @@ test "Helix continuity: remote visible identity refusal census reaches UPGRADE P
     try expectContains(metrics.items, "onyx_helix_continuity_remote_visible_blocked 1\n");
     // The full scrape renders the same series.
     try f.server.refreshMetricsSnapshotFallible();
+}
+
+test "Helix continuity: owner quiesce drain moves transient diverted output into the carried SendQ" {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .openbsd) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const previous = current_reactor;
+    defer current_reactor = previous;
+    var f = try RemoteHostNotifyFixtureForTest.create();
+    defer f.deinit();
+    try f.deliver("#quiesce-drain", "old.public", 100);
+    try f.join(f.observer, "#quiesce-drain");
+    const conn = f.server.connFor(f.observer).?;
+    resetTestSendQ(conn);
+    f.server.world.lockWrite();
+    {
+        defer f.server.world.unlockWrite();
+        // Accepted moments before the cut: departure image, barrier and a
+        // later diverted notice, with no owner drain turn in between.
+        try f.server.closeConn(f.server.connFor(f.peer).?.token, "peer drop just before quiesce");
+        f.link = null;
+        try appendToConn(conn, ":server NOTICE HostObserver :accepted before cut\r\n");
+        try std.testing.expectEqual(@as(usize, 0), conn.send_len);
+        const census = f.server.remoteVisibleContinuityCensus(true);
+        try std.testing.expect(census.blocks());
+        try std.testing.expectEqual(@as(usize, 1), census.spool.plaintext_entries);
+        try std.testing.expectEqual(LinuxServer.UpgradeContinuityBlocker.remote_visible_identity, f.server.upgradeContinuityBlockerLocked().?);
+    }
+    f.server.rx().socket_io_quiescing = true;
+    defer f.server.rx().socket_io_quiescing = false;
+    try f.server.drainUpgradeFabric();
+    f.server.world.lockWrite();
+    defer f.server.world.unlockWrite();
+    try std.testing.expect(!f.server.remoteVisibleContinuityCensus(true).blocks());
+    try std.testing.expect(f.server.upgradeContinuityBlockerLocked() == null);
+    try std.testing.expect(conn.output_barrier_server == null and !conn.closing);
+    // Exactly once, in accepted order, now in the SendQ Helix carries.
+    const queued = try copyTestSendQ(a, conn);
+    defer a.free(queued);
+    try std.testing.expectEqualStrings(":RemoteHost!remote@old.public QUIT :replay-a.test replay-b.test\r\n" ++
+        ":server NOTICE HostObserver :accepted before cut\r\n", queued);
 }
