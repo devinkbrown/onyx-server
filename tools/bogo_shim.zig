@@ -87,6 +87,7 @@ const tls_server = onyx_server.crypto.tls_server;
 const tls12_server = onyx_server.crypto.tls12_server;
 const tls_client = onyx_server.crypto.tls_client;
 const tls_record = onyx_server.crypto.tls_record;
+const tls_resumption = onyx_server.crypto.tls_resumption;
 
 const TlsConn = tls_conn.TlsConn;
 const Client = tls_client.Client;
@@ -106,6 +107,10 @@ const curve_secp256r1: u64 = 23;
 const curve_x25519mlkem768: u64 = 4588; // 0x11ec
 
 const max_read = 18 * 1024; // one TLS record (16 KiB + overhead) per syscall.
+/// Largest `-ocsp-response` the shim stages inline (runner values are tiny).
+const max_ocsp_len = 4096;
+/// Upper bound on `-resume-count` (the runner uses 1, or 2 for renewed sessions).
+const max_resume_count = 8;
 
 // ── Flags ───────────────────────────────────────────────────────────────────
 
@@ -131,6 +136,21 @@ pub const Flags = struct {
     select_alpn: ?[]const u8 = null,
     /// Post-handshake ALPN assertion (server role only; borrowed from argv).
     expect_alpn: ?[]const u8 = null,
+    /// `-resume-count N` (server role only): after the initial connection the
+    /// runner accepts N more; the shim dials each in turn, reusing one ticket
+    /// key so the runner's client can resume (RFC 8446 §4.6.1 / §2.2, RFC 5077).
+    resume_count: u8 = 0,
+    /// `-expect-session-miss`: resumption connections must run a FULL handshake.
+    expect_session_miss: bool = false,
+    /// `-ocsp-response <base64>` (server role only): decoded OCSPResponse bytes
+    /// to staple (RFC 8446 §4.4.2.1 / RFC 6066 §8). Stored inline so parsing
+    /// stays allocation-free.
+    ocsp_len: usize = 0,
+    ocsp_buf: [max_ocsp_len]u8 = undefined,
+
+    pub fn ocspResponse(self: *const Flags) []const u8 {
+        return self.ocsp_buf[0..self.ocsp_len];
+    }
 
     pub const ParseError = error{
         /// Flag/case outside the scoped subset ⇒ exit 89.
@@ -179,6 +199,24 @@ pub const Flags = struct {
                 f.select_alpn = try takeVal(args, &i);
             } else if (eql(a, "-expect-alpn")) {
                 f.expect_alpn = try takeVal(args, &i);
+            } else if (eql(a, "-resume-count")) {
+                const n = std.fmt.parseInt(u8, try takeVal(args, &i), 10) catch return error.Usage;
+                if (n > max_resume_count) return error.Unimplemented;
+                f.resume_count = n;
+            } else if (eql(a, "-expect-session-miss")) {
+                f.expect_session_miss = true;
+                i += 1;
+            } else if (eql(a, "-ocsp-response")) {
+                const b64 = try takeVal(args, &i);
+                const dec = std.base64.standard.Decoder;
+                const n = dec.calcSizeForSlice(b64) catch return error.Usage;
+                if (n > f.ocsp_buf.len) return error.Unimplemented;
+                dec.decode(f.ocsp_buf[0..n], b64) catch return error.Usage;
+                f.ocsp_len = n;
+            } else if (eql(a, "-async")) {
+                // bssl_shim: async BIOs/callbacks. Peer-invisible scheduling; the
+                // shim's blocking pump yields the same wire bytes.
+                i += 1;
             } else {
                 // Unknown or out-of-scope flag: over-skipping (exit 89) is safe,
                 // silently mis-handling is not.
@@ -198,6 +236,9 @@ pub const Flags = struct {
         if (f.server and f.client_curve != null) return error.Unimplemented; // client-only
         if (!f.server and f.select_alpn != null) return error.Unimplemented; // server-only
         if (!f.server and f.expect_alpn != null) return error.Unimplemented; // asserted via server accessor
+        // Client-side resumption (ticket storage + PSK offer) is not driven.
+        if (!f.server and (f.resume_count != 0 or f.expect_session_miss)) return error.Unimplemented;
+        if (!f.server and f.ocsp_len != 0) return error.Unimplemented; // server-only
         return f;
     }
 
@@ -284,75 +325,134 @@ fn shimRun(alloc: std.mem.Allocator, init: std.process.Init) u8 {
 fn doConnection(alloc: std.mem.Allocator, io: std.Io, flags: Flags) !void {
     if (comptime builtin.os.tag == .windows) try socketStartup();
     defer socketCleanup();
-    const fd = try tcpConnect(flags.port);
-    defer socketClose(fd);
 
+    if (!flags.server) {
+        const fd = try dialRunner(flags);
+        defer socketClose(fd);
+        return runClientRole(alloc, fd, flags);
+    }
+
+    // Server role: the credential and (with -resume-count) the ticket key are
+    // shared by every connection of this invocation, exactly as one bssl_shim
+    // SSL_CTX serves the initial and the resumption connections.
+    var server: ServerSetup = undefined;
+    try server.init(alloc, io, &flags);
+    defer server.deinit(alloc);
+
+    var conn_index: usize = 0;
+    while (conn_index <= flags.resume_count) : (conn_index += 1) {
+        const fd = try dialRunner(flags);
+        defer socketClose(fd);
+        try runServerRole(alloc, fd, &server, flags, conn_index != 0);
+    }
+}
+
+/// Dial the runner and send the optional 8-byte little-endian `-shim-id` that
+/// prefixes EVERY connection (bssl_shim.cc DoConnection).
+fn dialRunner(flags: Flags) !Socket {
+    const fd = try tcpConnect(flags.port);
+    errdefer socketClose(fd);
     if (flags.have_shim_id) {
         var idb: [8]u8 = undefined;
         std.mem.writeInt(u64, &idb, flags.shim_id, .little);
         try sockWriteAll(fd, &idb);
     }
-
-    if (flags.server) {
-        try runServerRole(alloc, io, fd, flags);
-    } else {
-        try runClientRole(alloc, fd, flags);
-    }
+    return fd;
 }
 
 // ── Server role (TlsConn: TLS 1.3 + hardened TLS 1.2) ─────────────────────────
 
-fn runServerRole(alloc: std.mem.Allocator, io: std.Io, fd: Socket, flags: Flags) !void {
-    // BoGo supplies PEM `-cert-file`/`-key-file`; with neither we bootstrap a
-    // self-signed Ed25519 leaf (loopback-only, matches the daemon's own loader).
-    var loaded = try tls_certs.loadOrBootstrap(alloc, io, .{
-        .enabled = flags.cert_file == null and flags.key_file == null,
-        .cert_path = flags.cert_file,
-        .key_path = flags.key_file,
-        .dns_name = "localhost",
-    });
-    defer loaded.deinit(alloc);
+/// Per-invocation server state: loaded credential, ALPN list, and the engine
+/// configs built from them. `alpn_store` is borrowed by both configs, so the
+/// value must stay in place once `init` has run (it lives on `doConnection`'s
+/// frame for the whole invocation). The OCSP staple borrows `flags.ocsp_buf`,
+/// so `init` takes the caller's `Flags` by pointer, never a by-value copy.
+const ServerSetup = struct {
+    loaded: tls_certs.Loaded,
+    alpn_store: [1][]const u8,
+    cfg13: tls_server.Config,
+    cfg12: tls12_server.Config,
+    dual: bool,
 
-    // `-select-alpn` names the single protocol the server will select. The store
-    // lives on this frame (outlives `conn`); its element borrows argv.
-    var alpn_store: [1][]const u8 = undefined;
-    var alpn: []const []const u8 = &.{};
-    if (flags.select_alpn) |name| {
-        alpn_store[0] = name;
-        alpn = alpn_store[0..1];
+    fn init(self: *ServerSetup, alloc: std.mem.Allocator, io: std.Io, flags: *const Flags) !void {
+        // BoGo supplies PEM `-cert-file`/`-key-file`; with neither we bootstrap a
+        // self-signed Ed25519 leaf (loopback-only, matches the daemon's loader).
+        self.loaded = try tls_certs.loadOrBootstrap(alloc, io, .{
+            .enabled = flags.cert_file == null and flags.key_file == null,
+            .cert_path = flags.cert_file,
+            .key_path = flags.key_file,
+            .dns_name = "localhost",
+        });
+        errdefer self.loaded.deinit(alloc);
+
+        // `-select-alpn` names the single protocol the server will select; the
+        // element borrows argv.
+        var alpn: []const []const u8 = &.{};
+        if (flags.select_alpn) |name| {
+            self.alpn_store[0] = name;
+            alpn = self.alpn_store[0..1];
+        }
+
+        // Session tickets are enabled only for resumption cases, so every
+        // non-resumption baseline case keeps its exact pre-existing wire shape.
+        // One random key serves all connections of this invocation.
+        const tickets = flags.resume_count != 0;
+        var ticket_key: tls_resumption.TicketKey = undefined;
+        try io.randomSecure(&ticket_key);
+        const now = std.Io.Clock.real.now(io).toSeconds();
+
+        self.cfg13 = .{
+            .cert_chain = self.loaded.cert_chain,
+            .signing_key = self.loaded.signing_key,
+            .ecdsa_p256_signing_key = self.loaded.ecdsa_p256_signing_key,
+            .rsa_signing_key = self.loaded.rsa_signing_key,
+            .alpn_protocols = alpn,
+            .ocsp_staple = flags.ocspResponse(),
+            .enable_session_tickets = tickets,
+            .ticket_key = if (tickets) ticket_key else null,
+            .now_unix_seconds = now,
+        };
+        // TLS 1.2 server auth is ECDSA/RSA only (no Ed25519 in the 1.2 engine).
+        self.cfg12 = .{
+            .cert_chain = self.loaded.cert_chain,
+            .ecdsa_p256_signing_key = self.loaded.ecdsa_p256_signing_key,
+            .rsa_signing_key = self.loaded.rsa_signing_key,
+            .alpn_protocols = alpn,
+            .ocsp_staple = flags.ocspResponse(),
+            .enable_session_tickets = tickets,
+            .ticket_key = if (tickets) ticket_key else null,
+            .now_unix_seconds = now,
+        };
+
+        // Offer the dual (1.3 + hardened 1.2) engine only when the leaf key can
+        // actually authenticate a 1.2 handshake (ECDSA/RSA — the 1.2 engine has
+        // no Ed25519 path). Otherwise run 1.3-only: this both matches capability
+        // AND avoids feeding `TlsConn.initDual` a keyless `cfg12`, whose lazy
+        // `tls12_server.Server.init` would fail `NoSigningKey` on a 1.2
+        // ClientHello and leave the engine union half-constructed.
+        // `-min-version 0x0304` also forces 1.3-only.
+        const has_tls12_key = self.loaded.ecdsa_p256_signing_key != null or self.loaded.rsa_signing_key != null;
+        self.dual = flags.min_version < version_tls13 and has_tls12_key;
     }
 
-    const cfg13: tls_server.Config = .{
-        .cert_chain = loaded.cert_chain,
-        .signing_key = loaded.signing_key,
-        .ecdsa_p256_signing_key = loaded.ecdsa_p256_signing_key,
-        .rsa_signing_key = loaded.rsa_signing_key,
-        .alpn_protocols = alpn,
-    };
-    // TLS 1.2 server auth is ECDSA/RSA only (no Ed25519 in the 1.2 engine); a
-    // 1.2 ClientHello against an Ed25519-only leaf fails at engine construction.
-    const cfg12: tls12_server.Config = .{
-        .cert_chain = loaded.cert_chain,
-        .ecdsa_p256_signing_key = loaded.ecdsa_p256_signing_key,
-        .rsa_signing_key = loaded.rsa_signing_key,
-        .alpn_protocols = alpn,
-    };
+    fn deinit(self: *ServerSetup, alloc: std.mem.Allocator) void {
+        self.loaded.deinit(alloc);
+    }
 
-    // Offer the dual (1.3 + hardened 1.2) engine only when the leaf key can
-    // actually authenticate a 1.2 handshake (ECDSA/RSA — the 1.2 engine has no
-    // Ed25519 path). Otherwise run 1.3-only: this both matches capability AND
-    // avoids feeding `TlsConn.initDual` a keyless `cfg12`, whose lazy
-    // `tls12_server.Server.init` would fail `NoSigningKey` on a 1.2 ClientHello
-    // (e.g. a downgrade/negative test) and leave the engine union in a corrupt
-    // half-constructed `.tls12` state. `-min-version 0x0304` also forces 1.3-only.
-    const has_tls12_key = loaded.ecdsa_p256_signing_key != null or loaded.rsa_signing_key != null;
-    var conn = if (flags.min_version >= version_tls13 or !has_tls12_key)
-        try TlsConn.init(alloc, cfg13)
-    else
-        TlsConn.initDual(alloc, cfg13, cfg12);
+    fn newConn(self: *const ServerSetup, alloc: std.mem.Allocator) !TlsConn {
+        if (!self.dual) return TlsConn.init(alloc, self.cfg13);
+        // The owned-staple constructor pins the OCSP bytes like production does.
+        return TlsConn.initDualOwnedStaple(alloc, self.cfg13, self.cfg12);
+    }
+};
+
+fn runServerRole(alloc: std.mem.Allocator, fd: Socket, setup: *const ServerSetup, flags: Flags, is_resume: bool) !void {
+    var conn = try setup.newConn(alloc);
     defer conn.deinit();
 
-    driveServerHandshake(fd, &conn) catch |e| {
+    var early_app: std.ArrayList(u8) = .empty;
+    defer early_app.deinit(alloc);
+    driveServerHandshake(alloc, fd, &conn, &early_app) catch |e| {
         // Emit the engine's fatal alert (plaintext pre-ServerHello, encrypted
         // after) so a real BoGo peer sees a diagnostic alert, not a bare RST.
         if (conn.takeAlert(e)) |rec| {
@@ -363,16 +463,44 @@ fn runServerRole(alloc: std.mem.Allocator, io: std.Io, fd: Socket, flags: Flags)
     };
 
     try checkServerExpect(&conn, flags);
+    try checkSessionReuse(serverResumed(&conn), is_resume, flags.expect_session_miss);
+    if (early_app.items.len != 0) try xorEchoServer(fd, &conn, early_app.items);
     try echoServer(alloc, fd, &conn);
 }
 
-fn driveServerHandshake(fd: Socket, conn: *TlsConn) !void {
+/// Whether the completed handshake was abbreviated: a TLS 1.3 PSK resumption
+/// (RFC 8446 §2.2) or a TLS 1.2 ticket resumption (RFC 5077 §3.1).
+fn serverResumed(conn: *const TlsConn) bool {
+    return switch (conn.engine) {
+        .undecided => false,
+        .tls13 => |*s| s.resumed,
+        .tls12 => |*s| s.resuming,
+    };
+}
+
+/// bssl_shim CheckHandshakeProperties: a session must be reused exactly on
+/// resumption connections, unless `-expect-session-miss` says otherwise.
+fn checkSessionReuse(resumed: bool, is_resume: bool, expect_session_miss: bool) !void {
+    const expect_resume = is_resume and !expect_session_miss;
+    if (resumed != expect_resume) {
+        return if (resumed) error.SessionUnexpectedlyReused else error.SessionUnexpectedlyNotReused;
+    }
+}
+
+/// Pump the handshake to completion. The socket read that carries the peer's
+/// final flight may also carry application data in the SAME `onInbound` turn
+/// (e.g. a client Finished fragmented into many records followed directly by
+/// its first application record). That plaintext is copied into `early_app`
+/// so the caller echoes it — dropping it would stall a peer that is waiting
+/// for the echo.
+fn driveServerHandshake(alloc: std.mem.Allocator, fd: Socket, conn: *TlsConn, early_app: *std.ArrayList(u8)) !void {
     var buf: [max_read]u8 = undefined;
     while (!conn.handshakeDone()) {
         const n = try sockReadSome(fd, &buf);
         if (n == 0) return error.UnexpectedEof;
         const outcome = try conn.onInbound(buf[0..n]);
         if (outcome.handshake_bytes.len != 0) try sockWriteAll(fd, outcome.handshake_bytes);
+        if (outcome.plaintext.len != 0) try early_app.appendSlice(alloc, outcome.plaintext);
     }
 }
 
@@ -402,14 +530,22 @@ fn echoServer(alloc: std.mem.Allocator, fd: Socket, conn: *TlsConn) !void {
             if (e == error.TlsAlert or e == error.BadRecord) return;
             return e;
         };
+        // Post-handshake control replies (e.g. a KeyUpdate response, RFC 8446
+        // §4.6.3) surface as handshake bytes and must reach the peer.
+        if (outcome.handshake_bytes.len != 0) try sockWriteAll(fd, outcome.handshake_bytes);
         if (outcome.plaintext.len != 0) {
             const xored = try alloc.dupe(u8, outcome.plaintext);
             defer alloc.free(xored);
-            for (xored) |*b| b.* ^= 0xff;
-            const ct = try conn.write(xored);
-            try sockWriteAll(fd, ct);
+            try xorEchoServer(fd, conn, xored);
         }
     }
+}
+
+/// XOR every byte of `data` (in place) with 0xff and send it back encrypted.
+fn xorEchoServer(fd: Socket, conn: *TlsConn, data: []u8) !void {
+    for (data) |*b| b.* ^= 0xff;
+    const ct = try conn.write(data);
+    try sockWriteAll(fd, ct);
 }
 
 // ── Client role (tls_client.Client: TLS 1.3) ──────────────────────────────────
@@ -671,6 +807,42 @@ test "parse: server ALPN select + expect" {
 test "parse: unknown flag ⇒ Unimplemented (exit 89)" {
     const args = [_][]const u8{ "bogo_shim", "-port", "9", "-resume-count", "1" };
     try testing.expectError(error.Unimplemented, Flags.parse(&args));
+}
+
+test "parse: truly unknown flag ⇒ Unimplemented" {
+    const args = [_][]const u8{ "bogo_shim", "-server", "-port", "9", "-expect-msg-callback", "x" };
+    try testing.expectError(error.Unimplemented, Flags.parse(&args));
+}
+
+test "parse: server resumption, session-miss, OCSP, async" {
+    const args = [_][]const u8{
+        "bogo_shim",      "-server",  "-port",                "9",      "-resume-count", "2",
+        "-ocsp-response", "AQIDBA==", "-expect-session-miss", "-async",
+    };
+    const f = try Flags.parse(&args);
+    try testing.expectEqual(@as(u8, 2), f.resume_count);
+    try testing.expect(f.expect_session_miss);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, f.ocspResponse());
+}
+
+test "parse: resumption/OCSP flags are server-only, bounded, and well-formed" {
+    // Client-side resumption is not driven ⇒ skip, never mis-handle.
+    try testing.expectError(error.Unimplemented, Flags.parse(&[_][]const u8{ "bogo_shim", "-port", "9", "-expect-session-miss" }));
+    try testing.expectError(error.Unimplemented, Flags.parse(&[_][]const u8{ "bogo_shim", "-port", "9", "-ocsp-response", "AQIDBA==" }));
+    // More resumption rounds than the shim bounds ⇒ skip.
+    try testing.expectError(error.Unimplemented, Flags.parse(&[_][]const u8{ "bogo_shim", "-server", "-port", "9", "-resume-count", "9" }));
+    // Malformed values are usage errors (exit 1), not silent skips.
+    try testing.expectError(error.Usage, Flags.parse(&[_][]const u8{ "bogo_shim", "-server", "-port", "9", "-resume-count", "x" }));
+    try testing.expectError(error.Usage, Flags.parse(&[_][]const u8{ "bogo_shim", "-server", "-port", "9", "-ocsp-response", "!!!" }));
+}
+
+test "checkSessionReuse: reuse exactly on resumption unless a miss is expected" {
+    try checkSessionReuse(false, false, false); // initial connection: full handshake
+    try checkSessionReuse(true, true, false); // resumption connection: resumed
+    try checkSessionReuse(false, true, true); // -expect-session-miss: full handshake
+    try testing.expectError(error.SessionUnexpectedlyReused, checkSessionReuse(true, false, false));
+    try testing.expectError(error.SessionUnexpectedlyNotReused, checkSessionReuse(false, true, false));
+    try testing.expectError(error.SessionUnexpectedlyReused, checkSessionReuse(true, true, true));
 }
 
 test "parse: unsupported curve ⇒ Unimplemented" {

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -51,6 +52,8 @@ printf 'fixture:%s:%s' "$target" "$cpu" > "$prefix/bin/onyx-server"
         self.env['PATH'] = str(self.root / 'bin') + os.pathsep + os.defpath
         self.env.pop('COSIGN_KEY', None)
         self.env.pop('COSIGN_EXPERIMENTAL', None)
+        for gate in ('ONYX_RELEASE_CT_CHECK', 'ONYX_RELEASE_INTEROP', 'ONYX_RELEASE_BOGO'):
+            self.env.pop(gate, None)
         self.env['TMPDIR'] = str(self.root)
 
     def stub(self, name, content):
@@ -125,6 +128,87 @@ printf 'fixture:%s:%s' "$target" "$cpu" > "$prefix/bin/onyx-server"
         self.env['TEST_DIRTY'] = ' M tracked'
         self.assertNotEqual(self.invoke('release.sh', self.root / 'dirty').returncode, 0)
         self.assertNotEqual(self.invoke('verify-release.sh', out / 'SHA256SUMS').returncode, 0)
+
+    def ct_check_stub(self, rc):
+        # Record every ct-check invocation; exit with `rc` for it.
+        stub = (self.root / 'bin' / 'zig').read_text().replace(
+            '[ "$1" = build ] || exit 1\n',
+            '[ "$1" = build ] || exit 1\n'
+            'if [ "$2" = ct-check ]; then echo "$*" >> "$TMPDIR/ct-check.calls"; exit %d; fi\n' % rc)
+        self.stub('zig', stub)
+
+    def test_ct_check_gate_is_opt_in(self):
+        self.ct_check_stub(0)
+        self.release('x86_64-linux-musl')
+        self.assertFalse((self.root / 'ct-check.calls').exists())
+
+    def test_ct_check_gate_runs_and_fails_closed(self):
+        self.env['ONYX_RELEASE_CT_CHECK'] = '1'
+        self.ct_check_stub(0)
+        self.release('x86_64-linux-musl')
+        calls = (self.root / 'ct-check.calls').read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+        # The harness measures the shipped target/cpu, not a host-native build.
+        self.assertTrue(calls[0].startswith('build ct-check -Dtarget=x86_64-linux-musl -Dcpu=baseline '), calls[0])
+        self.ct_check_stub(1)
+        failed = self.invoke('release.sh', self.root / 'ct-fail', 'x86_64-linux-musl')
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(b'ct-check gate failed', failed.stderr)
+        self.assertFalse((self.root / 'ct-fail' / 'SHA256SUMS').exists())
+
+    def test_ct_check_gate_refuses_foreign_target(self):
+        self.env['ONYX_RELEASE_CT_CHECK'] = '1'
+        self.ct_check_stub(0)
+        foreign = 'aarch64-linux-musl' if platform.machine() != 'aarch64' else 'x86_64-linux-musl'
+        failed = self.invoke('release.sh', self.root / 'ct-foreign', foreign)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(b'cannot run', failed.stderr)
+        self.assertFalse((self.root / 'ct-check.calls').exists())
+
+    def interop_stubs(self, rc=0):
+        # Stub gate scripts that record their argv/env and check, from a
+        # DIFFERENT cwd (as the real scripts do), that the binary resolves.
+        (self.root / 'tools').mkdir(exist_ok=True)
+        sh = self.root / 'tools' / 'openssl_interop.sh'
+        sh.write_text('#!/usr/bin/env bash\n'
+                      'printf "%s %s\\n" "$1" "${ONYX_INTEROP_STRICT:-0}" >> "$TMPDIR/interop.calls"\n'
+                      'cd / && [[ -f "$1" ]] || exit 9\n'
+                      'exit ' + str(rc) + '\n')
+        sh.chmod(0o755)
+        (self.root / 'tools' / 'browser_tls_smoke.py').write_text(
+            'import os, sys\n'
+            'open(os.path.join(os.environ["TMPDIR"], "browser.calls"), "a").write(sys.argv[1] + "\\n")\n'
+            'os.chdir("/")\n'
+            'sys.exit(0 if os.path.isfile(sys.argv[1]) else 9)\n')
+
+    @unittest.skipUnless(platform.machine() == 'x86_64', 'gate needs a host that runs the target')
+    def test_interop_gate_passes_absolute_artifact_with_relative_out(self):
+        self.env['ONYX_RELEASE_INTEROP'] = '1'
+        self.interop_stubs()
+        # Default-style relative output directory, resolved against the repo root.
+        result = self.invoke('release.sh', 'dist-rel', 'x86_64-linux-musl')
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        art = str(self.root / 'dist-rel' / 'onyx-server-1.2.3-x86_64-linux-musl')
+        self.assertEqual((self.root / 'interop.calls').read_text(), art + ' 1\n')
+        self.assertEqual((self.root / 'browser.calls').read_text(), art + '\n')
+        self.assertTrue((self.root / 'dist-rel' / 'SHA256SUMS').exists())
+
+    @unittest.skipUnless(platform.machine() == 'x86_64', 'gate needs a host that runs the target')
+    def test_interop_gate_failure_aborts_release(self):
+        self.env['ONYX_RELEASE_INTEROP'] = '1'
+        self.interop_stubs(rc=1)
+        failed = self.invoke('release.sh', 'dist-fail', 'x86_64-linux-musl')
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(b'OpenSSL interop gate failed', failed.stderr)
+        self.assertFalse((self.root / 'browser.calls').exists())
+        self.assertFalse((self.root / 'dist-fail' / 'SHA256SUMS').exists())
+
+    def test_interop_gate_refuses_foreign_target(self):
+        self.env['ONYX_RELEASE_INTEROP'] = '1'
+        foreign = 'aarch64-linux-musl' if platform.machine() != 'aarch64' else 'x86_64-linux-musl'
+        failed = self.invoke('release.sh', self.root / 'interop-foreign', foreign)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(b'cannot run', failed.stderr)
 
 if __name__ == '__main__':
     unittest.main()
