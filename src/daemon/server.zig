@@ -185724,7 +185724,7 @@ test "armor3: RFC 8737 tls-alpn-01 store reaches the implicit-TLS listener throu
         defer Admit.drop(server, admitted.id, admitted.conn);
         const conn = admitted.conn;
         try std.testing.expect(conn.tls.?.acme_store == &store);
-        var client = try tls_client.Client.init(allocator, .{ .server_name = "irc.example.test", .trust_anchors = &.{}, .alpn_protocols = &.{acme_challenge.acme_tls_alpn_protocol} });
+        var client = try tls_client.Client.init(allocator, .{ .server_name = "irc.example.test", .trust_anchors = &.{}, .alpn_protocols = &.{acme_challenge.acme_tls_alpn_protocol}, .grease = false });
         defer client.deinit();
         client.disableServerCertVerification();
         const ch = try client.start();

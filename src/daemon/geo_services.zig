@@ -1245,7 +1245,7 @@ fn normalizeKey(s: []const u8, buf: []u8) []const u8 {
 
 test "newsUrlForKey resolves source and country keys" {
     try std.testing.expectEqualStrings("https://feeds.bbci.co.uk/news/rss.xml", newsUrlForKey("src:bbc").?);
-    try std.testing.expectEqualStrings("https://www3.nhk.or.jp/nhkworld/en/news/feeds/rss.xml", newsUrlForKey("cc:JP").?);
+    try std.testing.expectEqualStrings("https://www.japantimes.co.jp/feed/", newsUrlForKey("cc:JP").?);
     try std.testing.expect(newsUrlForKey("src:nope") == null);
     try std.testing.expect(newsUrlForKey("garbage") == null);
 }

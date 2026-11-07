@@ -330,6 +330,7 @@ pub const tls_cert_message = @import("tls_cert_message.zig");
 pub const tls_cookie = @import("tls_cookie.zig");
 pub const tls_extension = @import("tls_extension.zig");
 pub const tls_finished = @import("tls_finished.zig");
+pub const tls_grease = @import("tls_grease.zig");
 pub const tls_key_update = @import("tls_key_update.zig");
 pub const tls_keyshare = @import("tls_keyshare.zig");
 pub const tls_psk = @import("tls_psk.zig");
@@ -706,6 +707,7 @@ test {
     _ = tls_cookie;
     _ = tls_extension;
     _ = tls_finished;
+    _ = tls_grease;
     _ = tls_key_update;
     _ = tls_keyshare;
     _ = tls_psk;

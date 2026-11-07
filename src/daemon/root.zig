@@ -26,6 +26,7 @@ pub const attachment_id = @import("attachment_id.zig");
 pub const audit_trail = @import("audit_trail.zig");
 pub const autojoin = @import("autojoin.zig");
 pub const bot_registry = @import("bot_registry.zig");
+pub const ca_bundle = @import("ca_bundle.zig");
 pub const certfp_bind = @import("certfp_bind.zig");
 pub const challenge = @import("challenge.zig");
 pub const chanmode = @import("chanmode.zig");
@@ -493,6 +494,7 @@ test {
     _ = autojoin;
     _ = backup_set;
     _ = bot_registry;
+    _ = ca_bundle;
     _ = certfp_bind;
     _ = challenge;
     _ = chanmode;

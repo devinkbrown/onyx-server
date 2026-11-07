@@ -99,7 +99,7 @@ test "GAP-C5 FEC stays unwired and section 12 symbols stay absent" {
     try testing.expect(manifest.Live.lookupCommand("STARTTLS") == null);
     try testing.expect(manifest.Live.lookupCommand("IDENT") == null);
 
-    try testing.expect(try fileContains(io, "src/cli/stub_cmds.zig", "openssl-enc-compatible format", testing.allocator));
+    try testing.expect(try fileContains(io, "src/cli/enc_cmd.zig", "no openssl-enc compatibility", testing.allocator));
     try testing.expect(try fileContains(io, "src/cli/armor_main.zig", "error.NotImplemented => std.process.exit(3)", testing.allocator));
 
     std.debug.print("GAP-C5 branch=FEC modules stay unwired until a measured GAP-V3 signal; section 12 symbols stay absent\n", .{});

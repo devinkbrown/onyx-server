@@ -5185,7 +5185,7 @@ test "RFC 8737 tls-alpn-01: an acme-tls/1 hello gets the challenge certificate a
         var conn = try TlsConn.initBorrowed(alloc, cfg13);
         defer conn.deinit();
         conn.acme_store = &store;
-        var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.example.test", .trust_anchors = &.{}, .alpn_protocols = &.{acme_challenge.acme_tls_alpn_protocol} });
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "irc.example.test", .trust_anchors = &.{}, .alpn_protocols = &.{acme_challenge.acme_tls_alpn_protocol}, .grease = false });
         defer client.deinit();
         client.disableServerCertVerification();
         const ch = try client.start();
@@ -5227,7 +5227,7 @@ test "RFC 8737 tls-alpn-01: an acme-tls/1 hello gets the challenge certificate a
         var conn = try TlsConn.initBorrowed(alloc, cfg13);
         defer conn.deinit();
         conn.acme_store = &store;
-        var client = try tls_client.Client.init(alloc, .{ .server_name = "other.example.test", .trust_anchors = &.{}, .alpn_protocols = &.{acme_challenge.acme_tls_alpn_protocol} });
+        var client = try tls_client.Client.init(alloc, .{ .server_name = "other.example.test", .trust_anchors = &.{}, .alpn_protocols = &.{acme_challenge.acme_tls_alpn_protocol}, .grease = false });
         defer client.deinit();
         const ch = try client.start();
         defer alloc.free(ch);
