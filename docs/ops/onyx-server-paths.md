@@ -21,7 +21,28 @@ substitutes for this table.
 | **WebTransport** | UDP `:4433` | UDP `:4433` |
 | **Operational log** | `/home/kain/onyx-server-run/onyx-server.log` (`0600`) | journal for `onyx-server.service` |
 
-## Verified fleet baseline (2026-11-13, 0.11.5)
+## Verified fleet baseline (2026-11-13, 0.11.7)
+
+| Evidence | eshmaki.me | ircx.us |
+|---|---|---|
+| Running image | `0.11.7+1de9c39c19bf` | `0.11.7+1de9c39c19bf` |
+| Executable SHA-256 | `517c17bf0ea67066748a11d3921ad0610d144457a440499aee4977b9c00a4a77` | same |
+| Restart | Helix with `[acme]` enabled, PID 26437 kept | Helix, PID 2980332 kept |
+| `links_active` / `peers_up` / `partitioned` | `1 / 1 / 0` | `1 / 1 / 0` |
+
+0.11.6/0.11.7 carry the in-daemon ACME renewal schedule across Helix (HXAC
+checkpoint, Helix state capability `acme-scheduler-v1`). 0.11.6 sealed the
+checkpoint but its Linux successor ignored it; 0.11.7 restores it. Live
+acceptance on eshmaki.me: 0.11.6 -> 0.11.7 logged `ACME schedule carried
+(next check in 42344s, 1 completed, last not_due)`, and a 0.11.7 -> 0.11.7
+reload 47 s later logged `next check in 42297s` with the same count, so the
+deadline is carried exactly, not reset. Both reloads kept PID 26437 and
+re-attached 2 TLS clients. Immediate-send TLS 1.3 registration and the mesh
+health smoke pass on both nodes; ports 443 and 6697 serve the leaf valid until
+2027-02-11. Rollback binaries: `onyx-server.0.11.5-e9fe8ae5` on both nodes
+(and `onyx-server.0.11.6-0e1b2ce9`).
+
+## Previous baseline (2026-11-13, 0.11.5)
 
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|

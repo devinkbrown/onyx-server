@@ -53,17 +53,19 @@ claims; historical roadmaps do not establish support.
 
 ## Current release status
 
-The source manifest is **0.11.4**, deployed to both production nodes on
-**2026-11-13** (ircx.us by Helix reload, eshmaki.me by cold restart). 0.11.4
-fixes `ktls = "txrx"` dropping TLS 1.3 clients that write right after the
-handshake; see [NEWS](NEWS.md). Exact running revisions and hashes, service
+The source manifest is **0.11.7**, deployed to both production nodes by Helix
+on **2026-11-13**. The 0.11.x line this week fixed `ktls = "txrx"` dropping
+TLS 1.3 clients that write right after the handshake (0.11.4) and made Helix
+work with in-daemon `[acme]` renewal while carrying its exact schedule
+(0.11.5–0.11.7); see [NEWS](NEWS.md). Exact running revisions and hashes, service
 paths, acceptance scope and rollback facts have one canonical home:
 [production status](docs/ops/onyx-server-paths.md).
 
 Production nodes use Helix live reloads. Since 0.10.3 the durable mesh
-presence store is carried across Helix (see NEWS 0.10.3), and since 0.11.5 a
-node with in-daemon `[acme]` renewal enabled (eshmaki.me) can be live-upgraded
-too: the renewal worker is parked at a safe boundary before exec. The 0.9.0
+presence store is carried across Helix (see NEWS 0.10.3). A node with
+in-daemon `[acme]` renewal enabled (eshmaki.me) is live-upgraded too: the
+renewal worker is parked at a safe boundary before exec and its schedule is
+carried to the successor (0.11.7). The 0.9.0
 acceptance verified saved durable account-token recovery after both restarts;
 later rollouts re-verified the secured mesh and cross-node delivery but did
 not repeat the token fixture. Neither claims preservation of old exact

@@ -24,6 +24,9 @@ A source-only line is dated when the manifest changes and says so.
   untouched.
 - New test drives the real `adoptInheritedSessions` path with an HXAC piece
   in the arena and checks the exact deadline, check count and last outcome.
+- Deployed to both nodes by Helix (PIDs kept). On eshmaki.me, with `[acme]`
+  enabled, two reloads logged `ACME schedule carried (next check in 42344s …)`
+  and then `42297s` 47 s later, with the same check count.
 
 ## 0.11.6 — Helix carries the ACME renewal schedule (2026-11-13)
 
