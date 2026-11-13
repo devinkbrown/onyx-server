@@ -11,6 +11,31 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
+## 0.11.4 — kTLS RX no longer drops clients that write right after the handshake (2026-11-13)
+
+- **Hotfix for `[tls] ktls = "txrx"`.** A provided-buffer multishot recv stayed
+  armed across the TLS 1.3 Finished boundary. A client that sends its first
+  application record immediately behind Finished — WeeChat, `openssl s_client`
+  and most IRC clients — had that record pulled into userspace before the
+  daemon attached `TLS_RX`. The record was parsed as plaintext and the kernel
+  expected a sequence number the wire had already passed, so the connection
+  died with EBADMSG (`tls_record_failure` / `RecvFailed`). On production this
+  turned away almost every fresh TLS 1.3 client while held connections and
+  TLS 1.2 kept working, which looked like users repeatedly delinking.
+- TLS connections that may still attach kernel RX now use single-shot recv
+  until the attach, and the attach refuses to run while any recv is armed.
+  Regression test: `ringlane kTLS-RX-capable TLS conn arms single-shot recv
+  until the RX attach`.
+- Tests: the TLS-policy test server is constructed in place; the by-value
+  `LinuxServer` temporary overflowed the default 8 MiB test-thread stack.
+- CI: the release-artifact check matches Zig 0.17's renamed build-mode tag
+  (`fast`, formerly `ReleaseFast`); it had failed on every release build since
+  the compiler upgrade.
+- Deployed to both nodes: ircx.us by Helix reload (PID kept), eshmaki.me by
+  cold restart, because in-daemon `[acme]` renewal (enabled there the same day)
+  refuses Helix. Immediate-send TLS 1.3 registration passes 3/3 on both nodes;
+  mesh health is `links_active=1 partitioned=0`.
+
 ## 0.11.3 — Deferred registration renames instead of disconnecting (2026-11-07)
 
 - On deferred registration paths (local guest issuer, challenge) the welcome

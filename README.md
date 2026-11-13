@@ -53,17 +53,21 @@ claims; historical roadmaps do not establish support.
 
 ## Current release status
 
-The source manifest is **0.10.0**, deployed to both production nodes on
-**2026-11-06**. Both nodes use the improved OpenRC/systemd kits. Exact running revisions and hashes, service paths,
-acceptance scope and rollback facts have one
-canonical home: [production status](docs/ops/onyx-server-paths.md).
+The source manifest is **0.11.4**, deployed to both production nodes on
+**2026-11-13** (ircx.us by Helix reload, eshmaki.me by cold restart). 0.11.4
+fixes `ktls = "txrx"` dropping TLS 1.3 clients that write right after the
+handshake; see [NEWS](NEWS.md). Exact running revisions and hashes, service
+paths, acceptance scope and rollback facts have one canonical home:
+[production status](docs/ops/onyx-server-paths.md).
 
-Production nodes use Helix live reloads. Since 0.10.3 the durable mesh
-presence store is carried across Helix (see NEWS 0.10.3), and both nodes kept
-their PID and held clients through a live reload. The 0.9.0 acceptance verified saved durable
-account-token recovery after both restarts; the 0.10.0 rollout re-verified the
-secured mesh and cross-node delivery but did not repeat the token fixture.
-Neither claims preservation of old exact attachment tokens across a cold boundary.
+Production nodes use Helix live reloads where possible. Since 0.10.3 the
+durable mesh presence store is carried across Helix (see NEWS 0.10.3). A node
+with in-daemon `[acme]` renewal enabled refuses Helix on Linux and is upgraded
+by a cold restart instead; eshmaki.me runs that way since 2026-11-13. The 0.9.0
+acceptance verified saved durable account-token recovery after both restarts;
+later rollouts re-verified the secured mesh and cross-node delivery but did
+not repeat the token fixture. Neither claims preservation of old exact
+attachment tokens across a cold boundary.
 
 The latest published GitHub asset release, checked **2026-11-06**, is still
 [v0.5.6](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6).
