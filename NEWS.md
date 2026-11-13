@@ -32,6 +32,10 @@ A source-only line is dated when the manifest changes and says so.
 - Tests: the cold-started worker parks, captures, resumes and parks again; the
   continuity gate treats a parkable worker as no blocker and an unmanaged one
   as `acme_companion`.
+- Deployed to both nodes: ircx.us by Helix; eshmaki.me by one last cold
+  restart (0.11.4 still carried the block), then live Helix reloads with
+  `[acme]` enabled kept PID 26437 and re-attached 2 TLS clients, and a held
+  TLS 1.3 client answered `PING` after the swap.
 
 ## 0.11.4 — kTLS RX no longer drops clients that write right after the handshake (2026-11-13)
 

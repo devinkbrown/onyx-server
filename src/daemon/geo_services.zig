@@ -1709,14 +1709,14 @@ test "Windows geo news cache reads regular UTF-8 files and rejects reparse point
     const cache_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer std.testing.allocator.free(cache_dir);
     var service = Service.init(std.testing.allocator, .{ .news_cache_dir = cache_dir });
-    service.fetchNewsFromFile("src:bbc");
+    try std.testing.expect(service.fetchNewsFromFile("src:bbc"));
     var output: [256]u8 = undefined;
     var lines: [max_headlines][]const u8 = undefined;
     const headlines = service.getNews("src:bbc", &output, &lines) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 2), headlines.len);
     try std.testing.expectEqualStrings("First headline", headlines[0]);
     try std.testing.expectEqualStrings("Second headline", headlines[1]);
-    service.fetchNewsFromFile("src:../../escape");
+    try std.testing.expect(!service.fetchNewsFromFile("src:../../escape"));
     try std.testing.expect(service.findNews("src:../../escape") == null);
 
     var path_buf: [512]u8 = undefined;

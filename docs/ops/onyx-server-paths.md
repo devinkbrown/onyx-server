@@ -21,7 +21,27 @@ substitutes for this table.
 | **WebTransport** | UDP `:4433` | UDP `:4433` |
 | **Operational log** | `/home/kain/onyx-server-run/onyx-server.log` (`0600`) | journal for `onyx-server.service` |
 
-## Verified fleet baseline (2026-11-13, 0.11.4)
+## Verified fleet baseline (2026-11-13, 0.11.5)
+
+| Evidence | eshmaki.me | ircx.us |
+|---|---|---|
+| Running image | `0.11.5+d984ce0c0728` | `0.11.5+d984ce0c0728` |
+| Executable SHA-256 | `e9fe8ae5da37d0341558279810252323415aca2422a7c860f9853320cf374d6f` | same |
+| Restart | cold (OpenRC, last time 0.11.4's ACME block applied), then Helix reloads with `[acme]` enabled, PID 26437 kept | Helix, PID 2980332 kept |
+| `links_active` / `peers_up` / `partitioned` | `1 / 1 / 0` | `1 / 1 / 0` |
+
+0.11.5 lets Helix run while in-daemon `[acme]` renewal is enabled: the upgrade
+parks the renewal worker at a complete-operation boundary before exec. Live
+acceptance on eshmaki.me (ACME enabled): a Helix reload kept PID 26437 and
+re-attached 2 TLS clients, and a held TLS 1.3 client answered `PING` after the
+swap. The successor's first ACME check ran 1 minute after start
+(`acme renewal not due … leaf expires in 89d`). One earlier attempt was refused
+by the existing guard for a TLS connection still mid-handshake, not by ACME.
+ircx.us went first by Helix (ExecReload needs `sudo -n systemctl reload`).
+Immediate-send TLS 1.3 registration and the mesh health smoke pass on both
+nodes. Rollback binaries: `onyx-server.0.11.4-3cdd8e1f` on both nodes.
+
+## Previous baseline (2026-11-13, 0.11.4)
 
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
