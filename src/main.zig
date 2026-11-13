@@ -3864,6 +3864,8 @@ pub fn main(init: std.process.Init) !void {
             s.stop();
             if (comptime builtin.os.tag == .windows) {
                 if (srv.acme_worker == s) srv.acme_worker = null;
+            } else {
+                if (srv.acme_pause_owner == s) srv.acme_pause_owner = null;
             }
             if (srv.acme_tls_alpn01_store == s.tlsAlpn01Store()) srv.acme_tls_alpn01_store = null;
             allocator.destroy(s);
@@ -3972,6 +3974,11 @@ pub fn main(init: std.process.Init) !void {
                     // Pause and parked-restore both require the bound clock.
                     try svc.prepareColdResources(init.io);
                     srv.acme_worker = svc;
+                } else {
+                    // Helix parks this worker before exec; pausing needs the
+                    // bound clock, which must be set before the thread starts.
+                    try svc.prepareColdResources(init.io);
+                    srv.acme_pause_owner = svc;
                 }
             } else {
                 std.debug.print("onyx-server: [acme] renewal is unavailable on this platform\n", .{});

@@ -11,6 +11,28 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
+## 0.11.5 — Helix live upgrades work with in-daemon ACME renewal (2026-11-13)
+
+- **Helix no longer refuses on Linux/OpenBSD when `[acme]` is enabled.** The
+  renewal worker ran as an unmanaged thread, so the continuity scan reported
+  `ACME renewal companion has no exact Helix checkpoint` and every live
+  upgrade was refused for as long as ACME was on. The worker's pause clock is
+  now bound at boot. Before freezing state, the upgrade parks the worker after
+  its current complete operation (any issuance, challenge-listener teardown
+  and cert/key writes), so exec can never split a renewal between the chain
+  and key writes. The successor starts a fresh worker from config.
+- A renewal still running 30 s after the upgrade request refuses that upgrade
+  with `ACME renewal in progress; retry shortly` before anything is frozen; a
+  failed upgrade resumes the same worker. Windows keeps its carried scheduler
+  snapshot.
+- A freshly started worker (cold boot or Helix re-exec) checks the certificate
+  1 minute after start instead of a full `check_interval` (12 h) later, so
+  reloads more frequent than the interval can no longer postpone renewal. A
+  check that is not due only reads the local certificate file.
+- Tests: the cold-started worker parks, captures, resumes and parks again; the
+  continuity gate treats a parkable worker as no blocker and an unmanaged one
+  as `acme_companion`.
+
 ## 0.11.4 — kTLS RX no longer drops clients that write right after the handshake (2026-11-13)
 
 - **Hotfix for `[tls] ktls = "txrx"`.** A provided-buffer multishot recv stayed

@@ -6593,6 +6593,14 @@ pub const LinuxServer = struct {
     acme_reload_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     acme_reload_retry_after_ms: i64 = 0,
     acme_worker: ?*@import("acme_renewal.zig").Service = null,
+    /// Linux/OpenBSD ACME renewal worker whose pause clock main.zig bound
+    /// before start. Helix re-execs on these hosts and the successor builds a
+    /// fresh worker from config, so the only continuity hazard is exec landing
+    /// inside an issuance (between the chain and key writes). The upgrade parks
+    /// this worker at a complete-operation boundary first. Windows keeps using
+    /// `acme_worker`, which also carries the scheduler snapshot.
+    acme_pause_owner: ?*@import("acme_renewal.zig").Service = null,
+    acme_pause_epoch: u64 = 0,
     /// RFC 8737 tls-alpn-01 challenge store owned by the ACME renewal Service.
     /// Kept separate from `acme_worker` so it is wired on every platform
     /// without entering Windows Helix runtime-relation accounting. main.zig
@@ -41737,6 +41745,13 @@ pub const LinuxServer = struct {
     /// mutation boundary for MediaRooms/signaling. Transport predicates take
     /// their own pump locks; bridge values are inspected under their owner lock.
     /// Returns the FIRST blocker in inventory order: the one UPGRADE refuses with.
+    /// True when Helix can quiesce the ACME renewal worker: Windows carries its
+    /// scheduler snapshot through `acme_worker`; Linux/OpenBSD park the
+    /// `acme_pause_owner` at a complete-operation boundary before exec.
+    fn acmeHelixManaged(self: *const LinuxServer) bool {
+        return if (comptime builtin.os.tag == .windows) self.acme_worker != null else self.acme_pause_owner != null;
+    }
+
     fn upgradeContinuityBlockerLocked(self: *LinuxServer) ?UpgradeContinuityBlocker {
         var scan: UpgradeContinuityScan = .{ .stop_at_first = true };
         self.scanUpgradeContinuityBlockersLocked(&scan);
@@ -41827,7 +41842,10 @@ pub const LinuxServer = struct {
             const owner = if (builtin.os.tag == .windows) self.windows_webtransport_owner else if (builtin.os.tag == .linux) self.linuxWebTransportOwner() else null;
             if (owner == null or owner.?.port != self.config.webtransport_port) if (scan.note(.webtransport_listener)) return;
         }
-        if (self.acme_reload_tls != null and (builtin.os.tag != .windows or self.acme_worker == null))
+        // An ACME worker the upgrade cannot park is unchecked process-owned
+        // state. A managed one is parked before exec (Linux/OpenBSD) or carried
+        // as a scheduler snapshot (Windows).
+        if (self.acme_reload_tls != null and !self.acmeHelixManaged())
             if (scan.note(.acme_companion)) return;
         // Neither active journals nor retired writers awaiting a manifest
         // have a Helix capsule. Room state can already be gone while retired
@@ -42282,6 +42300,34 @@ pub const LinuxServer = struct {
                     windows_acme_pause = token;
                     const io = self.config.crypto_io orelse return error.InvalidRuntime;
                     try owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) }));
+                }
+            }
+        }
+        // Linux/OpenBSD: park the ACME renewal worker after its current complete
+        // operation (any issuance, challenge-listener teardown and cert/key
+        // writes) so exec can never split a renewal. The successor starts a
+        // fresh worker from config. A renewal still running at the deadline
+        // refuses the upgrade before any state is frozen; a failed upgrade
+        // resumes the same worker.
+        var acme_pause: ?@import("runtime_pause.zig").Token = null;
+        defer if (comptime builtin.os.tag != .windows) {
+            if (acme_pause) |token| {
+                if (self.acme_pause_owner) |owner| owner.resumePaused(token) catch @panic("ACME pause could not resume");
+            }
+        };
+        if (comptime builtin.os.tag != .windows) {
+            if (self.acme_pause_owner) |owner| {
+                if (owner.thread != null) {
+                    const epoch = std.math.add(u64, self.acme_pause_epoch, 1) catch return error.InvalidRuntime;
+                    const token = try owner.requestPause(epoch);
+                    self.acme_pause_epoch = epoch;
+                    acme_pause = token;
+                    const io = self.config.crypto_io orelse return error.InvalidRuntime;
+                    owner.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(30_000) })) catch |err| {
+                        srvLog("onyx-server: UPGRADE refused — ACME renewal did not reach a safe boundary within 30s ({s}); retry after it finishes\n", .{@errorName(err)});
+                        self.deferredUpgradeNotice(request, "UPGRADE refused: ACME renewal in progress; retry shortly");
+                        return err;
+                    };
                 }
             }
         }
@@ -100628,6 +100674,15 @@ test "UPGRADE continuity gate accepts idle state and refuses every media or comp
     var acme_tls = config_format.Config.Tls{};
     server.acme_reload_tls = &acme_tls;
     try std.testing.expectEqual(Server.UpgradeContinuityBlocker.acme_companion, blocker(&server).?);
+    // A worker the upgrade can park (Linux/OpenBSD) is not a blocker: the
+    // upgrade quiesces it at a complete-operation boundary before exec.
+    if (comptime builtin.os.tag != .windows) {
+        var parkable: @import("acme_renewal.zig").Service = undefined;
+        server.acme_pause_owner = &parkable;
+        try std.testing.expect(blocker(&server) == null);
+        server.acme_pause_owner = null;
+        try std.testing.expectEqual(Server.UpgradeContinuityBlocker.acme_companion, blocker(&server).?);
+    }
     server.acme_reload_tls = null;
     try std.testing.expect(blocker(&server) == null);
 

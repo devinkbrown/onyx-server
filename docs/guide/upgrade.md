@@ -103,8 +103,13 @@ Continuity guards inspect process-owned state before sealing. Active recording
 journals and retired writers awaiting their final manifest are not carried and
 therefore block Helix even after their room has disappeared. Unfinished oversized
 input, pending identity/membership delivery and other uncheckpointed authorities
-can also defer or refuse the request. WebTransport/media/ACME continuity depends
-on the actual platform, retained owner and source/target implementation; a named
+can also defer or refuse the request. Since 0.11.5 an enabled `[acme]` renewal
+worker does not block Helix on Linux/OpenBSD: the upgrade parks it after its
+current complete operation (a renewal still running 30 s after the request
+refuses that upgrade, `ACME renewal in progress; retry shortly`) and the
+successor starts a fresh worker whose first check runs 1 minute after start.
+WebTransport/media continuity depends on the actual platform, retained owner
+and source/target implementation; a named
 feature or capability token alone does not prove that the running deployment can
 upgrade it. Consult the source guard and release acceptance for the exact image.
 

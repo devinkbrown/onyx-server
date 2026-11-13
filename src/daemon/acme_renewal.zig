@@ -36,6 +36,12 @@ const x509 = @import("../crypto/x509.zig");
 
 const seconds_per_day: i64 = 24 * 60 * 60;
 const wake_poll_ms: u64 = 1000;
+/// First expiry check after a (cold or Helix re-exec) boot. Waiting a full
+/// `check_interval` instead would let reloads more frequent than the interval
+/// postpone every check indefinitely. A check that is not due only reads the
+/// local certificate file. A Windows Helix successor restores the carried
+/// deadline over this default.
+const initial_check_delay_ms: u64 = 60_000;
 const max_cert_file_bytes: usize = 256 * 1024;
 
 /// Pure renewal predicate: renew when the leaf is expired or when its remaining
@@ -81,7 +87,7 @@ pub const Service = struct {
             .server = server,
             .acme = acme,
             .tls = tls,
-            .next_check_ms = platform.monotonicMillis() +| (std.math.cast(i64, acme.check_interval_ms) orelse std.math.maxInt(i64)),
+            .next_check_ms = platform.monotonicMillis() +| (std.math.cast(i64, @min(acme.check_interval_ms, initial_check_delay_ms)) orelse std.math.maxInt(i64)),
         };
     }
 
@@ -634,4 +640,42 @@ test "companion runtime acme retained worker carries deadline and actual skipped
     try std.testing.expectError(error.ConfigMismatch, carry.validate(changed, &tls));
     carry.completed_checks = 0;
     try std.testing.expectError(error.InvalidSnapshot, carry.validate(acme, &tls));
+}
+
+test "acme cold-started worker with a bound clock parks for Helix and resumes" {
+    // Linux/OpenBSD Helix path: main.zig binds the pause clock, then start()
+    // spawns a plain thread (no Gate). The upgrade must be able to park it at
+    // a complete-operation boundary and resume it if the upgrade aborts.
+    var server: server_mod.Server = undefined;
+    const tls: config_format.Config.Tls = .{};
+    const acme: config_format.Config.Acme = .{ .enabled = true };
+    var service = Service.init(std.testing.allocator, std.testing.io, &server, acme, &tls);
+    // A fresh worker checks soon after boot instead of a full interval later,
+    // so frequent reloads cannot postpone renewal indefinitely.
+    try std.testing.expect(service.next_check_ms - platform.monotonicMillis() <= @as(i64, @intCast(initial_check_delay_ms)));
+    try service.prepareColdResources(std.testing.io);
+    try service.startChecked();
+    defer service.stop();
+
+    const token = try service.requestPause(1);
+    try service.awaitPaused(token, std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(10_000) }));
+    const snapshot = try service.capturePaused(token);
+    try std.testing.expectEqual(Execution.paused, snapshot.execution);
+    try service.resumePaused(token);
+
+    // A second upgrade attempt after the resume parks again. Departure from the
+    // boundary is asynchronous; until the worker has left it a new request is
+    // refused as Busy (a real retry arrives much later), so poll for it.
+    const again = blk: {
+        var attempts: usize = 0;
+        while (true) : (attempts += 1) {
+            break :blk service.requestPause(2) catch |err| {
+                if (err != error.Busy or attempts >= 500) return err;
+                sleepMs(10);
+                continue;
+            };
+        }
+    };
+    try service.awaitPaused(again, std.Io.Clock.Timestamp.fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(10_000) }));
+    try service.resumePaused(again);
 }
