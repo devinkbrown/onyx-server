@@ -36,11 +36,11 @@ const x509 = @import("../crypto/x509.zig");
 
 const seconds_per_day: i64 = 24 * 60 * 60;
 const wake_poll_ms: u64 = 1000;
-/// First expiry check after a (cold or Helix re-exec) boot. Waiting a full
-/// `check_interval` instead would let reloads more frequent than the interval
-/// postpone every check indefinitely. A check that is not due only reads the
-/// local certificate file. A Windows Helix successor restores the carried
-/// deadline over this default.
+/// First expiry check after a cold boot: the certificate may have entered its
+/// renewal window, or expired, while the daemon was down, so it is checked
+/// soon instead of a full `check_interval` later. A check that is not due only
+/// reads the local certificate file. Helix successors do not use this: they
+/// restore the predecessor's exact schedule from the HXAC checkpoint.
 const initial_check_delay_ms: u64 = 60_000;
 const max_cert_file_bytes: usize = 256 * 1024;
 

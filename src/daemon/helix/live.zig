@@ -382,13 +382,20 @@ pub const tls_session_v4_capability_token = "ONYX_HELIX_STATE_CAP=tls-session-v4
 /// `ready == false` for that suite under the unchanged v2 HXLW layout and has
 /// no v3 frame.
 pub const quic_wide_key_update_capability_token = "ONYX_HELIX_STATE_CAP=quic-wide-key-update-v1";
+/// `acme-scheduler-v1`: the target restores the in-daemon ACME renewal
+/// scheduler (next check deadline, completed checks, last outcome) from a
+/// carried HXAC checkpoint on Linux/OpenBSD. Older targets have no such
+/// branch, so the predecessor omits the piece and the target starts a fresh
+/// schedule, exactly as before.
+pub const acme_scheduler_capability_token = "ONYX_HELIX_STATE_CAP=acme-scheduler-v1";
 /// Never emit a predecessor line whose mandatory state this image refuses.
 /// Probe success must imply that the target can accept the sender's handoff.
 /// Multi-line: the exact base contract followed by every rolling state
 /// capability this image adopts.
 pub const upgrade_capability_advertisement = upgrade_capability_token ++ "\n" ++
     tls_session_v4_capability_token ++ "\n" ++
-    quic_wide_key_update_capability_token;
+    quic_wide_key_update_capability_token ++ "\n" ++
+    acme_scheduler_capability_token;
 
 /// What a probed upgrade target adopts beyond the exact base contract. A
 /// target that answers only the base token (0.10.4) gets all-false: the
@@ -396,10 +403,11 @@ pub const upgrade_capability_advertisement = upgrade_capability_token ++ "\n" ++
 pub const TargetStateCaps = struct {
     tls_session_v4: bool = false,
     quic_wide_key_update: bool = false,
+    acme_scheduler: bool = false,
 
     /// This image's own capabilities. Used where no probe runs (native
     /// same-image handoff) and as the in-process default.
-    pub const current: TargetStateCaps = .{ .tls_session_v4 = true, .quic_wide_key_update = true };
+    pub const current: TargetStateCaps = .{ .tls_session_v4 = true, .quic_wide_key_update = true, .acme_scheduler = true };
     /// A 0.10.4-class target: only the exact base token.
     pub const legacy: TargetStateCaps = .{};
 
@@ -407,6 +415,7 @@ pub const TargetStateCaps = struct {
         return .{
             .tls_session_v4 = hasCompleteOutputLine(output, tls_session_v4_capability_token),
             .quic_wide_key_update = hasCompleteOutputLine(output, quic_wide_key_update_capability_token),
+            .acme_scheduler = hasCompleteOutputLine(output, acme_scheduler_capability_token),
         };
     }
 
@@ -414,6 +423,7 @@ pub const TargetStateCaps = struct {
         return .{
             .tls_session_v4 = a.tls_session_v4 or b.tls_session_v4,
             .quic_wide_key_update = a.quic_wide_key_update or b.quic_wide_key_update,
+            .acme_scheduler = a.acme_scheduler or b.acme_scheduler,
         };
     }
 };
@@ -1554,7 +1564,11 @@ test "Helix rollback probe: a 0.10.4 target is compatible but lacks tls-session-
     try std.testing.expect(hasUpgradeCapabilityLine(output));
     try std.testing.expectEqual(TargetStateCaps.current, TargetStateCaps.fromOutput(output));
     // Capabilities split across stdout/stderr merge; substrings never count.
-    try std.testing.expectEqual(TargetStateCaps.current, TargetStateCaps.fromOutput(tls_session_v4_capability_token ++ "\n").merge(TargetStateCaps.fromOutput(quic_wide_key_update_capability_token ++ "\r\n")));
+    try std.testing.expectEqual(TargetStateCaps.current, TargetStateCaps.fromOutput(tls_session_v4_capability_token ++ "\n").merge(TargetStateCaps.fromOutput(quic_wide_key_update_capability_token ++ "\r\n" ++ acme_scheduler_capability_token ++ "\n")));
+    // A 0.11.5-class target advertises the TLS/QUIC rows but not the ACME
+    // scheduler: the predecessor must omit the HXAC piece for it.
+    const pre_acme = TargetStateCaps.fromOutput(upgrade_capability_token ++ "\n" ++ tls_session_v4_capability_token ++ "\n" ++ quic_wide_key_update_capability_token ++ "\n");
+    try std.testing.expect(pre_acme.tls_session_v4 and pre_acme.quic_wide_key_update and !pre_acme.acme_scheduler);
     try std.testing.expectEqual(TargetStateCaps.legacy, TargetStateCaps.fromOutput("x" ++ tls_session_v4_capability_token ++ "\n" ++ quic_wide_key_update_capability_token ++ " y\n"));
 }
 
@@ -1566,6 +1580,7 @@ test "Helix forward probe: a 0.10.4 predecessor still finds its exact line in th
     try std.testing.expect(hasCompleteOutputLine(upgrade_capability_advertisement ++ "\n", base_line));
     try std.testing.expect(hasCompleteOutputLine(upgrade_capability_advertisement, tls_session_v4_capability_token));
     try std.testing.expect(hasCompleteOutputLine(upgrade_capability_advertisement, quic_wide_key_update_capability_token));
+    try std.testing.expect(hasCompleteOutputLine(upgrade_capability_advertisement, acme_scheduler_capability_token));
     // The probe output limit (4096 per stream) still holds with headroom.
     try std.testing.expect(upgrade_capability_advertisement.len + boot_policy_capability_token.len + 2 < 4096);
 }

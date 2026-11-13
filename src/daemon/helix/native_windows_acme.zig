@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Fixed-size Windows Helix custody for the ACME renewal scheduler only.
+//! Fixed-size Helix custody for the ACME renewal scheduler only (HXAC).
+//! Native Windows carries it with its parked Gate worker; Linux/OpenBSD carry
+//! it to targets advertising `acme-scheduler-v1` and restore it before the
+//! successor starts its worker. The frame domain keeps its original name so
+//! existing Windows images still interoperate.
 //! TLS reload intent and certificate generations belong to the server graph.
 
 const std = @import("std");

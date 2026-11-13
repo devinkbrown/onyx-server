@@ -11,6 +11,27 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
+## 0.11.6 — Helix carries the ACME renewal schedule (2026-11-13)
+
+- **A reload no longer resets ACME renewal on Linux/OpenBSD.** 0.11.5 parked
+  the renewal worker for Helix but the successor started a brand-new schedule.
+  Reloads closer together than the first-check delay kept postponing the
+  expiry check, and after a failed issuance every reload retried at once,
+  which can run into the CA's failed-validation rate limits.
+- The predecessor now seals the parked worker's exact scheduler state (next
+  check deadline, completed checks, last outcome) into the Helix arena as an
+  HXAC checkpoint, the same frame native Windows already carries. The
+  successor restores it before its worker starts. `CLOCK_MONOTONIC` continues
+  across exec, so the carried deadline stays exact.
+- New Helix state capability `acme-scheduler-v1`. The checkpoint is sent only
+  to targets that advertise it, so upgrading from 0.11.5 and rolling back to
+  it still work (the target then starts a fresh schedule, as before).
+- If the successor's `[acme]` or `[tls]` cert/key paths changed, or ACME is
+  disabled there, the carried schedule is dropped and a fresh one starts. A
+  malformed checkpoint refuses the handoff like any other carried state.
+- The 1-minute first check now applies only to cold boots, where the
+  certificate may have entered its renewal window while the daemon was down.
+
 ## 0.11.5 — Helix live upgrades work with in-daemon ACME renewal (2026-11-13)
 
 - **Helix no longer refuses on Linux/OpenBSD when `[acme]` is enabled.** The
