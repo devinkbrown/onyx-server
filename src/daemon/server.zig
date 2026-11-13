@@ -22096,7 +22096,21 @@ pub const LinuxServer = struct {
         if (comptime builtin.os.tag == .linux) {
             // kTLS RX demuxes control records with recvmsg on the connection
             // buffer. Provided-buffer multishot cannot carry that cmsg.
-            if (!conn.tls_rx_offloaded and self.rx().ring.features.multishot_recv and
+            //
+            // A TLS conn that may still attach kTLS RX must also stay off
+            // multishot BEFORE the attach: a live multishot SQE keeps pulling
+            // ciphertext into provided buffers, so by the time driveTls attaches
+            // TLS_RX at the Finished boundary the kernel may already have handed
+            // userspace the client's first application record (it typically
+            // sends NICK/USER right behind Finished). That record would then be
+            // parsed as plaintext and the kernel would expect a sequence number
+            // the wire has already passed -> EBADMSG / tls_record_failure on
+            // every fresh TLS 1.3 client. Single-shot recv has no SQE in flight
+            // while the completion is processed, so the attach sees the exact
+            // socket boundary.
+            const ktls_rx_may_attach = conn.tls != null and self.config.tls_ktls_rx;
+            if (!conn.tls_rx_offloaded and !ktls_rx_may_attach and
+                self.rx().ring.features.multishot_recv and
                 self.rx().ring.hasProvidedGroup())
             {
                 self.rx().ring.submitRecvMultishot(conn.token, conn.fd, self.rx().ring.providedGroup()) catch |err| {
@@ -23331,9 +23345,12 @@ pub const LinuxServer = struct {
         // so the kernel resumes decryption from exactly app_read_seq. One-shot: a
         // conn that still holds a partial inbound record stays on userspace RX.
         // After this, recv() returns plaintext (routed via driveClientBytes).
+        // A recv still armed (multishot, or a single-shot submitted by another
+        // path) may already own bytes past this boundary; attaching now would
+        // desync the kernel's record sequence. Defer to the next completion.
         if (self.config.tls_ktls_rx and conn.tls.?.handshakeDone() and
             !conn.tls_rx_offloaded and conn.tls.?.negotiatedVersion() != null and
-            !conn.tls.?.hasBufferedInbound())
+            !conn.tls.?.hasBufferedInbound() and !conn.recv_armed)
         {
             if (conn.tls.?.enableKtlsRx(conn.fd)) |_| {
                 conn.tls_rx_offloaded = true;
@@ -131200,6 +131217,59 @@ test "ringlane multishot recv copies into the connection and zero-copy send wait
     }
     try std.testing.expectEqual(outbound.len, n);
     try std.testing.expectEqualSlices(u8, outbound, got[0..outbound.len]);
+}
+
+test "ringlane kTLS-RX-capable TLS conn arms single-shot recv until the RX attach" {
+    // Regression (0.11.4): a multishot recv armed across the TLS 1.3 Finished
+    // boundary pre-consumed the client's first application record before
+    // TLS_RX was attached, so the kernel desynced (EBADMSG) on every fresh
+    // client that wrote immediately after the handshake.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    server.initInPlace(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_clients = 2,
+        .features = .{ .buf_ring = true, .multishot_recv = true },
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    defer current_reactor = null;
+    current_reactor = &server.reactors[0];
+    if (!server.rx().ring.hasProvidedGroup() or !server.rx().ring.features.multishot_recv) return error.SkipZigTest;
+
+    const plain = try sameIPTestSocketPair();
+    defer closeFd(plain[1]);
+    const tls_pair = try sameIPTestSocketPair();
+    defer closeFd(tls_pair[1]);
+    const tls_fixture = try DaemonOutputTestPair.createSuite(.tls13, 0x1301);
+    defer tls_fixture.destroy();
+
+    const plain_id = try server.rx().clients.alloc(ConnState.init(plain[0]));
+    const plain_conn = server.rx().clients.get(plain_id).?;
+    plain_conn.overflow_allocator = allocator;
+    plain_conn.token = try tokenFromId(plain_id);
+    const tls_id = try server.rx().clients.alloc(ConnState.init(tls_pair[0]));
+    const tls_conn_state = server.rx().clients.get(tls_id).?;
+    tls_conn_state.overflow_allocator = allocator;
+    tls_conn_state.token = try tokenFromId(tls_id);
+    tls_conn_state.tls = &tls_fixture.tls;
+    tls_conn_state.is_tls = true;
+    // Borrowed adapter: never let server teardown free the fixture's TlsConn.
+    defer tls_conn_state.tls = null;
+
+    server.config.tls_ktls_rx = true;
+    // Control: a plaintext conn still uses provided-buffer multishot.
+    try server.armRecv(plain_conn);
+    try std.testing.expect(plain_conn.recv_armed and plain_conn.recv_multishot_armed);
+    // A TLS conn that may attach kTLS RX must not have a multishot in flight.
+    try server.armRecv(tls_conn_state);
+    try std.testing.expect(tls_conn_state.recv_armed);
+    try std.testing.expect(!tls_conn_state.recv_multishot_armed);
 }
 
 test "ringlane unsupported optional recv and SEND_ZC fall back without changing bytes" {
