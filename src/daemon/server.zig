@@ -161065,7 +161065,9 @@ fn testEchConfigList(buf: []u8, config_id: u8, public_key: []const u8, public_na
 fn initTlsPolicyTestServer(allocator: std.mem.Allocator, cfg: Config) !*Server {
     const server = try allocator.create(Server);
     errdefer allocator.destroy(server);
-    server.* = try Server.init(allocator, cfg);
+    // Construct in place: a by-value LinuxServer temporary overflows the
+    // default 8 MiB test-thread stack.
+    try server.initInPlace(allocator, cfg);
     return server;
 }
 
