@@ -523,10 +523,19 @@ jobs:
           test -x zig-out/bin/onyx-server
           # The daemon core embeds @tagName(builtin.mode) for its VERSION line —
           # exactly one mode string ends up in the binary. Assert the core is
-          # really ReleaseFast: a mis-wired build graph once shipped a "release"
-          # shim wrapping a Debug core, and this catches that structurally.
-          grep -aq ReleaseFast zig-out/bin/onyx-server
-          ! grep -aq Debug zig-out/bin/onyx-server
+          # really the fast (ReleaseFast) mode: a mis-wired build graph once
+          # shipped a "release" shim wrapping a Debug core, and this catches
+          # that structurally. Zig 0.17 renamed the OptimizeMode tags to
+          # debug/safe/fast/small, so match the NUL-delimited tag literal.
+          python3 - zig-out/bin/onyx-server <<'PY'
+          import sys
+          data = open(sys.argv[1], "rb").read()
+          if b"\x00fast\x00" not in data:
+              sys.exit("artifact lacks the 'fast' build-mode tag")
+          for other in (b"\x00debug\x00", b"\x00safe\x00"):
+              if other in data:
+                  sys.exit(f"artifact embeds a non-release build-mode tag {other!r}")
+          PY
       - name: Upload daemon binary
         uses: actions/upload-artifact@v4
         with:
