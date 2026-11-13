@@ -21,7 +21,29 @@ substitutes for this table.
 | **WebTransport** | UDP `:4433` | UDP `:4433` |
 | **Operational log** | `/home/kain/onyx-server-run/onyx-server.log` (`0600`) | journal for `onyx-server.service` |
 
-## Verified fleet baseline (2026-11-07, 0.11.3)
+## Verified fleet baseline (2026-11-13, 0.11.4)
+
+| Evidence | eshmaki.me | ircx.us |
+|---|---|---|
+| Running image | `0.11.4+5c6650b9d135` | `0.11.4+5c6650b9d135` |
+| Executable SHA-256 | `3cdd8e1fa80859579f894860ba3ec61045e8643ff8d6988323c96fd05ce685cf` | same |
+| Restart | cold (OpenRC), PID 8796, presence epoch 14 | Helix, PID 2980332 kept |
+| `links_active` / `peers_up` / `partitioned` | `1 / 1 / 0` | `1 / 1 / 0` |
+
+0.11.4 is a hotfix for `ktls = "txrx"`: a provided-buffer multishot recv armed
+across the TLS 1.3 Finished boundary pre-consumed the client's first
+application record before `TLS_RX` attached, so every client that wrote right
+after the handshake (WeeChat, `openssl s_client`) died with EBADMSG
+(`tls_record_failure`). Kernel-RX-capable TLS conns now stay on single-shot
+recv until the attach. Built with `packaging/release.sh` (Zig 0.17.0,
+`7c61539a…`). Acceptance: immediate-send TLS 1.3 registration 3/3 and TLS 1.2
+on both nodes, mesh health smoke OK. ircx.us went first by Helix. eshmaki.me
+refused Helix with `ACME renewal companion has no exact Helix checkpoint`
+(in-daemon `[acme]` was enabled there on 2026-11-13 and blocks every Linux
+Helix while enabled), so it was cold-restarted. Rollback binaries:
+`onyx-server.0.11.3-877fe313` on both nodes.
+
+## Previous baseline (2026-11-07, 0.11.3)
 
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
