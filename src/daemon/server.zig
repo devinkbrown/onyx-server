@@ -41752,22 +41752,34 @@ pub const LinuxServer = struct {
         return if (comptime builtin.os.tag == .windows) self.acme_worker != null else self.acme_pause_owner != null;
     }
 
-    /// Linux/OpenBSD successor: adopt the predecessor's ACME scheduler before
-    /// main.zig starts the worker. A changed `[acme]`/`[tls]` path config
-    /// (digest mismatch) or ACME disabled in the successor is an operator
-    /// decision, not corruption: the carried schedule is dropped and the
-    /// worker starts fresh. A malformed checkpoint refuses the handoff.
-    fn restoreAcmeSchedulerCheckpoint(self: *LinuxServer, bytes: []const u8) !void {
+    /// Linux/OpenBSD successor, decode phase: validate the predecessor's ACME
+    /// scheduler without touching the worker. A changed `[acme]`/`[tls]` path
+    /// config (digest mismatch) or ACME disabled in the successor is an
+    /// operator decision, not corruption: returns null and the worker starts
+    /// fresh. A malformed checkpoint, or a worker that is already running,
+    /// refuses the handoff.
+    fn stageAcmeSchedulerCheckpoint(self: *LinuxServer, bytes: []const u8) !?@import("acme_renewal.zig").Snapshot {
         const owner = self.acme_pause_owner orelse {
+            try native_windows_acme.validateCheckpoint(bytes);
             srvLog("onyx-server: UPGRADE resume — [acme] is disabled in this config; carried ACME schedule dropped\n", .{});
-            return native_windows_acme.validateCheckpoint(bytes);
+            return null;
         };
-        const snapshot = native_windows_acme.decodeSnapshot(bytes, owner) catch |err| {
+        if (owner.thread != null or owner.runtime.view != null) return error.NotQuiescent;
+        return native_windows_acme.decodeSnapshot(bytes, owner) catch |err| {
             if (err != error.ConfigMismatch) return err;
             srvLog("onyx-server: UPGRADE resume — [acme] config changed; starting a fresh ACME schedule\n", .{});
+            return null;
+        };
+    }
+
+    /// Commit phase: publish the staged schedule after adoption commits and
+    /// before main.zig starts the worker. Never fails the committed handoff.
+    fn publishAcmeSchedulerReplacement(self: *LinuxServer, snapshot: *const @import("acme_renewal.zig").Snapshot) void {
+        const owner = self.acme_pause_owner orelse return;
+        owner.restoreSnapshot(snapshot) catch |err| {
+            srvLog("onyx-server: UPGRADE resume — ACME schedule not restored ({s}); starting fresh\n", .{@errorName(err)});
             return;
         };
-        try owner.restoreSnapshot(&snapshot);
         const now = platform.monotonicMillis();
         srvLog("onyx-server: UPGRADE resume — ACME schedule carried (next check in {d}s, {d} completed, last {s})\n", .{
             @divTrunc(@max(snapshot.next_check_ms - now, 0), 1000),
@@ -44386,6 +44398,7 @@ pub const LinuxServer = struct {
         var chanstats_replacement: ?chanstats_checkpoint.Owned = null;
         defer if (chanstats_replacement) |*replacement| replacement.deinit();
         var access_replacement: ?ircx_access_store.AccessStore = null;
+        var acme_schedule_replacement: ?@import("acme_renewal.zig").Snapshot = null;
         defer if (access_replacement) |*replacement| replacement.deinit();
         var saccess_replacement: ?ircx_saccess.ServerAccessStore = null;
         defer if (saccess_replacement) |*replacement| replacement.deinit();
@@ -44490,6 +44503,18 @@ pub const LinuxServer = struct {
                 if (!std.meta.eql(ward_replacement.?.params, self.warden.params)) {
                     self.abandonInheritedSessionState(caps, arena_fd, "configuration-incompatible WARD checkpoint");
                     return error.InvalidInheritedHandoff;
+                }
+            } else if (comptime builtin.os.tag != .windows) {
+                // Windows restores HXAC with its parked Gate companions below.
+                // handoff_relations already refused a malformed or duplicate
+                // frame. Stage only; the schedule is published with the other
+                // replacements after COMMIT, before main.zig starts the worker.
+                if (native_windows_acme.isCheckpoint(bytes)) {
+                    acme_schedule_replacement = self.stageAcmeSchedulerCheckpoint(bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid ACME scheduler checkpoint");
+                        srvLog("onyx-server: ACME scheduler restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
                 }
             }
         }
@@ -44815,20 +44840,12 @@ pub const LinuxServer = struct {
                         return error.InvalidInheritedHandoff;
                     };
                 } else if (native_windows_acme.isCheckpoint(bytes)) {
-                    if (comptime builtin.os.tag == .windows) {
-                        const owner = self.acme_worker orelse unreachable;
-                        native_windows_acme.restoreEncodedParked(owner, bytes) catch |e| {
-                            self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows ACME scheduler checkpoint");
-                            srvLog("onyx-server: Windows ACME scheduler restore failed ({s})\n", .{@errorName(e)});
-                            return error.InvalidInheritedHandoff;
-                        };
-                    } else {
-                        self.restoreAcmeSchedulerCheckpoint(bytes) catch |e| {
-                            self.abandonInheritedSessionState(caps, arena_fd, "invalid ACME scheduler checkpoint");
-                            srvLog("onyx-server: ACME scheduler restore failed ({s})\n", .{@errorName(e)});
-                            return error.InvalidInheritedHandoff;
-                        };
-                    }
+                    const owner = self.acme_worker orelse unreachable;
+                    native_windows_acme.restoreEncodedParked(owner, bytes) catch |e| {
+                        self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows ACME scheduler checkpoint");
+                        srvLog("onyx-server: Windows ACME scheduler restore failed ({s})\n", .{@errorName(e)});
+                        return error.InvalidInheritedHandoff;
+                    };
                 } else if (native_windows_tls_material.isCheckpoint(bytes)) {
                     tls_material_replacement = native_windows_tls_material.decodeOwned(self.allocator, bytes) catch |e| {
                         self.abandonInheritedSessionState(caps, arena_fd, "invalid Windows TLS material checkpoint");
@@ -46951,6 +46968,9 @@ pub const LinuxServer = struct {
             std.mem.swap(svc_akick.AkickStore, &self.chan_akick, replacement)
         else
             unreachable;
+        if (comptime builtin.os.tag != .windows) {
+            if (acme_schedule_replacement) |*snapshot| self.publishAcmeSchedulerReplacement(snapshot);
+        }
         if (ward_replacement) |*replacement|
             std.mem.swap(warden.Registry, &self.warden, replacement)
         else
@@ -100667,6 +100687,57 @@ test "MESSAGE_V2 Helix activation is staged exact and monotonic across current h
     try std.testing.expect(!downgrade.authoredRelayV2Configured());
 }
 
+test "Helix adopt restores a carried ACME schedule through the real Linux adopt path" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const acme_mod = @import("acme_renewal.zig");
+    const tls: config_format.Config.Tls = .{ .cert_path = "/srv/tls/leaf.pem", .key_path = "/srv/tls/leaf.key" };
+    const acme_cfg: config_format.Config.Acme = .{ .enabled = true, .domain = "acme.test" };
+    const cfg = Config{ .host = "127.0.0.1", .port = 0, .crypto_io = std.testing.io };
+
+    const first = createTestServer(alloc, cfg) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    var blobs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+    var pieces: std.ArrayList(helix_live.StatePiece) = .empty;
+    defer pieces.deinit(alloc);
+    appendCurrentMandatoryUpgradeStateForTest(first, &pieces, &blobs) catch |err| {
+        first.deinit();
+        alloc.destroy(first);
+        return err;
+    };
+
+    // Predecessor's scheduler, cut at a parked boundary, sealed as HXAC.
+    var source = acme_mod.Service.init(alloc, std.testing.io, first, acme_cfg, &tls);
+    source.next_check_ms = platform.monotonicMillis() + 5 * 60 * 60 * 1000;
+    source.completed_checks = 9;
+    source.last_outcome = .not_due;
+    const acme_wire = try native_windows_acme.captureUnstartedEncoded(alloc, &source);
+    try blobs.append(alloc, acme_wire);
+    try pieces.append(alloc, .{ .kind = .mesh_checkpoint, .bytes = acme_wire, .min_supported = 2 });
+    first.deinit();
+    alloc.destroy(first);
+
+    const second = try createTestServer(alloc, cfg);
+    defer alloc.destroy(second);
+    defer second.deinit();
+    var successor = acme_mod.Service.init(alloc, std.testing.io, second, acme_cfg, &tls);
+    try successor.prepareColdResources(std.testing.io);
+    second.acme_pause_owner = &successor;
+    defer second.acme_pause_owner = null;
+
+    _ = try adoptUpgradePiecesForTest(second, pieces.items, "onyx-test-acme-schedule-carry");
+    current_reactor = null;
+    try std.testing.expectEqual(source.next_check_ms, successor.next_check_ms);
+    try std.testing.expectEqual(@as(u64, 9), successor.completed_checks);
+    try std.testing.expectEqual(acme_mod.Outcome.not_due, successor.last_outcome);
+}
+
 test "Helix carries the Linux ACME scheduler exactly and starts fresh on config change" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const acme_mod = @import("acme_renewal.zig");
@@ -100694,7 +100765,11 @@ test "Helix carries the Linux ACME scheduler exactly and starts fresh on config 
     var successor = acme_mod.Service.init(std.testing.allocator, std.testing.io, &unused_server, acme_cfg, &tls);
     try successor.prepareColdResources(std.testing.io);
     server.acme_pause_owner = &successor;
-    try server.restoreAcmeSchedulerCheckpoint(wire);
+    const fresh_successor_deadline = successor.next_check_ms;
+    const staged = (try server.stageAcmeSchedulerCheckpoint(wire)) orelse return error.TestUnexpectedResult;
+    // Staging never mutates the worker: an abandoned adopt keeps it fresh.
+    try std.testing.expectEqual(fresh_successor_deadline, successor.next_check_ms);
+    server.publishAcmeSchedulerReplacement(&staged);
     try std.testing.expectEqual(source.next_check_ms, successor.next_check_ms);
     try std.testing.expectEqual(@as(u64, 3), successor.completed_checks);
     try std.testing.expectEqual(acme_mod.Outcome.failed, successor.last_outcome);
@@ -100705,22 +100780,22 @@ test "Helix carries the Linux ACME scheduler exactly and starts fresh on config 
     var changed = acme_mod.Service.init(std.testing.allocator, std.testing.io, &unused_server, changed_cfg, &tls);
     const fresh_deadline = changed.next_check_ms;
     server.acme_pause_owner = &changed;
-    try server.restoreAcmeSchedulerCheckpoint(wire);
+    try std.testing.expect((try server.stageAcmeSchedulerCheckpoint(wire)) == null);
     try std.testing.expectEqual(fresh_deadline, changed.next_check_ms);
     try std.testing.expectEqual(@as(u64, 0), changed.completed_checks);
 
     // ACME disabled in the successor: the valid piece is dropped.
     server.acme_pause_owner = null;
-    try server.restoreAcmeSchedulerCheckpoint(wire);
+    try std.testing.expect((try server.stageAcmeSchedulerCheckpoint(wire)) == null);
 
     // A corrupt frame is refused (the caller abandons the handoff).
     const corrupt = try std.testing.allocator.dupe(u8, wire);
     defer std.testing.allocator.free(corrupt);
     corrupt[corrupt.len - 1] ^= 0x01;
     server.acme_pause_owner = &successor;
-    try std.testing.expectError(error.InvalidSnapshot, server.restoreAcmeSchedulerCheckpoint(corrupt));
+    try std.testing.expectError(error.InvalidSnapshot, server.stageAcmeSchedulerCheckpoint(corrupt));
     server.acme_pause_owner = null;
-    try std.testing.expectError(error.InvalidSnapshot, server.restoreAcmeSchedulerCheckpoint(corrupt));
+    try std.testing.expectError(error.InvalidSnapshot, server.stageAcmeSchedulerCheckpoint(corrupt));
 }
 
 test "UPGRADE continuity gate accepts idle state and refuses every media or companion owner" {

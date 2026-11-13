@@ -11,6 +11,20 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
+## 0.11.7 — Linux successors actually restore the carried ACME schedule (2026-11-13)
+
+- **Fix for 0.11.6.** The predecessor sealed the HXAC scheduler checkpoint,
+  but on Linux/OpenBSD the successor's restore branch sat in the native-Windows
+  companion loop, so the piece was ignored and the worker still started a
+  fresh schedule. Found in live acceptance on eshmaki.me: the reload sealed one
+  more capsule but logged no carried schedule. Nothing else was affected.
+- The restore now runs in the shared host-policy loop. Like every other
+  carried piece it is decoded and validated during adopt and published only
+  after COMMIT, before the worker starts; an abandoned adopt leaves the worker
+  untouched.
+- New test drives the real `adoptInheritedSessions` path with an HXAC piece
+  in the arena and checks the exact deadline, check count and last outcome.
+
 ## 0.11.6 — Helix carries the ACME renewal schedule (2026-11-13)
 
 - **A reload no longer resets ACME renewal on Linux/OpenBSD.** 0.11.5 parked
