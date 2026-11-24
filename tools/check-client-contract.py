@@ -18,7 +18,8 @@ from typing import Any, Mapping, Sequence
 
 
 SCHEMA = "onyx-client-server-contract/v2"
-REVISION = 3
+REVISION = 4
+WEBSOCKET_TRANSPORT = "Client text sends contain one complete IRC line per WebSocket application message without CR, LF, or NUL; text.ircv3.net is text-only; onyx.irc-media.v1 permits binary Cadence media; WebSocket application messages may use fragmented frames"
 REQUIRED_CAPS = (
     "message-tags",
     "server-time",
@@ -51,10 +52,10 @@ CLIENT_FIELDS = {
     },
     "group_message_crypto": {
         "envelope_helpers": "implemented",
-        "store_seal": "activation_hold",
-        "store_open": "activation_hold",
-        "outbound": "required rooms reject plaintext; no production path seals and tags ONYXROOM1",
-        "inbound": "ONYXROOM1 remains ciphertext in the store and renders as a locked placeholder",
+        "store_seal": "production_wired_required_rooms",
+        "store_open": "production_wired_ephemeral_session",
+        "outbound": "required rooms seal through the private connection-owned runtime, tag onyx/e2ee=mls, and fail closed without a live session; plaintext is not queued or scheduled at rest",
+        "inbound": "ONYXROOM1 remains ciphertext in store text; a matching live session may attach transient plaintext after exact async ownership revalidation, otherwise it renders locked",
     },
 }
 REQUIRED_POLICY_FIELDS = {
@@ -122,8 +123,11 @@ REJECTED_VECTORS = (
 )
 SESSION_COMMANDS = (
     "SESSION TOKEN",
-    "SESSION MTOKEN",
     "SESSION RESUME <token>",
+)
+SESSION_RESPONSES = (
+    "SESSION TOKEN <credential>",
+    "SESSION MTOKEN <credential> expires=<unix>",
 )
 VENDOR_CAPS = {
     "onyx/session-sync": "same-account attachment synchronization",
@@ -298,8 +302,7 @@ def semantic_errors(contract: Any) -> list[str]:
     need(_is_mapping(transport), "transport must be an object")
     if _is_mapping(transport):
         need(
-            transport.get("websocket")
-            == "one IRC message per frame; no trailing frame bytes",
+            transport.get("websocket") == WEBSOCKET_TRANSPORT,
             "transport.websocket framing is frozen",
         )
 
@@ -347,6 +350,7 @@ def semantic_errors(contract: Any) -> list[str]:
     need(_is_mapping(session), "session must be an object")
     if _is_mapping(session):
         need(_exact_seq(session.get("commands"), SESSION_COMMANDS), "session.commands are frozen")
+        need(_exact_seq(session.get("responses"), SESSION_RESPONSES), "session.responses are frozen")
         need(session.get("resume") == SESSION_RESUME_FIELDS, "session.resume fields are frozen")
         split = session.get("replay_live_separation")
         need(_is_mapping(split), "session.replay_live_separation must be an object")

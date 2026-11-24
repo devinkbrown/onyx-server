@@ -141,8 +141,16 @@ class ContractSemanticsTests(unittest.TestCase):
         self.assertEqual("production_wired", client["group_control_runtime"]["status"])
         self.assertEqual("production_wired", client["group_control_runtime"]["genesis_session_provisioning"])
         self.assertEqual("activation_hold", client["group_control_runtime"]["session_persistence"])
-        self.assertEqual("activation_hold", client["group_message_crypto"]["store_seal"])
-        self.assertEqual("activation_hold", client["group_message_crypto"]["store_open"])
+        self.assertEqual("production_wired_required_rooms", client["group_message_crypto"]["store_seal"])
+        self.assertEqual("production_wired_ephemeral_session", client["group_message_crypto"]["store_open"])
+
+    def test_revision_four_session_request_and_response_split(self) -> None:
+        self.assertEqual(4, SOURCE["revision"])
+        self.assertEqual(["SESSION TOKEN", "SESSION RESUME <token>"], SOURCE["session"]["commands"])
+        self.assertEqual(
+            ["SESSION TOKEN <credential>", "SESSION MTOKEN <credential> expires=<unix>"],
+            SOURCE["session"]["responses"],
+        )
 
     def test_session_resume_and_presence_objects_are_exact(self) -> None:
         self.assertEqual(checker.SESSION_RESUME_FIELDS, SOURCE["session"]["resume"])
@@ -159,6 +167,10 @@ class MutationRejectionTests(unittest.TestCase):
             (
                 "transport websocket drift",
                 lambda value: value["transport"].__setitem__("websocket", "multiple IRC messages per frame"),
+            ),
+            (
+                "old websocket frame wording",
+                lambda value: value["transport"].__setitem__("websocket", "one IRC message per frame; no trailing frame bytes"),
             ),
             (
                 "content_envelope",
@@ -193,6 +205,18 @@ class MutationRejectionTests(unittest.TestCase):
                 lambda value: value["client"]["group_message_crypto"].__setitem__("store_seal", "production_active"),
             ),
             (
+                "old group message activation hold",
+                lambda value: value["client"]["group_message_crypto"].__setitem__("store_seal", "activation_hold"),
+            ),
+            (
+                "plaintext required-room queue",
+                lambda value: value["client"]["group_message_crypto"].__setitem__("outbound", "required rooms queue plaintext"),
+            ),
+            (
+                "unowned asynchronous open",
+                lambda value: value["client"]["group_message_crypto"].__setitem__("inbound", "async plaintext without ownership revalidation"),
+            ),
+            (
                 "required policy admission",
                 lambda value: value["e2ee_group"]["required_policy"].__setitem__("admission", "tag_only"),
             ),
@@ -213,6 +237,7 @@ class MutationRejectionTests(unittest.TestCase):
                 lambda value: value.__setitem__("e2ee_group", []),
             ),
             ("revision", lambda value: value.__setitem__("revision", 1)),
+            ("revision three", lambda value: value.__setitem__("revision", 3)),
             ("server status", lambda value: value["server"].__setitem__("group_control", "staged")),
             ("client status", lambda value: value["client"].__setitem__("group_crypto", "production_active")),
             ("guest negotiation", lambda value: value["eligibility"]["guest"].__setitem__("onyx_e2ee_negotiation", "denied")),
@@ -384,6 +409,18 @@ class MutationRejectionTests(unittest.TestCase):
             (
                 "session commands",
                 lambda value: value["session"]["commands"].__setitem__(0, "SESSION LIST"),
+            ),
+            (
+                "MTOKEN request",
+                lambda value: value["session"]["commands"].insert(1, "SESSION MTOKEN"),
+            ),
+            (
+                "missing session responses",
+                lambda value: value["session"].pop("responses"),
+            ),
+            (
+                "bad session response",
+                lambda value: value["session"]["responses"].__setitem__(1, "SESSION MTOKEN"),
             ),
             (
                 "control forms",

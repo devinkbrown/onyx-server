@@ -17249,12 +17249,27 @@ pub const LinuxServer = struct {
             }
         }
 
-        // kTLS RX offload: a kernel-decrypted TLS control record surfaces here as a
-        // recv error (res < 0, typically -EIO) because a plain recv cannot carry the
-        // record type. Demux it via recvmsg + cmsg instead of dropping the conn — a
-        // KeyUpdate is consumed and the conn continues; a close_notify closes.
+        // Only EIO (a queued typed record) and EKEYEXPIRED (a held RX rekey)
+        // enter the kTLS control reader. A TCP timeout/reset has already consumed
+        // the socket error; a second recvmsg can return EOF and falsely replace
+        // that transport failure with a TLS record failure. Kernel-reported TLS
+        // record faults are terminal without another read.
         if (conn.tls_rx_offloaded and event.res < 0) {
-            switch (try self.handleKtlsRxControl(id, conn)) {
+            const record_failure: ?anyerror = switch (event.res) {
+                -@as(i32, @backingInt(linux.E.BADMSG)) => error.RecordAuthenticationFailed,
+                -@as(i32, @backingInt(linux.E.MSGSIZE)) => error.RecordOverflow,
+                -@as(i32, @backingInt(linux.E.INVAL)) => error.ProtocolVersion,
+                else => null,
+            };
+            const control: ?KtlsRxDrain = if (record_failure) |failure| outcome: {
+                self.failTls(conn, failure);
+                break :outcome .close;
+            } else if (event.res == -@as(i32, @backingInt(linux.E.IO)) or
+                event.res == -@as(i32, @backingInt(linux.E.KEYEXPIRED)))
+                try self.handleKtlsRxControl(id, conn)
+            else
+                null;
+            if (control) |outcome| switch (outcome) {
                 .freed => return,
                 .survived => {
                     try self.armSendIfNeeded(conn);
@@ -17274,7 +17289,7 @@ pub const LinuxServer = struct {
                     }
                     return;
                 },
-            }
+            };
         }
 
         if (event.res <= 0) {
@@ -149622,6 +149637,8 @@ test "receive error diagnostics: handleRecv retains reasons through SEND ownersh
     const E = if (builtin.os.tag == .openbsd) std.c.E else linux.E;
     const Case = struct {
         result: i32,
+        ktls_rx: bool = false,
+        record_failure: ?anyerror = null,
         prior: []const u8 = "Client quit",
         already_closing: bool = false,
         expected: []const u8,
@@ -149637,7 +149654,18 @@ test "receive error diagnostics: handleRecv retains reasons through SEND ownersh
         .{ .result = -@as(i32, @backingInt(E.TIMEDOUT)), .prior = "Server draining", .expected = "Server draining", .diagnostic = "server_draining" },
         .{ .result = -@as(i32, @backingInt(E.TIMEDOUT)), .prior = "private prior reason", .expected = "private prior reason", .diagnostic = "other_redacted" },
         .{ .result = -@as(i32, @backingInt(E.TIMEDOUT)), .already_closing = true, .expected = "Client quit", .diagnostic = "generic_client_quit" },
+        .{ .result = -@as(i32, @backingInt(E.TIMEDOUT)), .ktls_rx = true, .expected = "Connection timed out", .diagnostic = "connection_timeout" },
+        .{ .result = -@as(i32, @backingInt(E.CONNRESET)), .ktls_rx = true, .expected = "Connection reset by peer", .diagnostic = "connection_reset" },
+        .{ .result = -1, .ktls_rx = true, .expected = "Read error", .diagnostic = "read_error" },
+        .{ .result = std.math.minInt(i32), .ktls_rx = true, .expected = "Read error", .diagnostic = "read_error" },
+        .{ .result = -@as(i32, @backingInt(E.TIMEDOUT)), .ktls_rx = true, .prior = "Server draining", .expected = "Server draining", .diagnostic = "server_draining" },
+        .{ .result = -@as(i32, @backingInt(linux.E.BADMSG)), .ktls_rx = true, .record_failure = error.RecordAuthenticationFailed, .expected = "TLS record failure", .diagnostic = "tls_record_failure" },
+        .{ .result = -@as(i32, @backingInt(linux.E.MSGSIZE)), .ktls_rx = true, .record_failure = error.RecordOverflow, .expected = "TLS record failure", .diagnostic = "tls_record_failure" },
+        .{ .result = -@as(i32, @backingInt(linux.E.INVAL)), .ktls_rx = true, .record_failure = error.ProtocolVersion, .expected = "TLS record failure", .diagnostic = "tls_record_failure" },
     }) |case| {
+        if (case.ktls_rx and builtin.os.tag != .linux) continue;
+        const pair = if (case.ktls_rx) try DaemonOutputTestPair.createSuite(.tls13, 0x1301) else null;
+        defer if (pair) |fixture| fixture.destroy();
         var sockets: [2]i32 = undefined;
         if (posix.errno(socket_system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets)) != .SUCCESS)
             return error.SkipZigTest;
@@ -149648,6 +149676,18 @@ test "receive error diagnostics: handleRecv retains reasons through SEND ownersh
         };
         const victim = server.connFor(victim_id).?;
         victim.fd = sockets[0]; // the Server owns and must close this physical endpoint
+        if (pair) |fixture| {
+            const owned = try allocator.create(tls_conn.TlsConn);
+            owned.* = fixture.tls;
+            fixture.tls = .{ .allocator = allocator, .engine = .undecided, .cfg13 = owned.cfg13, .cfg12 = owned.cfg12 };
+            victim.tls = owned;
+            victim.is_tls = true;
+            victim.tls_handshake_finished = true;
+            victim.tls_rx_offloaded = true;
+            victim.tls_tx_offloaded = true;
+            owned.ktls_rx_offloaded = true;
+            owned.ktls_tx_offloaded = true;
+        }
         const token = victim.token;
         _ = try server.world.join("#recv-reason", worldIdFromClient(victim_id));
         observer.send_len = 0;
@@ -149670,6 +149710,16 @@ test "receive error diagnostics: handleRecv retains reasons through SEND ownersh
         try std.testing.expect(held.send_armed);
         try std.testing.expectEqualStrings(case.expected, held.close_reason);
         try std.testing.expectEqualStrings(pending, held.send_buf[held.send_offset..held.send_len]);
+        if (held.tls) |tls| {
+            // Neither real transport errors nor terminal kernel record errors
+            // may start a second read or reserve KeyUpdate response credit.
+            try std.testing.expectEqual(tls_conn.ControlBarrierPhase.none, tls.control_phase);
+            try std.testing.expectEqual(@as(u64, 0), held.tls_kernel_prefix_remaining);
+            try std.testing.expectEqual(case.record_failure != null, held.tls_terminal_failure);
+            if (case.record_failure) |failure| {
+                try std.testing.expectEqual(tls_record.fatalAlertBytes(failure).?, held.tls_alert_bytes);
+            } else try std.testing.expect(!held.tls_alert_pending);
+        }
         try std.testing.expectEqual(@as(usize, 0), observer.send_len);
         var diagnostic: [768]u8 = undefined;
         const line = try formatConnectionDiagnostic(&diagnostic, 0, held, .closed, 0, null, connectionDiagnosticReason(held.close_reason), 0);
@@ -149689,8 +149739,67 @@ test "receive error diagnostics: handleRecv retains reasons through SEND ownersh
         const quit = try std.fmt.bufPrint(&expected_quit, " QUIT :{s}\r\n", .{case.expected});
         try expectContains(observer.send_buf[0..observer.send_len], quit);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, observer.send_buf[0..observer.send_len], " QUIT :"));
-        var byte: [1]u8 = undefined;
-        try std.testing.expectEqual(@as(usize, 0), try readFd(sockets[1], &byte));
+        // These completion fixtures declare offload on a plain socketpair:
+        // sendmsg exposes the control alert payload directly. Observe that
+        // exact terminal alert, then EOF; never suppress it to simplify teardown.
+        var tail: [3]u8 = undefined;
+        var tail_len: usize = 0;
+        while (tail_len < tail.len) {
+            const n = try readFd(sockets[1], tail[tail_len..]);
+            if (n == 0) break;
+            tail_len += n;
+        }
+        if (case.ktls_rx) {
+            const expected_alert = if (case.record_failure) |failure|
+                tls_record.fatalAlertBytes(failure).?
+            else
+                [2]u8{ 1, 0 }; // close_notify after a transport failure
+            try std.testing.expectEqualSlices(u8, &expected_alert, tail[0..tail_len]);
+        } else try std.testing.expectEqual(@as(usize, 0), tail_len);
+    }
+}
+
+test "receive error diagnostics: kTLS control completions retain SEND custody and await demux" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+    for ([_]linux.E{ .IO, .KEYEXPIRED }) |errno| {
+        const server = createTestServer(allocator, .{ .host = "127.0.0.1", .port = 0, .max_clients = 2 }) catch |err| switch (err) {
+            error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+            else => return err,
+        };
+        defer {
+            server.deinit();
+            allocator.destroy(server);
+        }
+        current_reactor = &server.reactors[0];
+        const pair = try DaemonOutputTestPair.createSuite(.tls13, 0x1301);
+        defer pair.destroy();
+        const id = try addTestLocalClient(server, "ControlOwner", null);
+        const conn = server.connFor(id).?;
+        const owned = try allocator.create(tls_conn.TlsConn);
+        owned.* = pair.tls;
+        pair.tls = .{ .allocator = allocator, .engine = .undecided, .cfg13 = owned.cfg13, .cfg12 = owned.cfg12 };
+        conn.tls = owned;
+        conn.is_tls = true;
+        conn.tls_handshake_finished = true;
+        conn.tls_rx_offloaded = true;
+        conn.tls_tx_offloaded = true;
+        owned.ktls_rx_offloaded = true;
+        owned.ktls_tx_offloaded = true;
+        const pending = "kernel prefix\r\n";
+        try rawAppendToConn(conn, pending);
+        conn.send_armed = true;
+        conn.send_submitted_len = pending.len;
+        conn.recv_armed = true;
+
+        try server.handleRecv(.{ .token = conn.token, .res = -@as(i32, @backingInt(errno)), .more = false });
+        try std.testing.expect(!conn.closing and !conn.tls_terminal_failure);
+        try std.testing.expect(!conn.recv_armed and conn.send_armed);
+        try std.testing.expectEqual(tls_conn.ControlBarrierPhase.kernel_control_read_held, owned.control_phase);
+        try std.testing.expectEqual(@as(u64, pending.len), conn.tls_kernel_prefix_remaining);
+        try std.testing.expectEqualStrings(pending, conn.send_buf[conn.send_offset..conn.send_len]);
+        try std.testing.expectEqual(@as(usize, 0), conn.tls_control_charge);
     }
 }
 

@@ -51,6 +51,10 @@ surfaces to configuration, commands, source ownership and verification. A
 compiled primitive, a proposal, and an accepted deployed feature are separate
 claims; historical roadmaps do not establish support.
 
+Client developers can follow the [Onyx Elm client roadmap](docs/design/onyx-elm-client-roadmap.md)
+for the proposed architecture, feature priorities, protocol integration and
+acceptance tests.
+
 ## Current release status
 
 The source manifest is **0.11.7**, deployed to both production nodes by Helix

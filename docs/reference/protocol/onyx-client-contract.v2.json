@@ -1,8 +1,8 @@
 {
   "schema": "onyx-client-server-contract/v2",
-  "revision": 3,
+  "revision": 4,
   "transport": {
-    "websocket": "one IRC message per frame; no trailing frame bytes"
+    "websocket": "Client text sends contain one complete IRC line per WebSocket application message without CR, LF, or NUL; text.ircv3.net is text-only; onyx.irc-media.v1 permits binary Cadence media; WebSocket application messages may use fragmented frames"
   },
   "capabilities": {
     "required_for_first_party_client": [
@@ -70,7 +70,6 @@
   "session": {
     "commands": [
       "SESSION TOKEN",
-      "SESSION MTOKEN",
       "SESSION RESUME <token>"
     ],
     "resume": {
@@ -84,7 +83,11 @@
       "history_replay": "CHATHISTORY and bouncer rewind replay stored events; they do not re-author live commands",
       "helix_e2ee_group": "EGRG Helix checkpoints are replay metadata only; opaque payloads and hop-custody wires never enter Helix",
       "session_resume": "snapshot or live-sibling attach; original JOIN/PART/QUIT live commands are not replayed"
-    }
+    },
+    "responses": [
+      "SESSION TOKEN <credential>",
+      "SESSION MTOKEN <credential> expires=<unix>"
+    ]
   },
   "error_privacy": {
     "roadmap": "Q01",

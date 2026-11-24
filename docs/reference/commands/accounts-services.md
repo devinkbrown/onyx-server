@@ -107,7 +107,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 ## SASL AUTHENTICATE and numerics
 
 - Syntax: `AUTHENTICATE <mechanism|payload|*>`
-- Description: IRCv3 SASL runs through the `AUTHENTICATE` dispatcher. It supports configured `PLAIN`, `EXTERNAL`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `SCRAM-SHA-512-PLUS`, `SESSION-TOKEN`, `OAUTHBEARER`, and `ANONYMOUS` mechanisms on the live connection. The router can parse `SCRAM-SHA-256-PLUS`, but that name is not currently advertised by CAP, SASLINFO, or IRCX package lists. `SESSION-TOKEN` is a SASL re-entry credential, distinct from the `SESSION TOKEN` / `SESSION MTOKEN` reclaim tokens used with `SESSION RESUME`.
+- Description: IRCv3 SASL runs through the `AUTHENTICATE` dispatcher. It supports configured `PLAIN`, `EXTERNAL`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `SCRAM-SHA-512-PLUS`, `SESSION-TOKEN`, `OAUTHBEARER`, and `ANONYMOUS` mechanisms on the live connection. The router can parse `SCRAM-SHA-256-PLUS`, but that name is not currently advertised by CAP, SASLINFO, or IRCX package lists. `SESSION-TOKEN` is a SASL re-entry credential, distinct from the `SESSION TOKEN` command and its optional `SESSION MTOKEN` response used with `SESSION RESUME`.
 - Replies: `AUTHENTICATE +` or challenge data during the exchange; `RPL_LOGGEDIN 900` plus `RPL_SASLSUCCESS 903` on success; optional final SCRAM verifier before success.
 - Errors and numerics: `ERR_SASLFAIL 904`, `ERR_SASLTOOLONG 905`, `ERR_SASLABORTED 906`, `ERR_SASLALREADY 907`, and `RPL_SASLMECHS 908` before `904` for an unsupported mechanism. `RPL_LOGGEDOUT 901` is emitted when aborting an already-authenticated SASL exchange or on `LOGOUT`. The current dispatcher defines `900`, `901`, and `903`; it does not define or emit a `902` account-auth numeric.
 - Account-status lockout: A SUSPENDED or FORBIDDEN account is rejected at the SASL success chokepoint for every non-guest mechanism, including SCRAM and OAUTHBEARER. The user-facing IRCv3 surface is the generic `904 :SASL authentication failed`, so account status is not enumerated.
@@ -187,7 +187,6 @@ Syntax:
 SESSION LIST
 SESSION LIST MESH
 SESSION TOKEN
-SESSION MTOKEN
 SESSION RESUME <credential>
 SESSION DROP <#n|sid=<32-hex>>
 SESSION REVOKE group=<32-hex>
@@ -196,7 +195,8 @@ SESSION REVOKE group=<32-hex>
 The caller must be a registered client authenticated to the owning account.
 `TOKEN` reveals the current local resume credential; composite issuance can return
 `srm2l.<group>.<attachment>` instead of the bare logical 32-hex token. `MTOKEN`
-returns a portable credential with `expires=<unix-seconds>`; composite `srm2m`
+may be returned by `SESSION TOKEN` as `SESSION MTOKEN <credential> expires=<unix-seconds>`.
+It is a response, not a request command. Composite `srm2m`
 exact-restore issuance binds destination to issuer and another node can REDIRECT.
 These are separate from the durable `sst_...` account-login credential issued by
 `SESSIONTOKEN`. Parsing a sealed envelope does not authorize arbitrary-node

@@ -16,6 +16,7 @@ image, public release tag and proposed work are separate facts.
 | Configure accounts, history or media | [Feature index](reference/features.md) | [Account commands](reference/commands/accounts-services.md), [messaging](reference/commands/messaging.md), [media](architecture/03-media.md) |
 | Develop or review a change | [Development guide](development.md) | [Source map](architecture/source-modules.md), [testing](guide/testing.md), [contributing](../CONTRIBUTING.md) |
 | Understand architecture and invariants | [Architecture overview](architecture/00-overview.md) | [Mesh security](architecture/mesh-security.md), [credentials](reference/credential-domains.md), [Helix](architecture/04-upgrade-wasm.md) |
+| Plan the Onyx Elm client | [Elm client roadmap](design/onyx-elm-client-roadmap.md) | [Client requirements baseline](design/onyx-client-integration-2026-10-26.md), [feature inventory](reference/features.md) |
 | Package or verify a release | [Packaging](../packaging/README.md) | [Runbook](RUNBOOK.md), [release verification](audit/release-0.10.0-2026-11-06.md) |
 | Maintain these documents | [Maintenance rules](MAINTENANCE.md) | `python3 -B tools/check_docs.py` |
 
@@ -56,6 +57,10 @@ operational reports retain their original evidence. Obsolete overlapping plans
 have been retired from the active tree and are recoverable through the
 [archive index](MAINTENANCE.md#retired-documents). Their old versions, counts and TODOs do not
 establish current behavior.
+
+The [Elm client roadmap](design/onyx-elm-client-roadmap.md) owns the proposed
+client architecture, delivery sequence, backlog and acceptance gates. It
+distinguishes server support from client implementation evidence.
 
 The [integrated requirements baseline](ROADMAP-2026-10-26.md),
 [acceptance ledger](ops/roadmap-acceptance-ledger-2026-10-26.md), and

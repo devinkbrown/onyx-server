@@ -1,12 +1,19 @@
 # Onyx client integration change outline
 
+For the current proposed Elm architecture, implementation sequence, prioritized
+backlog and acceptance tests, use the [Onyx Elm client roadmap](onyx-elm-client-roadmap.md).
+This page retains the cross-product requirements and contract baseline; it does
+not define a competing current implementation order.
+
 Requirements baseline: 2026-10-26; reviewed for scope on 2026-11-03. Proposed
 client work, not a statement of deployed client behavior. Companion to the
 [integrated delivery roadmap](../ROADMAP-2026-10-26.md)
 
 This outlines the client changes needed to deliver the requested quality of
 life, privacy, setup, session, voice/video, throughput, and mesh improvements.
-Client source has not been inspected in this repository. Items describe the
+This requirements baseline was written without inspecting client source.
+The [Elm roadmap](onyx-elm-client-roadmap.md) now records the separate read-only
+audit of the current Elm working tree. Items below retain their original
 desired behavior and integration contracts, not an assertion that an existing
 client lacks a feature. No client repository is changed by this document.
 
@@ -468,7 +475,11 @@ admission contract before the client sends them as early data. Cold storage,
 resume storms, sequential upgrades and offline return still require client
 source and end-to-end tests; this outline is not evidence that they are done.
 
-## Dependency and rollout order
+## Original dependency and rollout order
+
+This table preserves the requirements baseline's original grouping. The
+[Elm roadmap](onyx-elm-client-roadmap.md) owns the current proposed delivery
+order and its detailed dependencies.
 
 | Phase | Client work | Server prerequisite |
 | --- | --- | --- |
@@ -485,10 +496,10 @@ compatibility order; unsupported controls stay understandable. A rolling
 upgrade matrix must include old/new clients, old/new capabilities on current
 server schemas, multiple devices, offline return, and interrupted operations.
 
-The final client implementation plan should list actual files and components
-only after the client repository is available and audited. That audit should
-retain existing working features and assign explicit ownership rather than
-assuming a rewrite.
+The [Elm implementation roadmap](onyx-elm-client-roadmap.md) lists the actual
+files and components inspected in the client working tree, preserves existing
+features, and assigns bounded implementation work. Its source audit does not
+establish passing tests or deployed browser acceptance.
 
 
 ## Verified privacy and operator integration contracts

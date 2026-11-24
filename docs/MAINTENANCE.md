@@ -16,6 +16,7 @@ or parsed field alone is not evidence that a feature is enabled or accepted.
 | Wire syntax and policy | [Command index](reference/commands/_index.md), [protocol references](reference/ircv3.md) | New/changed command, capability, mode, numeric, limit or failure. |
 | Implementation ownership and invariants | [Architecture](architecture/00-overview.md), [source map](architecture/source-modules.md) | Module boundary, transaction, concurrency, transport or carry format changes. |
 | Development and verification | [Development](development.md), [testing](guide/testing.md) | Toolchain, test graph, failure workflow or evidence rules change. |
+| Onyx Elm client implementation plan | [Elm client roadmap](design/onyx-elm-client-roadmap.md) | Client source audit, server contract, milestone dependency or client acceptance changes. |
 | Deployment procedure | [Runbook](RUNBOOK.md), [service kits](guide/service-management.md) | Startup/reload/stop, staging, privilege or rollback behavior changes. |
 | Running production identity | [Production status](ops/onyx-server-paths.md) | Accepted deployment changes image, manager, path or configuration. |
 | Release changes and evidence | [NEWS](../NEWS.md), [latest evidence](audit/README.md) | Accepted behavior, measured result or deployment. |
