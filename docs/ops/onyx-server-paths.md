@@ -31,7 +31,9 @@ substitutes for this table.
 | Presence issuer epoch | 15, kept | 12, kept |
 | `links_active` / `peers_up` / `partitioned` | `1 / 1 / 0` | `1 / 1 / 0` |
 
-Both configs remain unchanged, including `[tls] ktls = "txrx"`. Local Helix
+Both configs were unchanged during this release rollout, including `[tls] ktls = "txrx"`.
+The subsequent [30-day cloak policy change](#anonymous-cloak-rotation-2026-11-25)
+changed only the anonymous rotation interval. Local Helix
 carried the ACME schedule (`next check in 15474s, 24 completed, last not_due`).
 Four CA-verified TLS 1.2/1.3 clients stayed on their original physical sockets
 through both reloads with stable exact local credentials and identical
@@ -46,6 +48,27 @@ Rollback binaries on both nodes: `onyx-server.0.11.7-517c17bf` (SHA-256
 Config backups: `onyx-server.local.toml.bak-pre-0.11.8-20261125`.
 The [0.11.8 release record](../audit/release-0.11.8-2026-11-25.md) pins source,
 compiler, complete test counts, independent artifact reproduction and limits.
+
+## Anonymous cloak rotation (2026-11-25)
+
+Both nodes now explicitly set `[cloak] anon_epoch_secs = 2592000` (30 days),
+replacing their previous `86400` (24 hours). The product default remains 14 days;
+this is the fleet's configured override. Cloak secrets, account cloaking and all
+other config values are unchanged. The same accepted 0.11.8 binary was reloaded
+by Helix, remote first, preserving both PIDs and issuer epochs.
+
+Public-source TLS 1.2/1.3 guest probes verified the running cadence on both nodes
+through the public cloak label `c278d00` (2592000 in hexadecimal). Eight held
+guest/account clients survived both reloads; account cloaks and exact local
+credentials stayed stable. Guest cloaks changed at most once for the new policy,
+then remained stable through maintenance ticks and same-address reconnects.
+Both mesh health checks passed, and temporary fixture accounts were removed.
+
+Rotation uses shared UTC epochs rather than an interval starting at login or
+configuration time. The next boundary is **2026-12-03 at 00:00 UTC**, then every
+30 days. This controls the displayed anonymous hostname, not the real IP address.
+Config backups on both nodes:
+`onyx-server.local.toml.bak-pre-cloak30d-20261125T005704Z`.
 
 ## Previous baseline (2026-11-13, 0.11.7)
 
