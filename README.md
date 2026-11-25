@@ -57,13 +57,14 @@ acceptance tests.
 
 ## Current release status
 
-The source manifest is **0.11.7**, deployed to both production nodes by Helix
-on **2026-11-13**. The 0.11.x line this week fixed `ktls = "txrx"` dropping
-TLS 1.3 clients that write right after the handshake (0.11.4) and made Helix
-work with in-daemon `[acme]` renewal while carrying its exact schedule
-(0.11.5–0.11.7); see [NEWS](NEWS.md). Exact running revisions and hashes, service
-paths, acceptance scope and rollback facts have one canonical home:
-[production status](docs/ops/onyx-server-paths.md).
+The source manifest is **0.11.8**, deployed to both production nodes by Helix
+on **2026-11-25**. Kernel TLS receive handling now preserves genuine TCP timeout
+and reset reasons instead of misreporting them as TLS record failures; this does
+not establish the cause of the historical network timeouts. The release also
+includes client-contract revision 4 and the Elm client roadmap. Exact running
+revisions and hashes, service paths, acceptance scope and rollback facts live in
+[production status](docs/ops/onyx-server-paths.md) and the
+[0.11.8 release record](docs/audit/release-0.11.8-2026-11-25.md).
 
 Production nodes use Helix live reloads. Since 0.10.3 the durable mesh
 presence store is carried across Helix (see NEWS 0.10.3). A node with
@@ -71,9 +72,10 @@ in-daemon `[acme]` renewal enabled (eshmaki.me) is live-upgraded too: the
 renewal worker is parked at a safe boundary before exec and its schedule is
 carried to the successor (0.11.7). The 0.9.0
 acceptance verified saved durable account-token recovery after both restarts;
-later rollouts re-verified the secured mesh and cross-node delivery but did
-not repeat the token fixture. Neither claims preservation of old exact
-attachment tokens across a cold boundary.
+0.11.8 separately verified stable exact attachment credentials across both live
+reloads, then restored prior exact credentials and channel participation after
+reconnect. These live-upgrade checks do not claim preservation of old exact
+attachment credentials across a cold boundary.
 
 The latest published GitHub asset release, checked **2026-11-06**, is still
 [v0.5.6](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6).
@@ -95,10 +97,10 @@ roots with bounded parallel workers. Cached lanes reuse a root binary for
 runtime selections; documentation-only commits no longer invalidate test
 version metadata. Windows and cross targets retain their documented graphs.
 
-The complete Debug gate for 0.10.0 discovered **12,086 tests: 11,773 passed,
-313 skipped, zero failures**, in about 14 minutes. Cold ReleaseSafe
+The complete 0.11.8 Debug and ReleaseSafe gates each executed **12,479 tests:
+12,166 passed, 313 skipped, zero failures, leaks or log errors**. Cold ReleaseSafe
 compilation remains expensive. Exact provenance and limits are in the
-[0.10.0 release record](docs/audit/release-0.10.0-2026-11-06.md); the earlier test-speed
+[0.11.8 release record](docs/audit/release-0.11.8-2026-11-25.md); earlier test-speed
 measurements are in the [2026-11-03 report](docs/audit/release-and-test-speed-2026-11-03.md).
 
 Start with [development](docs/development.md), then use the detailed

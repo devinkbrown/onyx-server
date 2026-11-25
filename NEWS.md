@@ -11,6 +11,29 @@ A source-only line is dated when the manifest changes and says so.
 
 ---
 
+## 0.11.8 — Preserve genuine transport errors under kernel TLS (2026-11-25)
+
+- Kernel TLS RX now sends only `EIO` and `EKEYEXPIRED` to the typed control
+  reader. A TCP timeout or reset keeps its actual receive error and disconnect
+  reason instead of a second read replacing it with `Eof` / TLS record failure.
+  Kernel-reported authentication, size and version faults remain fatal TLS errors.
+- Regression coverage preserves armed SEND ownership, terminal alerts and one
+  QUIT notification; EIO/rekey control handling remains covered. The historical
+  TCP timeout cause is still unproven, so this is not a claim of network-timeout
+  prevention.
+- Includes client-contract revision 4, matching validator/tests, corrected
+  SESSION request/response and WebSocket application-message documentation, and
+  the proposed Elm client implementation roadmap.
+- Full Debug and ReleaseSafe each executed 12,479 cases: 12,166 passed,
+  313 skipped, zero failures/leaks/log errors. Independent fresh-cache release
+  builds reproduced the binary and all metadata byte-for-byte.
+- Deployed remote first, then local, by Helix alone. Both PIDs and issuer epochs
+  stayed unchanged. Four held TLS 1.2/1.3 clients kept their exact credentials
+  and observed identical message IDs/timestamps with one delivery each. Prior
+  exact credentials restored channel participation after reconnect using bounded
+  retries for documented temporary-unavailable warnings. See the
+  [release record](docs/audit/release-0.11.8-2026-11-25.md).
+
 ## 0.11.7 — Linux successors actually restore the carried ACME schedule (2026-11-13)
 
 - **Fix for 0.11.6.** The predecessor sealed the HXAC scheduler checkpoint,

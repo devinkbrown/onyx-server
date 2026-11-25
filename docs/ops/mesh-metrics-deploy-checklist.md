@@ -20,10 +20,12 @@ artifact, config and listener inventory. Deployment requires explicit approval.
    The [native kit probe](../guide/service-management.md#isolated-kit-checks)
    catches certificate-loader/kernel-policy failures that a parser-only unit
    check or config preflight can miss. Preserve public-feed umask overrides.
-5. Review the exact Helix token and process-owned continuity guards. The current
-   accepted topology uses a planned cold boundary because of its WebTransport
-   configuration. Follow the runbook's custody and producer-boundary requirements;
-   a quiet interval or acknowledged prefix alone is not global empty-custody proof.
+5. Review the exact Helix token and process-owned continuity guards. The
+   2026-11-25 0.11.8 acceptance used Helix on both nodes with WebTransport
+   configured, preserving presence epochs and the local ACME schedule. Recheck
+   current capabilities and guards for every candidate. If a cold boundary is required,
+   follow the runbook's custody and producer-boundary requirements; a quiet
+   interval or acknowledged prefix alone is not global empty-custody proof.
 6. Operate one node at a time through its actual supervisor. After each node,
    verify service state, running executable identity/hash, all intended listeners,
    CA/hostname-verified TLS, secured links and recovery with a token issued before

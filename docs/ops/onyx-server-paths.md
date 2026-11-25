@@ -4,7 +4,7 @@
 
 This is the canonical current-topology document. It was refreshed from the
 running processes, `/proc/<pid>/exe`, executable hashes, and loopback metrics
-on **2026-11-07**. eshmaki.me is Alpine and supervises the daemon with OpenRC.
+on **2026-11-25**. eshmaki.me is Alpine and supervises the daemon with OpenRC.
 ircx.us supervises it with systemd. Re-run the commands below after any
 deployment; release notes preserve the exact historical inputs and are not
 substitutes for this table.
@@ -21,7 +21,33 @@ substitutes for this table.
 | **WebTransport** | UDP `:4433` | UDP `:4433` |
 | **Operational log** | `/home/kain/onyx-server-run/onyx-server.log` (`0600`) | journal for `onyx-server.service` |
 
-## Verified fleet baseline (2026-11-13, 0.11.7)
+## Verified fleet baseline (2026-11-25, 0.11.8)
+
+| Evidence | eshmaki.me | ircx.us |
+|---|---|---|
+| Running image | `0.11.8+75b20aaa9986` | `0.11.8+75b20aaa9986` |
+| Running and on-disk executable SHA-256 | `a967ea8d9d882f1b81db6520bd64d46106897a9ae2ad144797a9ba98518491ad` | same |
+| Restart | Helix with `[acme]` enabled, PID 26437 kept | Helix first, PID 2980332 kept |
+| Presence issuer epoch | 15, kept | 12, kept |
+| `links_active` / `peers_up` / `partitioned` | `1 / 1 / 0` | `1 / 1 / 0` |
+
+Both configs remain unchanged, including `[tls] ktls = "txrx"`. Local Helix
+carried the ACME schedule (`next check in 15474s, 24 completed, last not_due`).
+Four CA-verified TLS 1.2/1.3 clients stayed on their original physical sockets
+through both reloads with stable exact local credentials and identical
+message IDs/timestamps, exactly once at every recipient. A separate reconnect
+check restored each closed attachment's own prior exact credential and channel
+participation without JOIN, honoring documented temporary-unavailable retries.
+Fresh TLS 1.2/1.3 registration/PONG, both-node mesh health and the public status
+JSON also passed; fixture accounts were removed.
+
+Rollback binaries on both nodes: `onyx-server.0.11.7-517c17bf` (SHA-256
+`517c17bf0ea67066748a11d3921ad0610d144457a440499aee4977b9c00a4a77`).
+Config backups: `onyx-server.local.toml.bak-pre-0.11.8-20261125`.
+The [0.11.8 release record](../audit/release-0.11.8-2026-11-25.md) pins source,
+compiler, complete test counts, independent artifact reproduction and limits.
+
+## Previous baseline (2026-11-13, 0.11.7)
 
 | Evidence | eshmaki.me | ircx.us |
 |---|---|---|
@@ -224,7 +250,7 @@ Do not run both restarts together.
 rc-service onyx-server status          # eshmaki, OpenRC
 systemctl status onyx-server           # ircx.us, systemd
 
-# Current WebTransport-enabled topology requires cold restart; TCP clients drop.
+# Cold fallback only after the runbook preconditions; TCP clients drop.
 sudo rc-service onyx-server restart    # eshmaki
 sudo systemctl restart onyx-server     # ircx.us
 

@@ -5,7 +5,7 @@
 This runbook describes the shipped tree. For full configuration details, use
 [reference/config.md](reference/config.md) and `etc/onyx-server.reference.toml`.
 
-## Verified fleet baseline (2026-11-06)
+## Verified fleet baseline (2026-11-25)
 
 The [production paths and acceptance record](ops/onyx-server-paths.md) owns
 the current image revision, executable hash, process observations and mesh
@@ -25,15 +25,16 @@ Onyx Server runs as a long-lived network daemon with:
   `/etc/systemd/system/onyx-server.service`;
 - state under `/var/lib/onyx-server` in the packaged unit;
 - ReleaseFast production binaries from `zig build release` or `zig build package`;
-- session-preserving reload via SIGUSR2/Helix where the listener set allows it
-  (on the current fleet the durable mesh presence store blocks Helix, so
-  upgrades are cold restarts: `rc-service onyx-server restart` on eshmaki.me,
-  `systemctl restart onyx-server.service` on ircx.us).
+- session-preserving reload via SIGUSR2/Helix when the candidate capabilities
+  and live-state guards allow it. The 0.11.8 fleet acceptance used Helix on both
+  nodes with the durable presence store, WebTransport configured and local ACME
+  enabled; both PIDs and issuer epochs were kept, and the ACME schedule carried.
+  A guard refusal preserves the predecessor and must be resolved before proceeding.
 
-Cold restart is the fallback path and drops physical connections. Saved durable
-account tokens recovered on both nodes after this roll; old composite attachment
-tokens are not promised to survive a cold boundary. Reload preserves connections
-where the listener set permits it.
+Cold restart is the fallback path and drops physical connections. The 0.9.0
+acceptance recovered saved durable account tokens on both nodes after cold
+restarts; old exact attachment credentials are not promised to survive a cold
+boundary. Reload preserves connections where the listener set permits it.
 Cold restart is also **not crash-durable for the MESSAGE_V2 custody plane** and can lose an
 intermediate node's last un-repaired custody copy — see [Cold Restart](#cold-restart) and the
 [cold-restart durability contract](design/message-v2-exact-once.md#cold-restart-durability-contract).
