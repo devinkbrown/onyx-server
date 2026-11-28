@@ -21,6 +21,7 @@ pub const AppendResult = types.AppendResult;
 pub const ExactOnceResult = types.ExactOnceResult;
 pub const Error = types.Error;
 pub const CheckpointError = types.CheckpointError;
+pub const Position = store.Position;
 pub const Lotus = store.Lotus;
 pub const HistoryStore = store.HistoryStore;
 

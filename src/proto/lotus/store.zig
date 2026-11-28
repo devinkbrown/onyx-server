@@ -9,6 +9,22 @@ const types = @import("types.zig");
 const retained = @import("retained_message.zig");
 const checkpoint = @import("checkpoint_wire.zig");
 
+/// A bound in one target log. An exact message ID also carries the logical
+/// ring index, which disambiguates rows with the same server timestamp.
+pub const Position = struct {
+    timestamp: u64,
+    index: ?usize = null,
+
+    fn order(self: Position, other: Position) std.math.Order {
+        const by_time = std.math.order(self.timestamp, other.timestamp);
+        if (by_time != .eq) return by_time;
+        return if (self.index != null and other.index != null)
+            std.math.order(self.index.?, other.index.?)
+        else
+            .eq;
+    }
+};
+
 pub fn Lotus(comptime params: types.Params) type {
     comptime validateParams(params);
 
@@ -72,10 +88,6 @@ pub fn Lotus(comptime params: types.Params) type {
                 }
                 self.len -= 1;
             }
-        };
-
-        const QueryBound = union(enum) {
-            before: u64,
         };
 
         const EvictionCandidate = struct {
@@ -249,7 +261,7 @@ pub fn Lotus(comptime params: types.Params) type {
             try validateTarget(target);
             try validateOutput(n, out);
             const log = self.targets.get(target) orelse return out[0..0];
-            return collectNewest(&log, n, out, null);
+            return collect(&log, n, out, true, null, null, false);
         }
 
         pub fn before(
@@ -259,10 +271,7 @@ pub fn Lotus(comptime params: types.Params) type {
             n: usize,
             out: []types.Message,
         ) types.Error![]const types.Message {
-            try validateTarget(target);
-            try validateOutput(n, out);
-            const log = self.targets.get(target) orelse return out[0..0];
-            return collectNewest(&log, n, out, .{ .before = timestamp });
+            return self.beforePosition(target, .{ .timestamp = timestamp }, n, out);
         }
 
         /// Return visible entries after `timestamp`, oldest first for replay.
@@ -273,10 +282,33 @@ pub fn Lotus(comptime params: types.Params) type {
             n: usize,
             out: []types.Message,
         ) types.Error![]const types.Message {
+            return self.afterPosition(target, .{ .timestamp = timestamp }, false, n, out);
+        }
+
+        pub fn beforePosition(self: *const Self, target: []const u8, anchor: Position, n: usize, out: []types.Message) types.Error![]const types.Message {
             try validateTarget(target);
             try validateOutput(n, out);
             const log = self.targets.get(target) orelse return out[0..0];
-            return collectAfter(&log, timestamp, n, out);
+            return collect(&log, n, out, true, null, anchor, false);
+        }
+
+        pub fn afterPosition(self: *const Self, target: []const u8, anchor: Position, inclusive: bool, n: usize, out: []types.Message) types.Error![]const types.Message {
+            try validateTarget(target);
+            try validateOutput(n, out);
+            const log = self.targets.get(target) orelse return out[0..0];
+            return collect(&log, n, out, false, anchor, null, inclusive);
+        }
+
+        /// Return the strict interval, starting at the end specified first.
+        pub fn betweenPositions(self: *const Self, target: []const u8, first: Position, last: Position, n: usize, out: []types.Message) types.Error![]const types.Message {
+            try validateTarget(target);
+            try validateOutput(n, out);
+            const log = self.targets.get(target) orelse return out[0..0];
+            return switch (first.order(last)) {
+                .lt => collect(&log, n, out, false, first, last, false),
+                .gt => collect(&log, n, out, true, last, first, false),
+                .eq => out[0..0],
+            };
         }
 
         pub fn redact(self: *Self, target: []const u8, msgid: []const u8) types.Error!void {
@@ -295,12 +327,16 @@ pub fn Lotus(comptime params: types.Params) type {
             self.checkpoint_body_len = new_body_len;
         }
 
-        /// Resolve a message's server timestamp by its msgid within `target`, or
-        /// null when no such message exists. Translates CHATHISTORY msgid
-        /// selectors into the timestamp bounds the paging queries operate on.
-        pub fn timestampOf(self: *Self, target: []const u8, msgid: []const u8) ?u64 {
-            const found = self.findNewest(target, msgid) catch return null;
-            return found.timestamp;
+        /// Resolve even a redacted pivot while it remains in this target ring.
+        /// The position is valid until the next mutation of the ring.
+        pub fn positionOf(self: *const Self, target: []const u8, msgid: []const u8) ?Position {
+            const log = self.targets.get(target) orelse return null;
+            const index = findNewestIndex(&log, msgid) orelse return null;
+            return .{ .timestamp = log.entry(index).timestamp, .index = index };
+        }
+
+        pub fn timestampOf(self: *const Self, target: []const u8, msgid: []const u8) ?u64 {
+            return (self.positionOf(target, msgid) orelse return null).timestamp;
         }
 
         /// Oldest retained row on `target` at or before `cutoff`, tombstones
@@ -648,13 +684,17 @@ pub fn Lotus(comptime params: types.Params) type {
             try validateTarget(target);
             const log = self.targets.getPtr(target) orelse return error.NotFound;
 
+            const index = findNewestIndex(log, msgid) orelse return error.NotFound;
+            return log.entryMut(index);
+        }
+
+        fn findNewestIndex(log: *const TargetLog, msgid: []const u8) ?usize {
             var scanned: usize = 0;
             while (scanned < log.len) : (scanned += 1) {
-                const logical_index = log.len - 1 - scanned;
-                const entry = log.entryMut(logical_index);
-                if (std.mem.eql(u8, entry.msgid, msgid)) return entry;
+                const index = log.len - 1 - scanned;
+                if (std.mem.eql(u8, log.entry(index).msgid, msgid)) return index;
             }
-            return error.NotFound;
+            return null;
         }
 
         fn validateText(text: []const u8) types.Error!void {
@@ -733,29 +773,21 @@ pub fn Lotus(comptime params: types.Params) type {
             return body_len;
         }
 
-        fn collectNewest(log: *const TargetLog, n: usize, out: []types.Message, bound: ?QueryBound) []const types.Message {
+        fn collect(log: *const TargetLog, n: usize, out: []types.Message, reverse: bool, lower: ?Position, upper: ?Position, include_lower: bool) []const types.Message {
             var count: usize = 0;
             var scanned: usize = 0;
             while (scanned < log.len and count < n) : (scanned += 1) {
-                const logical_index = log.len - 1 - scanned;
-                const entry = log.entry(logical_index);
-                if (entry.tombstone) continue;
-                if (bound) |query_bound| switch (query_bound) {
-                    .before => |timestamp| if (entry.timestamp >= timestamp) continue,
-                };
-                out[count] = entry.view();
-                count += 1;
-            }
-            return out[0..count];
-        }
-
-        fn collectAfter(log: *const TargetLog, timestamp: u64, n: usize, out: []types.Message) []const types.Message {
-            var count: usize = 0;
-            var index: usize = 0;
-            while (index < log.len and count < n) : (index += 1) {
+                const index = if (reverse) log.len - 1 - scanned else scanned;
                 const entry = log.entry(index);
                 if (entry.tombstone) continue;
-                if (entry.timestamp <= timestamp) continue;
+                const position: Position = .{ .timestamp = entry.timestamp, .index = index };
+                if (lower) |bound| {
+                    const ordering = position.order(bound);
+                    if (ordering == .lt or (ordering == .eq and !include_lower)) continue;
+                }
+                if (upper) |bound| {
+                    if (position.order(bound) != .lt) continue;
+                }
                 out[count] = entry.view();
                 count += 1;
             }

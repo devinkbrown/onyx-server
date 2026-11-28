@@ -36972,16 +36972,11 @@ pub const LinuxServer = struct {
         };
     }
 
-    /// CHATHISTORY <sub> <target> <criteria...> <limit> — IRCv3 history replay.
-    /// Supports LATEST and BEFORE/AFTER with timestamp selectors over the Lotus
-    /// ring; emits a `chathistory` BATCH of PRIVMSG lines (msgid+server-time).
-    /// Resolve a CHATHISTORY selector to a server timestamp: a timestamp passes
-    /// through; a msgid is looked up in `target`'s history. Null when a msgid is
-    /// unknown (the caller then returns an empty result for that bound).
-    fn resolveSelector(self: *LinuxServer, target: []const u8, sel: chathistory_cmd.Selector) ?u64 {
+    /// Message-ID bounds keep the exact position of the pivot within ties.
+    fn resolveSelector(self: *LinuxServer, target: []const u8, sel: chathistory_cmd.Selector) ?lotus.Position {
         return switch (sel) {
-            .timestamp => |ts| ts,
-            .msgid => |id| self.history.timestampOf(target, id),
+            .timestamp => |ts| .{ .timestamp = ts },
+            .msgid => |id| self.history.positionOf(target, id),
         };
     }
 
@@ -37109,7 +37104,7 @@ pub const LinuxServer = struct {
                 switch (chathistory_cmd.latestMode(r)) {
                     .unbounded => found = self.history.latest(store_target, n, buf[0..n]) catch buf[0..0],
                     .before_bound => if (self.resolveSelector(store_target, r.lower_bound.?)) |ts| {
-                        found = self.history.before(store_target, ts, n, buf[0..n]) catch buf[0..0];
+                        found = self.history.beforePosition(store_target, ts, n, buf[0..n]) catch buf[0..0];
                     },
                 }
             },
@@ -37118,9 +37113,8 @@ pub const LinuxServer = struct {
                 var key_buf: [320]u8 = undefined;
                 const store_target = self.historyKeyForTarget(conn, target, &key_buf);
                 const n = @min(@as(usize, r.limit), buf.len);
-                // timestamp directly, or a msgid resolved to its timestamp.
                 if (self.resolveSelector(store_target, r.selector)) |ts| {
-                    found = self.history.before(store_target, ts, n, buf[0..n]) catch buf[0..0];
+                    found = self.history.beforePosition(store_target, ts, n, buf[0..n]) catch buf[0..0];
                 }
             },
             .after => |r| {
@@ -37129,7 +37123,7 @@ pub const LinuxServer = struct {
                 const store_target = self.historyKeyForTarget(conn, target, &key_buf);
                 const n = @min(@as(usize, r.limit), buf.len);
                 if (self.resolveSelector(store_target, r.selector)) |ts| {
-                    found = self.history.after(store_target, ts, n, buf[0..n]) catch buf[0..0];
+                    found = self.history.afterPosition(store_target, ts, false, n, buf[0..n]) catch buf[0..0];
                 }
             },
             .between => |r| {
@@ -37139,22 +37133,7 @@ pub const LinuxServer = struct {
                 const n = @min(@as(usize, r.limit), buf.len);
                 if (self.resolveSelector(store_target, r.start)) |s| {
                     if (self.resolveSelector(store_target, r.end)) |e| {
-                        const raw = switch (chathistory_cmd.rangeDirection(s, e)) {
-                            .forward => self.history.after(store_target, s, n, buf[0..n]) catch buf[0..0],
-                            .reverse => self.history.before(store_target, s, n, buf[0..n]) catch buf[0..0],
-                        };
-                        var k: usize = 0;
-                        for (raw) |m| {
-                            const in_range = switch (chathistory_cmd.rangeDirection(s, e)) {
-                                .forward => m.timestamp < e,
-                                .reverse => m.timestamp > e,
-                            };
-                            if (in_range) {
-                                buf[k] = m; // safe in-place compaction (k <= source index)
-                                k += 1;
-                            }
-                        }
-                        found = buf[0..k];
+                        found = self.history.betweenPositions(store_target, s, e, n, buf[0..n]) catch buf[0..0];
                     }
                 }
             },
@@ -37162,8 +37141,7 @@ pub const LinuxServer = struct {
                 target = r.target;
                 var key_buf: [320]u8 = undefined;
                 const store_target = self.historyKeyForTarget(conn, target, &key_buf);
-                // Return up to `limit` messages centred on the pivot (a timestamp
-                // or a msgid resolved to its timestamp): ~half strictly before it
+                // Return up to `limit` messages centred on the pivot: ~half strictly before it
                 // (reversed to chronological order) followed by the pivot and
                 // later, oldest-first.
                 if (self.resolveSelector(store_target, r.center)) |center| {
@@ -37172,10 +37150,10 @@ pub const LinuxServer = struct {
                     var before_buf: [64]lotus.Message = undefined;
                     var after_buf: [64]lotus.Message = undefined;
                     const bn = @min(half, before_buf.len);
-                    const before_part = self.history.before(store_target, center, bn, before_buf[0..bn]) catch before_buf[0..0];
+                    const before_part = self.history.beforePosition(store_target, center, bn, before_buf[0..bn]) catch before_buf[0..0];
                     const remaining = total - before_part.len;
                     const an = @min(remaining, after_buf.len);
-                    const after_part = self.history.after(store_target, center -| 1, an, after_buf[0..an]) catch after_buf[0..0];
+                    const after_part = self.history.afterPosition(store_target, center, true, an, after_buf[0..an]) catch after_buf[0..0];
                     var k: usize = 0;
                     var i: usize = before_part.len; // before_part is newest-first; emit reversed
                     while (i > 0 and k < buf.len) {
@@ -147937,6 +147915,47 @@ test "threaded server: CHATHISTORY records + replays channel messages" {
     try recvUntil(&a, ":B!bob@localhost PRIVMSG #h :msg-two", 200);
     try recvUntil(&a, "BATCH -1", 200);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, a.written(), "@batch=1;time="));
+}
+
+test "threaded server: CHATHISTORY message ID cursors preserve equal-time rows" {
+    var server = Server.init(std.testing.allocator, .{ .host = "127.0.0.1", .port = 0 }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    const timestamp = 1700000000000;
+    _ = try server.history.append("#ties", .{ .msgid = "first", .sender = "peer!u@h", .text = "first row", .timestamp = timestamp });
+    _ = try server.history.append("#ties", .{ .msgid = "middle", .sender = "peer!u@h", .text = "middle row", .timestamp = timestamp });
+    _ = try server.history.append("#ties", .{ .msgid = "last", .sender = "peer!u@h", .text = "last row", .timestamp = timestamp });
+
+    const port = try server.boundPort();
+    var run = std.atomic.Value(bool).init(true);
+    var thread = try std.Thread.spawn(.{}, Server.runThreaded, .{ &server, &run });
+    defer {
+        run.store(false, .release);
+        if (connectLoopback(port)) |wake| closeFd(wake) else |_| {}
+        thread.join();
+    }
+    const fd = connectLoopback(port) catch return error.SkipZigTest;
+    defer closeFd(fd);
+    var client = LiveClient{ .fd = fd };
+    try writeAllFd(fd, "CAP REQ :draft/chathistory batch\r\nNICK A\r\nUSER alice 0 * :Alice\r\nCAP END\r\nJOIN #ties\r\n");
+    try recvUntil(&client, " 366 A #ties ", 200);
+
+    const queries = [_]struct { command: []const u8, body: []const u8 }{
+        .{ .command = "CHATHISTORY BEFORE #ties msgid=middle 1\r\n", .body = "first row" },
+        .{ .command = "CHATHISTORY LATEST #ties msgid=middle 1\r\n", .body = "first row" },
+        .{ .command = "CHATHISTORY AFTER #ties msgid=middle 1\r\n", .body = "last row" },
+        .{ .command = "CHATHISTORY BETWEEN #ties msgid=last msgid=first 4\r\n", .body = "middle row" },
+        .{ .command = "CHATHISTORY AROUND #ties msgid=middle 1\r\n", .body = "middle row" },
+    };
+    for (queries) |query| {
+        client.reset();
+        try writeAllFd(fd, query.command);
+        try recvUntil(&client, "BATCH -1", 200);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, client.written(), "PRIVMSG #ties :"));
+        try std.testing.expect(std.mem.indexOf(u8, client.written(), query.body) != null);
+    }
 }
 
 test "threaded server: SEARCH returns matching channel messages in a chathistory BATCH" {

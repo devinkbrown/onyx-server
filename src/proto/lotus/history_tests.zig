@@ -97,6 +97,35 @@ test "timestampOf resolves a msgid to its timestamp" {
     try std.testing.expectEqual(@as(?u64, null), store.timestampOf("#absent", "m1"));
 }
 
+test "message ID paging keeps equal-time neighbors across ring wrap" {
+    const Store = history.Lotus(.{ .max_targets = 1, .max_per_target = 5, .max_text = 32 });
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    try support.appendForTest(&store, "#lotus", "evicted", 1, "old");
+    try support.appendForTest(&store, "#lotus", "older", 2, "older");
+    try support.appendForTest(&store, "#lotus", "z-first", 3, "first");
+    try support.appendForTest(&store, "#lotus", "m-pivot", 3, "pivot");
+    try support.appendForTest(&store, "#lotus", "a-last", 3, "last");
+    try support.appendForTest(&store, "#lotus", "later", 4, "later");
+
+    var out: [5]types.Message = undefined;
+    const pivot = store.positionOf("#lotus", "m-pivot").?;
+    const first = store.positionOf("#lotus", "z-first").?;
+    const last = store.positionOf("#lotus", "a-last").?;
+    try support.expectIds(try store.beforePosition("#lotus", pivot, out.len, &out), &.{ "z-first", "older" });
+    try support.expectIds(try store.afterPosition("#lotus", pivot, false, out.len, &out), &.{ "a-last", "later" });
+    try support.expectIds(try store.afterPosition("#lotus", pivot, true, out.len, &out), &.{ "m-pivot", "a-last", "later" });
+    try support.expectIds(try store.betweenPositions("#lotus", first, last, out.len, &out), &.{"m-pivot"});
+    try support.expectIds(try store.betweenPositions("#lotus", last, first, out.len, &out), &.{"m-pivot"});
+    try support.expectIds(try store.before("#lotus", 3, out.len, &out), &.{"older"});
+    try support.expectIds(try store.after("#lotus", 3, out.len, &out), &.{"later"});
+
+    try store.redact("#lotus", "m-pivot");
+    const redacted = store.positionOf("#lotus", "m-pivot").?;
+    try support.expectIds(try store.afterPosition("#lotus", redacted, true, out.len, &out), &.{ "a-last", "later" });
+    try std.testing.expectEqual(null, store.positionOf("#lotus", "evicted"));
+}
+
 test "around window composes before() reversed + after() at the pivot" {
     // Mirrors the CHATHISTORY AROUND wiring: ~half strictly before the pivot
     // (reversed to chronological), then the pivot and later, oldest-first.
